@@ -1,0 +1,32 @@
+# Build & Publish Outputs
+bin/
+[Bb]in/
+[Oo]bj/
+dist/
+release/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# Visual Studio & IDE
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+.idea/
+.vscode/
+
+# Temporary and logs
+*.log
+*.tmp
+tests/output/
+tests/staging*/
+tests/test_staging*/
+
+# OS generated files
+Thumbs.db
+[Dd]esktop.ini
+$RECYCLE.BIN/

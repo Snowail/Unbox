@@ -1,0 +1,732 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text.Json;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Interop;
+using System.Windows.Media;
+using System.Windows.Media.Animation;
+using System.Windows.Threading;
+using Microsoft.Win32;
+using UnzipProxy.Core;
+
+namespace UnzipProxy
+{
+    public partial class MainWindow : Window
+    {
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
+
+        private const int DWMWA_WINDOW_CORNER_PREFERENCE = 33;
+        private const int DWMWCP_ROUND = 2;
+
+        private readonly string _archivePath;
+        private ExtractionPlan? _plan;
+        private JobObjectManager? _jobManager;
+        private Process? _workerProcess;
+        private StreamWriter? _workerInput;
+
+        private UserSettings _settings;
+        private bool _isDarkMode = true;
+        private bool _isPaused = false;
+        private bool _isCompleted = false;
+        private bool _hasSkippedItems = false;
+        private bool _isDetailsExpanded = false;
+
+        // 精确匹配原生 Win11 尺寸：宽度 480，折叠 156，展开 306，全系统 DPI 缩放下绝不截断
+        private const double CollapsedHeight = 156.0;
+        private const double ExpandedHeight = 306.0;
+        private const double ExpandedDetailsHeight = 158.0;
+
+        // 速度采样与指标
+        private readonly DispatcherTimer _speedTimer;
+        private long _lastBytes = 0;
+        private DateTime _lastTime = DateTime.UtcNow;
+        private DateTime _startTime = DateTime.UtcNow;
+        private double _currentSpeedMBps = 0.0;
+        private double _displayedSpeedMBps = 0.0;
+        private DateTime _lastSpeedDisplayTime = DateTime.UtcNow;
+        private long _totalBytes = 0;
+        private long _completedBytes = 0;
+        private int _totalItems = 1;
+
+        // 非阻塞 UI 调度标志
+        private volatile bool _isUiUpdatePending = false;
+        private string _pendingCurrentFile = "";
+
+        public MainWindow(string archivePath)
+        {
+            InitializeComponent();
+            _archivePath = archivePath;
+            _settings = ConfigManager.Load();
+
+            ApplyWin11Theme();
+            InitWindowCorner();
+
+            // 恢复配置与记忆展开状态
+            RecycleCheckBox.IsChecked = _settings.RecycleOnSuccess;
+            _isDetailsExpanded = _settings.IsDetailsExpanded;
+
+            if (_isDetailsExpanded)
+            {
+                Height = ExpandedHeight;
+                CollapsedContainer.Height = 0;
+                CollapsedContainer.Opacity = 0;
+                ExpandedContainer.Height = ExpandedDetailsHeight;
+                ExpandedContainer.Opacity = 1;
+                ToggleChevronPath.Data = Geometry.Parse("M 1 6 L 5 2 L 9 6");
+                ToggleDetailsText.Text = "简略信息";
+            }
+            else
+            {
+                Height = CollapsedHeight;
+                CollapsedContainer.Height = 12;
+                CollapsedContainer.Opacity = 1;
+                ExpandedContainer.Height = 0;
+                ExpandedContainer.Opacity = 0;
+                ToggleChevronPath.Data = Geometry.Parse("M 1 2 L 5 6 L 9 2");
+                ToggleDetailsText.Text = "详细信息";
+            }
+
+            // 周期性速度与 ETA 辅助刷新定时器 (100ms)
+            _speedTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(100) };
+            _speedTimer.Tick += OnSpeedTimerTick;
+
+            Loaded += OnWindowLoaded;
+            Closing += OnWindowClosing;
+            Activated += (_, _) =>
+            {
+                var hwnd = new WindowInteropHelper(this).Handle;
+                SystemEffects.StopFlashing(hwnd);
+            };
+        }
+
+        private void InitWindowCorner()
+        {
+            SourceInitialized += (_, _) =>
+            {
+                var hwnd = new WindowInteropHelper(this).Handle;
+                int preference = DWMWCP_ROUND;
+                DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, ref preference, sizeof(int));
+            };
+        }
+
+        private void ApplyWin11Theme()
+        {
+            _isDarkMode = false;
+            try
+            {
+                using var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
+                if (key != null)
+                {
+                    var val = key.GetValue("AppsUseLightTheme");
+                    if (val is int lightInt && lightInt == 0)
+                    {
+                        _isDarkMode = true;
+                    }
+                }
+            }
+            catch { }
+
+            if (_isDarkMode)
+            {
+                Resources["WindowBackgroundBrush"] = new SolidColorBrush(Color.FromRgb(32, 32, 32));
+                Resources["WindowBorderBrush"] = new SolidColorBrush(Color.FromRgb(56, 56, 56));
+                Resources["CardBackgroundBrush"] = new SolidColorBrush(Color.FromRgb(43, 43, 43));
+                Resources["TextForegroundBrush"] = new SolidColorBrush(Color.FromRgb(255, 255, 255));
+                Resources["SubTextBrush"] = new SolidColorBrush(Color.FromRgb(185, 185, 185));
+                Resources["TitleDisabledBrush"] = new SolidColorBrush(Color.FromRgb(90, 90, 90));
+                Resources["TitleButtonHoverBrush"] = new SolidColorBrush(Color.FromRgb(56, 56, 56));
+                Resources["ButtonHoverBrush"] = new SolidColorBrush(Color.FromRgb(56, 56, 56));
+                Resources["ButtonPressedBrush"] = new SolidColorBrush(Color.FromRgb(66, 66, 66));
+                Resources["ProgressTrackBrush"] = new SolidColorBrush(Color.FromRgb(55, 55, 55));
+
+                // 暗色模式：运行中为 Win11 亮青蓝 (#4CC2FF)，暂停为亮金黄 (#FCE100)
+                Resources["AccentProgressBrush"] = _isPaused 
+                    ? (SolidColorBrush)Resources["Win11Yellow"] 
+                    : (SolidColorBrush)Resources["Win11Cyan"];
+
+                SpeedGraph.IsDarkMode = true;
+            }
+            else
+            {
+                Resources["WindowBackgroundBrush"] = new SolidColorBrush(Color.FromRgb(255, 255, 255));
+                Resources["WindowBorderBrush"] = new SolidColorBrush(Color.FromRgb(215, 215, 215));
+                Resources["CardBackgroundBrush"] = new SolidColorBrush(Color.FromRgb(249, 249, 249));
+                Resources["TextForegroundBrush"] = new SolidColorBrush(Color.FromRgb(25, 25, 25));
+                Resources["SubTextBrush"] = new SolidColorBrush(Color.FromRgb(100, 100, 100));
+                Resources["TitleDisabledBrush"] = new SolidColorBrush(Color.FromRgb(190, 190, 190));
+                Resources["TitleButtonHoverBrush"] = new SolidColorBrush(Color.FromRgb(235, 235, 235));
+                Resources["ButtonHoverBrush"] = new SolidColorBrush(Color.FromRgb(235, 235, 235));
+                Resources["ButtonPressedBrush"] = new SolidColorBrush(Color.FromRgb(225, 225, 225));
+                Resources["ProgressTrackBrush"] = new SolidColorBrush(Color.FromRgb(230, 230, 230));
+
+                // 浅色模式：运行中为 Win11 翠绿 (#107C41)，暂停为琥珀金 (#C19C00)
+                Resources["AccentProgressBrush"] = _isPaused 
+                    ? (SolidColorBrush)Resources["Win11Amber"] 
+                    : (SolidColorBrush)Resources["Win11Green"];
+
+                SpeedGraph.IsDarkMode = false;
+            }
+
+            SpeedGraph.IsPaused = _isPaused;
+        }
+
+        private async void OnWindowLoaded(object sender, RoutedEventArgs e)
+        {
+            if (string.IsNullOrEmpty(_archivePath) || !File.Exists(_archivePath))
+            {
+                TriggerError("文件不存在", _archivePath ?? "");
+                return;
+            }
+
+            // 规划目录结构 (D1 规则)
+            _plan = ArchiveTaskPlanner.Plan(_archivePath);
+            TitleText.Text = "已完成 0%";
+            MainStatusText.Text = "已完成 0%";
+
+            string srcName = Path.GetFileName(_archivePath);
+            string targetName = _plan.TargetRootDirName;
+            string fullPathInfo = $"正在将 1 个项目从 {srcName} 解压到 {targetName}";
+            PathInfoText.Text = fullPathInfo;
+            PathInfoText.ToolTip = fullPathInfo;
+
+            _startTime = DateTime.UtcNow;
+            _lastTime = DateTime.UtcNow;
+            _lastSpeedDisplayTime = DateTime.UtcNow;
+            _speedTimer.Start();
+
+            await StartExtractionAsync();
+        }
+
+        private Task StartExtractionAsync()
+        {
+            return Task.Run(() =>
+            {
+                try
+                {
+                    string appDir = AppDomain.CurrentDomain.BaseDirectory;
+                    string workerExe = Path.Combine(appDir, "UnzipWorker.exe");
+                    if (!File.Exists(workerExe))
+                    {
+                        string altWorker = Path.GetFullPath(Path.Combine(appDir, @"..\..\..\..\bin\UnzipWorker.exe"));
+                        if (File.Exists(altWorker)) workerExe = altWorker;
+                    }
+
+                    if (!File.Exists(workerExe))
+                    {
+                        Dispatcher.Invoke(() =>
+                        {
+                            TriggerError("启动失败", "找不到解压工作组件: UnzipWorker.exe");
+                        });
+                        return;
+                    }
+
+                    // 创建独占暂存目录
+                    if (!Directory.Exists(_plan!.StagingDirectory))
+                    {
+                        Directory.CreateDirectory(_plan.StagingDirectory);
+                    }
+
+                    var psi = new ProcessStartInfo
+                    {
+                        FileName = workerExe,
+                        Arguments = $"--archive \"{_plan.SourceArchivePath}\" --staging \"{_plan.StagingDirectory}\" --target-root \"{_plan.TargetRootDirName}\"",
+                        UseShellExecute = false,
+                        RedirectStandardInput = true,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                        CreateNoWindow = true
+                    };
+
+                    _jobManager = new JobObjectManager();
+                    _workerProcess = new Process { StartInfo = psi };
+                    _workerProcess.Start();
+                    _jobManager.AssignProcess(_workerProcess);
+
+                    _workerInput = _workerProcess.StandardInput;
+
+                    ListenWorkerOutput(_workerProcess.StandardOutput);
+                }
+                catch (Exception ex)
+                {
+                    Dispatcher.Invoke(() =>
+                    {
+                        TriggerError("解压启动出错", ex.Message);
+                    });
+                }
+            });
+        }
+
+        private void ListenWorkerOutput(StreamReader reader)
+        {
+            string? line;
+            while ((line = reader.ReadLine()) != null)
+            {
+                if (string.IsNullOrWhiteSpace(line)) continue;
+                try
+                {
+                    using var doc = JsonDocument.Parse(line);
+                    var root = doc.RootElement.Clone();
+                    string type = root.GetProperty("type").GetString() ?? "";
+
+                    if (type == "progress")
+                    {
+                        // 高频 progress 消息：异步非阻塞投递，保证 UI 线程绝对流畅
+                        _pendingCurrentFile = root.GetProperty("current_file").GetString() ?? "";
+                        _completedBytes = root.GetProperty("completed_bytes").GetInt64();
+                        long reportedTotal = root.GetProperty("total_bytes").GetInt64();
+                        if (reportedTotal > 0) _totalBytes = reportedTotal;
+
+                        if (!_isUiUpdatePending)
+                        {
+                            _isUiUpdatePending = true;
+                            Dispatcher.BeginInvoke(DispatcherPriority.Normal, () =>
+                            {
+                                _isUiUpdatePending = false;
+                                UpdateProgressUi(_pendingCurrentFile);
+                            });
+                        }
+                    }
+                    else
+                    {
+                        // 状态类消息：立即同步处理
+                        Dispatcher.Invoke(() => HandleWorkerMessage(type, root));
+                    }
+                }
+                catch { }
+            }
+        }
+
+        private void HandleWorkerMessage(string type, JsonElement root)
+        {
+            switch (type)
+            {
+                case "init":
+                    _totalItems = root.GetProperty("total_items").GetInt32();
+                    _totalBytes = root.GetProperty("total_bytes").GetInt64();
+                    if (_plan != null)
+                    {
+                        string srcName = Path.GetFileName(_archivePath);
+                        string targetName = _plan.TargetRootDirName;
+                        string fullPathInfo = $"正在将 {_totalItems} 个项目从 {srcName} 解压到 {targetName}";
+                        PathInfoText.Text = fullPathInfo;
+                        PathInfoText.ToolTip = fullPathInfo;
+                    }
+                    UpdateProgressUi();
+                    break;
+
+                case "invalid_chars_found":
+                    HandleInvalidChars(root);
+                    break;
+
+                case "password_request":
+                    ShowPasswordDialog();
+                    break;
+
+                case "finished":
+                    string status = root.GetProperty("status").GetString() ?? "ok";
+                    _completedBytes = root.GetProperty("completed_bytes").GetInt64();
+                    HandleFinished(status);
+                    break;
+
+                case "error":
+                    string msg = root.GetProperty("message").GetString() ?? "未知错误";
+                    TriggerError("解压失败", msg);
+                    break;
+            }
+        }
+
+        private void TriggerError(string title, string message)
+        {
+            MainStatusText.Text = title;
+            PathInfoText.Text = message;
+            PathInfoText.ToolTip = message;
+            ExtractProgressBar.Foreground = (Brush)Resources["Win11Red"];
+            RunningActionPanel.Visibility = Visibility.Collapsed;
+            FinishedActionPanel.Visibility = Visibility.Visible;
+
+            Topmost = true;
+            Activate();
+            Focus();
+            var hwnd = new WindowInteropHelper(this).Handle;
+            SystemEffects.FlashWindowForError(hwnd);
+        }
+
+        // 统一且流畅的实时进度更新
+        private void UpdateProgressUi(string? currentFile = null)
+        {
+            if (!string.IsNullOrEmpty(currentFile))
+            {
+                DetailFileNameText.Text = currentFile;
+                DetailFileNameText.ToolTip = currentFile;
+            }
+
+            if (_totalBytes <= 0)
+            {
+                ExtractProgressBar.IsIndeterminate = true;
+                return;
+            }
+
+            ExtractProgressBar.IsIndeterminate = false;
+            double progress = Math.Clamp((double)_completedBytes / _totalBytes, 0.0, 1.0);
+            double pct = progress * 100.0;
+            ExtractProgressBar.Value = pct;
+
+            string statusText = _isPaused ? $"已暂停 - 已完成 {pct:0}%" : $"已完成 {pct:0}%";
+            TitleText.Text = statusText;
+            MainStatusText.Text = statusText;
+
+            // 实时瞬时速度计算 (EMA 滤波)
+            DateTime now = DateTime.UtcNow;
+            double elapsedSec = (now - _lastTime).TotalSeconds;
+            if (elapsedSec >= 0.03)
+            {
+                long bytesDelta = _completedBytes - _lastBytes;
+                if (bytesDelta >= 0)
+                {
+                    double instantMBps = (bytesDelta / (1024.0 * 1024.0)) / elapsedSec;
+                    _currentSpeedMBps = _currentSpeedMBps > 0 ? (_currentSpeedMBps * 0.75 + instantMBps * 0.25) : instantMBps;
+                }
+                _lastBytes = _completedBytes;
+                _lastTime = now;
+            }
+
+            // 速度数值每 500ms 刷新一次，彻底解决数字一直跳跃晃动的问题
+            if ((now - _lastSpeedDisplayTime).TotalMilliseconds >= 500 || _displayedSpeedMBps <= 0.0 || _isPaused)
+            {
+                _displayedSpeedMBps = _currentSpeedMBps;
+                _lastSpeedDisplayTime = now;
+            }
+
+            // 实时向面积图推点，波形水平连续展开，数值平滑不跳动
+            SpeedGraph.PushSample(progress, _currentSpeedMBps, _displayedSpeedMBps);
+
+            // 实时更新剩余项目与剩余大小 (1:1 Win11 格式: 8 (5.04 GB))
+            long remainingBytes = Math.Max(0, _totalBytes - _completedBytes);
+            int estimatedRemainingItems = Math.Max(0, (int)Math.Ceiling((1.0 - progress) * _totalItems));
+            if (remainingBytes > 0 && estimatedRemainingItems == 0) estimatedRemainingItems = 1;
+            DetailRemainingText.Text = $"{estimatedRemainingItems} ({FormatBytes(remainingBytes)})";
+
+            // 实时更新剩余时间，绝不卡死在“正在计算...”
+            if (progress >= 1.0 || remainingBytes == 0)
+            {
+                DetailEtaText.Text = "完成";
+            }
+            else if (_currentSpeedMBps > 0.1)
+            {
+                double remainSec = (remainingBytes / (1024.0 * 1024.0)) / _currentSpeedMBps;
+                DetailEtaText.Text = $"大约 {FormatTimeSpan(TimeSpan.FromSeconds(remainSec))}";
+            }
+            else if (progress > 0.01)
+            {
+                DetailEtaText.Text = "大约 几秒钟";
+            }
+            else
+            {
+                DetailEtaText.Text = "正在计算...";
+            }
+        }
+
+        private void OnSpeedTimerTick(object? sender, EventArgs e)
+        {
+            if (_isCompleted || _isPaused) return;
+            UpdateProgressUi();
+        }
+
+        private static string FormatBytes(long bytes)
+        {
+            if (bytes < 1024) return $"{bytes} B";
+            if (bytes < 1024 * 1024) return $"{bytes / 1024.0:0.0} KB";
+            if (bytes < 1024 * 1024 * 1024) return $"{bytes / (1024.0 * 1024.0):0.0} MB";
+            return $"{bytes / (1024.0 * 1024.0 * 1024.0):0.0} GB";
+        }
+
+        private static string FormatTimeSpan(TimeSpan ts)
+        {
+            if (ts.TotalSeconds < 5) return "几秒钟";
+            if (ts.TotalMinutes < 1) return $"{Math.Ceiling(ts.TotalSeconds)} 秒";
+            if (ts.TotalHours < 1) return $"{ts.Minutes} 分 {ts.Seconds} 秒";
+            return $"{(int)ts.TotalHours} 小时 {ts.Minutes} 分钟";
+        }
+
+        // 处理非法字符交互 (D6)
+        private void HandleInvalidChars(JsonElement root)
+        {
+            if (_settings.RememberInvalidCharsAction && _settings.InvalidCharsAction != "ask")
+            {
+                SendWorkerMessage($"{{\"type\":\"invalid_chars_response\",\"action\":\"{_settings.InvalidCharsAction}\"}}");
+                return;
+            }
+
+            var itemsArray = root.GetProperty("items");
+            var previewLines = new List<string>();
+            foreach (var it in itemsArray.EnumerateArray())
+            {
+                string raw = it.GetProperty("raw").GetString() ?? "";
+                string sanitized = it.GetProperty("sanitized").GetString() ?? "";
+                previewLines.Add($"• 原名: {raw}  ->  建议: {sanitized}");
+            }
+            InvalidItemsListText.Text = string.Join("\n", previewLines);
+
+            ModalTitleText.Text = "文件名包含非法字符";
+            ModalRecycleAlertPanel.Visibility = Visibility.Collapsed;
+            ModalPasswordPanel.Visibility = Visibility.Collapsed;
+            ModalInvalidCharsPanel.Visibility = Visibility.Visible;
+            ModalOverlay.Visibility = Visibility.Visible;
+        }
+
+        private void OnInvalidCharsSubmitClick(object sender, RoutedEventArgs e)
+        {
+            string action = RadioBatchRename.IsChecked == true ? "batch_rename" : "skip";
+            if (RadioSkipInvalid.IsChecked == true)
+            {
+                _hasSkippedItems = true;
+            }
+
+            if (RememberInvalidCharsCheck.IsChecked == true)
+            {
+                _settings.InvalidCharsAction = action;
+                _settings.RememberInvalidCharsAction = true;
+                ConfigManager.Save(_settings);
+            }
+
+            ModalOverlay.Visibility = Visibility.Collapsed;
+            SendWorkerMessage($"{{\"type\":\"invalid_chars_response\",\"action\":\"{action}\"}}");
+        }
+
+        // 密码弹窗
+        private void ShowPasswordDialog()
+        {
+            ModalTitleText.Text = "输入密码";
+            ModalRecycleAlertPanel.Visibility = Visibility.Collapsed;
+            ModalInvalidCharsPanel.Visibility = Visibility.Collapsed;
+            ModalPasswordPanel.Visibility = Visibility.Visible;
+            PasswordInputBox.Password = "";
+            ModalOverlay.Visibility = Visibility.Visible;
+            PasswordInputBox.Focus();
+        }
+
+        private void OnPasswordSubmitClick(object sender, RoutedEventArgs e)
+        {
+            string pwd = PasswordInputBox.Password;
+            ModalOverlay.Visibility = Visibility.Collapsed;
+            SendWorkerMessage($"{{\"type\":\"password_response\",\"password\":\"{pwd}\"}}");
+        }
+
+        private void OnPasswordCancelClick(object sender, RoutedEventArgs e)
+        {
+            ModalOverlay.Visibility = Visibility.Collapsed;
+            OnCancelClick(sender, e);
+        }
+
+        // D2 移入回收站告警与偏好记忆
+        private void OnRecycleCheckBoxClick(object sender, RoutedEventArgs e)
+        {
+            if (RecycleCheckBox.IsChecked == true)
+            {
+                ModalTitleText.Text = "移入回收站提示";
+                ModalInvalidCharsPanel.Visibility = Visibility.Collapsed;
+                ModalPasswordPanel.Visibility = Visibility.Collapsed;
+                ModalRecycleAlertPanel.Visibility = Visibility.Visible;
+                ModalOverlay.Visibility = Visibility.Visible;
+            }
+            _settings.RecycleOnSuccess = RecycleCheckBox.IsChecked == true;
+            ConfigManager.Save(_settings);
+        }
+
+        private void OnRecycleAlertAckClick(object sender, RoutedEventArgs e)
+        {
+            ModalOverlay.Visibility = Visibility.Collapsed;
+        }
+
+        // 暂停 / 继续
+        private void OnPauseResumeClick(object sender, RoutedEventArgs e)
+        {
+            if (_isCompleted) return;
+
+            if (!_isPaused)
+            {
+                _isPaused = true;
+                PauseResumeIcon.Text = "▶";
+                SpeedGraph.IsPaused = true;
+                ApplyWin11Theme();
+                UpdateProgressUi();
+                SendWorkerMessage("{\"type\":\"pause\"}");
+            }
+            else
+            {
+                _isPaused = false;
+                PauseResumeIcon.Text = "❚❚";
+                SpeedGraph.IsPaused = false;
+                _lastTime = DateTime.UtcNow;
+                _lastBytes = _completedBytes;
+                _lastSpeedDisplayTime = DateTime.UtcNow;
+                ApplyWin11Theme();
+                UpdateProgressUi();
+                SendWorkerMessage("{\"type\":\"resume\"}");
+            }
+        }
+
+        // 取消 / 关闭
+        private void OnCancelClick(object sender, RoutedEventArgs e)
+        {
+            if (!_isCompleted)
+            {
+                SendWorkerMessage("{\"type\":\"cancel\"}");
+                if (_plan != null)
+                {
+                    ArchiveTaskPlanner.CleanupStaging(_plan);
+                }
+            }
+            Close();
+        }
+
+        private void OnCloseClick(object sender, RoutedEventArgs e)
+        {
+            OnCancelClick(sender, e);
+        }
+
+        private void OnMinimizeClick(object sender, RoutedEventArgs e)
+        {
+            WindowState = WindowState.Minimized;
+        }
+
+        // 详细信息平滑动画展开/折叠与偏好记忆
+        private void OnToggleDetailsClick(object sender, RoutedEventArgs e)
+        {
+            _isDetailsExpanded = !_isDetailsExpanded;
+
+            // 记忆用户偏好
+            _settings.IsDetailsExpanded = _isDetailsExpanded;
+            ConfigManager.Save(_settings);
+
+            double targetWindowHeight = _isDetailsExpanded ? ExpandedHeight : CollapsedHeight;
+            double targetExpandedHeight = _isDetailsExpanded ? ExpandedDetailsHeight : 0.0;
+            double targetExpandedOpacity = _isDetailsExpanded ? 1.0 : 0.0;
+            double targetCollapsedHeight = _isDetailsExpanded ? 0.0 : 12.0;
+            double targetCollapsedOpacity = _isDetailsExpanded ? 0.0 : 1.0;
+
+            if (_isDetailsExpanded)
+            {
+                ToggleChevronPath.Data = Geometry.Parse("M 1 6 L 5 2 L 9 6");
+                ToggleDetailsText.Text = "简略信息";
+            }
+            else
+            {
+                ToggleChevronPath.Data = Geometry.Parse("M 1 2 L 5 6 L 9 2");
+                ToggleDetailsText.Text = "详细信息";
+            }
+
+            var duration = TimeSpan.FromMilliseconds(220);
+            var ease = new CubicEase { EasingMode = EasingMode.EaseInOut };
+
+            // 窗口高度平滑动画
+            var animWindow = new DoubleAnimation(targetWindowHeight, duration) { EasingFunction = ease };
+            BeginAnimation(HeightProperty, animWindow);
+
+            // 折叠条容器动画 (展开时收起进度条)
+            CollapsedContainer.BeginAnimation(HeightProperty, new DoubleAnimation(targetCollapsedHeight, duration) { EasingFunction = ease });
+            CollapsedContainer.BeginAnimation(OpacityProperty, new DoubleAnimation(targetCollapsedOpacity, duration) { EasingFunction = ease });
+
+            // 展开图表容器动画
+            ExpandedContainer.BeginAnimation(HeightProperty, new DoubleAnimation(targetExpandedHeight, duration) { EasingFunction = ease });
+            ExpandedContainer.BeginAnimation(OpacityProperty, new DoubleAnimation(targetExpandedOpacity, duration) { EasingFunction = ease });
+        }
+
+        // 完成处理 (播放 Finished.mp3，优雅延时退出)
+        private async void HandleFinished(string status)
+        {
+            _isCompleted = true;
+            _speedTimer.Stop();
+
+            _completedBytes = _totalBytes;
+            UpdateProgressUi();
+
+            ExtractProgressBar.Value = 100;
+            TitleText.Text = "已完成 100%";
+            MainStatusText.Text = "已完成 100%";
+            DetailEtaText.Text = "完成";
+            DetailRemainingText.Text = "0 (0 B)";
+            SpeedGraph.PushSample(1.0, _currentSpeedMBps, _displayedSpeedMBps);
+
+            // 提交暂存目录
+            if (_plan != null && !ArchiveTaskPlanner.CommitStagingDirectory(_plan, out string commitErr))
+            {
+                TriggerError("提交最终目录失败", commitErr);
+                return;
+            }
+
+            bool isPartial = (status == "partial") || _hasSkippedItems;
+
+            if (isPartial)
+            {
+                MainStatusText.Text = "部分完成";
+                PathInfoText.Text = "部分条目因字符非法已被跳过，源压缩包已保留。";
+                PathInfoText.ToolTip = PathInfoText.Text;
+                TitleText.Text = $"部分完成 - {Path.GetFileName(_archivePath)}";
+                RunningActionPanel.Visibility = Visibility.Collapsed;
+                FinishedActionPanel.Visibility = Visibility.Visible;
+            }
+            else
+            {
+                if (RecycleCheckBox.IsChecked == true && _plan != null)
+                {
+                    var family = ShellRecycleBin.FindVolumeFamily(_plan.SourceArchivePath);
+                    ShellRecycleBin.RecycleItems(family);
+                }
+
+                SystemEffects.PlayFinishedSound();
+
+                // 停留 800ms，让用户看清完成动画与 100% 状态
+                await Task.Delay(800);
+                Close();
+            }
+        }
+
+        private void OnOpenFolderClick(object sender, RoutedEventArgs e)
+        {
+            if (_plan != null && Directory.Exists(_plan.FinalTargetDirectory))
+            {
+                Process.Start("explorer.exe", $"\"{_plan.FinalTargetDirectory}\"");
+            }
+            Close();
+        }
+
+        private void OnFinishedCloseClick(object sender, RoutedEventArgs e)
+        {
+            Close();
+        }
+
+        private void SendWorkerMessage(string json)
+        {
+            try
+            {
+                if (_workerInput != null)
+                {
+                    _workerInput.WriteLine(json);
+                    _workerInput.Flush();
+                }
+            }
+            catch { }
+        }
+
+        private void OnWindowClosing(object? sender, System.ComponentModel.CancelEventArgs e)
+        {
+            _speedTimer.Stop();
+            try
+            {
+                if (_workerProcess != null && !_workerProcess.HasExited)
+                {
+                    SendWorkerMessage("{\"type\":\"cancel\"}");
+                    _workerProcess.Kill();
+                }
+            }
+            catch { }
+            _jobManager?.Dispose();
+        }
+    }
+}

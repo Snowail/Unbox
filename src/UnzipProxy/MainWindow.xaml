@@ -1,0 +1,393 @@
+﻿<Window x:Class="UnzipProxy.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:ctrl="clr-namespace:UnzipProxy.Controls"
+        mc:Ignorable="d"
+        Title="已完成 0%" 
+        Width="480" 
+        Height="156"
+        ResizeMode="NoResize"
+        WindowStartupLocation="CenterScreen"
+        WindowStyle="None"
+        AllowsTransparency="False"
+        Background="{DynamicResource WindowBackgroundBrush}"
+        FontFamily="Segoe UI Variable Text, Segoe UI, Microsoft YaHei UI">
+
+    <WindowChrome.WindowChrome>
+        <WindowChrome GlassFrameThickness="0" CornerRadius="8" CaptionHeight="30" UseAeroCaptionButtons="False" />
+    </WindowChrome.WindowChrome>
+
+    <Window.Resources>
+        <!-- 基础色彩定义 -->
+        <SolidColorBrush x:Key="Win11Cyan" Color="#4CC2FF" />
+        <SolidColorBrush x:Key="Win11Green" Color="#107C41" />
+        <SolidColorBrush x:Key="Win11Yellow" Color="#FCE100" />
+        <SolidColorBrush x:Key="Win11Amber" Color="#C19C00" />
+        <SolidColorBrush x:Key="Win11Red" Color="#C42B1C" />
+
+        <!-- 标题栏按钮 -->
+        <Style x:Key="TitleBarButtonStyle" TargetType="Button">
+            <Setter Property="Width" Value="46" />
+            <Setter Property="Height" Value="30" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Foreground" Value="{DynamicResource TextForegroundBrush}" />
+            <Setter Property="WindowChrome.IsHitTestVisibleInChrome" Value="True" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="border" Background="{TemplateBinding Background}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="border" Property="Background" Value="{DynamicResource TitleButtonHoverBrush}" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style x:Key="CloseTitleBarButtonStyle" TargetType="Button" BasedOn="{StaticResource TitleBarButtonStyle}">
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="border" Background="{TemplateBinding Background}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="border" Property="Background" Value="#E81123" />
+                                <Setter Property="Foreground" Value="White" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- Win11 原生无边框扁平控制按钮 (暂停/取消) -->
+        <Style x:Key="FluentFlatIconButtonStyle" TargetType="Button">
+            <Setter Property="Width" Value="28" />
+            <Setter Property="Height" Value="26" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Foreground" Value="{DynamicResource TextForegroundBrush}" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="bd" Background="{TemplateBinding Background}" CornerRadius="4">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="bd" Property="Background" Value="{DynamicResource ButtonHoverBrush}" />
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="bd" Property="Background" Value="{DynamicResource ButtonPressedBrush}" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- Win11 原生纯文本链接按钮 (详细信息 / 简略信息) -->
+        <Style x:Key="FluentHyperlinkButtonStyle" TargetType="Button">
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Padding" Value="0" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="Foreground" Value="{DynamicResource TextForegroundBrush}" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <ContentPresenter HorizontalAlignment="Left" VerticalAlignment="Center" />
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- 扁平主操作按钮 -->
+        <Style x:Key="FluentPrimaryButtonStyle" TargetType="Button">
+            <Setter Property="Background" Value="{DynamicResource AccentProgressBrush}" />
+            <Setter Property="Foreground" Value="White" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Padding" Value="16,5" />
+            <Setter Property="FontSize" Value="12" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="bd" Background="{TemplateBinding Background}" CornerRadius="4" Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- Win11 复制进度条样式 (包含 PART_Track 与 PART_Indicator，确保宽度自适应生效) -->
+        <Style x:Key="Win11CopyProgressBarStyle" TargetType="ProgressBar">
+            <Setter Property="Height" Value="12" />
+            <Setter Property="Background" Value="{DynamicResource ProgressTrackBrush}" />
+            <Setter Property="Foreground" Value="{DynamicResource AccentProgressBrush}" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ProgressBar">
+                        <Grid x:Name="PART_Track">
+                            <Border Background="{TemplateBinding Background}" CornerRadius="2" />
+                            <Border x:Name="PART_Indicator" HorizontalAlignment="Left" Background="{TemplateBinding Foreground}" CornerRadius="2" />
+                        </Grid>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </Window.Resources>
+
+    <!-- 窗口主边框 (1px 实线，贴合系统原生窗口) -->
+    <Border Background="{DynamicResource WindowBackgroundBrush}" 
+            BorderBrush="{DynamicResource WindowBorderBrush}" 
+            BorderThickness="1">
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="30" />       <!-- 0: 标题栏 -->
+                <RowDefinition Height="*" />        <!-- 1: 主内容区 -->
+            </Grid.RowDefinitions>
+
+            <!-- 0. 标题栏 (恢复原生时钟图标位置 X=14) -->
+            <Grid Grid.Row="0">
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                    <Path Data="M 8 1 A 7 7 0 1 1 7.99 1 Z M 8 4 L 8 8 L 11 10" 
+                          Stroke="{DynamicResource SubTextBrush}" 
+                          StrokeThickness="1.2" 
+                          Fill="Transparent" 
+                          VerticalAlignment="Center" 
+                          Margin="14,0,8,0" 
+                          Width="14" Height="14" Stretch="Uniform" />
+                    <TextBlock x:Name="TitleText" 
+                               Text="已完成 0%" 
+                               VerticalAlignment="Center" 
+                               FontSize="12" 
+                               Foreground="{DynamicResource TextForegroundBrush}" />
+                </StackPanel>
+
+                <!-- 右侧窗口按钮 -->
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                    <Button Style="{StaticResource TitleBarButtonStyle}" Click="OnMinimizeClick" ToolTip="最小化">
+                        <TextBlock Text="─" FontSize="10" />
+                    </Button>
+                    <Border Width="46" Height="30" Background="Transparent" ToolTip="最大化 (不可用)">
+                        <TextBlock Text="⬜" FontSize="10" Foreground="{DynamicResource TitleDisabledBrush}" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                    </Border>
+                    <Button Style="{StaticResource CloseTitleBarButtonStyle}" Click="OnCloseClick" ToolTip="关闭">
+                        <TextBlock Text="✕" FontSize="11" />
+                    </Button>
+                </StackPanel>
+            </Grid>
+
+            <!-- 1. 主内容区 (左右对称边距 16px，整体左移对齐原生视觉) -->
+            <Grid Grid.Row="1" Margin="16,4,16,8">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />     <!-- 0: 说明文本 -->
+                    <RowDefinition Height="Auto" />     <!-- 1: 大标题与按钮 -->
+                    <RowDefinition Height="Auto" />     <!-- 2: 折叠视图 (12px 进度条) -->
+                    <RowDefinition Height="Auto" />     <!-- 3: 展开视图 (加高面积图 + 3行指标) -->
+                    <RowDefinition Height="Auto" />     <!-- 4: 底部栏: 详细信息切换与回收站 -->
+                </Grid.RowDefinitions>
+
+                <!-- A. 第一行说明文本 (超长路径自适应截断，鼠标悬浮显示全名) -->
+                <TextBlock Grid.Row="0" 
+                           x:Name="PathInfoText" 
+                           Text="正在读取压缩包..." 
+                           FontSize="12" 
+                           Foreground="{DynamicResource TextForegroundBrush}" 
+                           Margin="0,0,0,2" 
+                           TextTrimming="CharacterEllipsis" />
+
+                <!-- B. 第二行：状态文本 (18px Normal 原生排版，紧贴下方面积图) + 右侧暂停/关闭按钮 -->
+                <Grid Grid.Row="1" Margin="0,0,0,3">
+                    <TextBlock x:Name="MainStatusText" 
+                               Text="已完成 0%" 
+                               FontSize="18" 
+                               FontWeight="Normal" 
+                               Foreground="{DynamicResource TextForegroundBrush}" 
+                               VerticalAlignment="Center" />
+
+                    <!-- 右侧操作按钮栏 -->
+                    <StackPanel x:Name="RunningActionPanel" Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
+                        <Button x:Name="PauseResumeButton" 
+                                Style="{StaticResource FluentFlatIconButtonStyle}" 
+                                Margin="0,0,4,0" 
+                                Click="OnPauseResumeClick" 
+                                ToolTip="暂停/继续">
+                            <TextBlock x:Name="PauseResumeIcon" Text="❚❚" FontSize="10" />
+                        </Button>
+                        <Button x:Name="CancelButton" 
+                                Style="{StaticResource FluentFlatIconButtonStyle}" 
+                                Click="OnCancelClick" 
+                                ToolTip="取消">
+                            <TextBlock Text="✕" FontSize="11" />
+                        </Button>
+                    </StackPanel>
+
+                    <!-- 完成/出错状态下的按钮栏 -->
+                    <StackPanel x:Name="FinishedActionPanel" Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center" Visibility="Collapsed">
+                        <Button Style="{StaticResource FluentPrimaryButtonStyle}" 
+                                Margin="0,0,8,0" 
+                                Content="打开所在文件夹" 
+                                Click="OnOpenFolderClick" />
+                        <Button Background="{DynamicResource CardBackgroundBrush}" 
+                                BorderBrush="{DynamicResource WindowBorderBrush}" 
+                                BorderThickness="1" 
+                                Foreground="{DynamicResource TextForegroundBrush}" 
+                                Padding="16,4" 
+                                FontSize="12" 
+                                Content="关闭" 
+                                Click="OnFinishedCloseClick" />
+                    </StackPanel>
+                </Grid>
+
+                <!-- C. 折叠视图：12px 经典进度条 (顶部 5px 留空贴合面积图间距，严格左对齐) -->
+                <Grid Grid.Row="2" x:Name="CollapsedContainer" Height="12" Margin="0,5,0,14">
+                    <ProgressBar x:Name="ExtractProgressBar" 
+                                 Style="{StaticResource Win11CopyProgressBarStyle}" 
+                                 Minimum="0" Maximum="100" Value="0" />
+                </Grid>
+
+                <!-- D. 展开视图：加高堆积面积图 (92px) + 3 行详细指标 (共 154px) -->
+                <Grid Grid.Row="3" x:Name="ExpandedContainer" Height="0" Opacity="0" ClipToBounds="True">
+                    <StackPanel>
+                        <!-- 92px 堆积面积图 (10x6 网格、8% 可见度淡网格、70% 细边框) -->
+                        <ctrl:SpeedGraphControl x:Name="SpeedGraph" Height="92" Margin="0,0,0,8" />
+
+                        <!-- Win11 经典 3 行指标 (左侧绝对对齐，紧凑排版) -->
+                        <StackPanel>
+                            <!-- 第 1 行: 名称 (超长字符自适应截断，悬浮提示完整路径) -->
+                            <TextBlock Margin="0,0,0,3" FontSize="11.5" TextTrimming="CharacterEllipsis">
+                                <Run Text="名称: " Foreground="{DynamicResource SubTextBrush}" />
+                                <Run x:Name="DetailFileNameText" Text="准备中..." Foreground="{DynamicResource TextForegroundBrush}" />
+                            </TextBlock>
+
+                            <!-- 第 2 行: 剩余时间 -->
+                            <TextBlock Margin="0,0,0,3" FontSize="11.5">
+                                <Run Text="剩余时间: " Foreground="{DynamicResource SubTextBrush}" />
+                                <Run x:Name="DetailEtaText" Text="正在计算..." Foreground="{DynamicResource TextForegroundBrush}" />
+                            </TextBlock>
+
+                            <!-- 第 3 行: 剩余项目 (项目数与剩余大小) -->
+                            <TextBlock FontSize="11.5">
+                                <Run Text="剩余项目: " Foreground="{DynamicResource SubTextBrush}" />
+                                <Run x:Name="DetailRemainingText" Text="正在计算..." Foreground="{DynamicResource TextForegroundBrush}" />
+                            </TextBlock>
+                        </StackPanel>
+                    </StackPanel>
+                </Grid>
+
+                <!-- 4. 底部栏：与上方指标保持 10px 紧凑间距，底部留足呼吸内边距 -->
+                <Grid Grid.Row="4" Height="26" Margin="0,10,0,4" VerticalAlignment="Center">
+                    <Button x:Name="ToggleDetailsButton" 
+                            Style="{StaticResource FluentHyperlinkButtonStyle}" 
+                            HorizontalAlignment="Left" 
+                            Click="OnToggleDetailsClick">
+                        <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                            <!-- 直角 90 度矢量折角箭头 (非尖锐字符) -->
+                            <Path x:Name="ToggleChevronPath" 
+                                  Data="M 1 2 L 5 6 L 9 2" 
+                                  Stroke="{DynamicResource TextForegroundBrush}" 
+                                  StrokeThickness="1.2" 
+                                  StrokeStartLineCap="Round" StrokeEndLineCap="Round" 
+                                  VerticalAlignment="Center" 
+                                  Margin="0,0,8,0" Width="10" Height="8" Stretch="Uniform" />
+                            <TextBlock x:Name="ToggleDetailsText" 
+                                       Text="详细信息" 
+                                       FontSize="12" 
+                                       Foreground="{DynamicResource TextForegroundBrush}" 
+                                       VerticalAlignment="Center" />
+                        </StackPanel>
+                    </Button>
+
+                    <CheckBox x:Name="RecycleCheckBox" 
+                              Content="解压完成后移入回收站" 
+                              HorizontalAlignment="Right" 
+                              VerticalAlignment="Center" 
+                              FontSize="12" 
+                              Foreground="{DynamicResource TextForegroundBrush}" 
+                              Click="OnRecycleCheckBoxClick" />
+                </Grid>
+            </Grid>
+
+            <!-- 弹窗覆盖层 -->
+            <Grid x:Name="ModalOverlay" Grid.RowSpan="2" Background="#7F000000" Visibility="Collapsed">
+                <Border CornerRadius="8" 
+                        Background="{DynamicResource WindowBackgroundBrush}" 
+                        BorderBrush="{DynamicResource WindowBorderBrush}" 
+                        BorderThickness="1" 
+                        Width="380" 
+                        VerticalAlignment="Center" 
+                        HorizontalAlignment="Center" 
+                        Padding="20">
+                    <StackPanel>
+                        <TextBlock x:Name="ModalTitleText" Text="提示" FontSize="14" FontWeight="SemiBold" Foreground="{DynamicResource TextForegroundBrush}" Margin="0,0,0,10" />
+
+                        <!-- 回收站警示弹窗 (D2) -->
+                        <StackPanel x:Name="ModalRecycleAlertPanel" Visibility="Collapsed">
+                            <TextBlock Text="分卷压缩包会整组移入回收站；缺少内容校验的格式（如 TAR 等）可能会有风险。" 
+                                       TextWrapping="Wrap" 
+                                       FontSize="12" 
+                                       Foreground="{DynamicResource TextForegroundBrush}" 
+                                       Margin="0,0,0,16" />
+                            <Button Style="{StaticResource FluentPrimaryButtonStyle}" 
+                                    Content="我知道了" 
+                                    HorizontalAlignment="Right" 
+                                    Click="OnRecycleAlertAckClick" />
+                        </StackPanel>
+
+                        <!-- 密码输入弹窗 -->
+                        <StackPanel x:Name="ModalPasswordPanel" Visibility="Collapsed">
+                            <TextBlock Text="此压缩包受密码保护，请输入解压密码：" 
+                                       FontSize="12" 
+                                       Foreground="{DynamicResource TextForegroundBrush}" 
+                                       Margin="0,0,0,8" />
+                            <PasswordBox x:Name="PasswordInputBox" Height="28" Margin="0,0,0,16" />
+                            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                                <Button Content="取消" Margin="0,0,8,0" Padding="14,5" Click="OnPasswordCancelClick" />
+                                <Button Style="{StaticResource FluentPrimaryButtonStyle}" Content="确定" Click="OnPasswordSubmitClick" />
+                            </StackPanel>
+                        </StackPanel>
+
+                        <!-- 非法字符重命名弹窗 (D6) -->
+                        <StackPanel x:Name="ModalInvalidCharsPanel" Visibility="Collapsed">
+                            <TextBlock Text="压缩包内包含 Windows 不支持的非法字符或保留名称：" 
+                                       TextWrapping="Wrap" 
+                                       FontSize="12" 
+                                       Foreground="{DynamicResource TextForegroundBrush}" 
+                                       Margin="0,0,0,8" />
+                            <Border Background="{DynamicResource CardBackgroundBrush}" 
+                                    BorderBrush="{DynamicResource WindowBorderBrush}" 
+                                    BorderThickness="1" 
+                                    CornerRadius="4" 
+                                    Padding="6" 
+                                    MaxHeight="80" 
+                                    Margin="0,0,0,10">
+                                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                                    <TextBlock x:Name="InvalidItemsListText" FontSize="11" Foreground="{DynamicResource SubTextBrush}" TextWrapping="Wrap" />
+                                </ScrollViewer>
+                            </Border>
+
+                            <RadioButton x:Name="RadioBatchRename" Content="批量重命名：将非法字符全部替换为 &quot;-&quot; (默认)" IsChecked="True" FontSize="12" Margin="0,0,0,6" Foreground="{DynamicResource TextForegroundBrush}" />
+                            <RadioButton x:Name="RadioSkipInvalid" Content="仅提取可表示的文件（跳过该项，源包将保留）" FontSize="12" Margin="0,0,0,12" Foreground="{DynamicResource TextForegroundBrush}" />
+                            <CheckBox x:Name="RememberInvalidCharsCheck" Content="记住我的选择，以后不再询问" FontSize="11" Foreground="{DynamicResource SubTextBrush}" Margin="0,0,0,14" />
+
+                            <Button Style="{StaticResource FluentPrimaryButtonStyle}" Content="确定应用" HorizontalAlignment="Right" Click="OnInvalidCharsSubmitClick" />
+                        </StackPanel>
+                    </StackPanel>
+                </Border>
+            </Grid>
+        </Grid>
+    </Border>
+</Window>
