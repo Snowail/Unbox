@@ -108,7 +108,7 @@ Unbox 让解压体验变得像 macOS 的 Archive Utility 一样自然，同时�
 </td>
 <td width="40%" align="center">
 
-<img src="https://raw.githubusercontent.com/Tarikul-Islam-Anik/Animated-Fluent-Emojis/master/Emojis/Smilies/Sparkles.png" width="90"><br>
+<img src="https://raw.githubusercontent.com/Tarikul-Islam-Anik/Animated-Fluent-Emojis/master/Emojis/Activities/Sparkles.png" width="90"><br>
 
 **只需双击**<br>
 无需选择菜单，无需确认路径<br>
