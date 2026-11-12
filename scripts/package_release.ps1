@@ -72,8 +72,6 @@ Copy-Item -Path $iconsSrc -Destination (Join-Path $pkgDir "icons") -Recurse -For
 Write-Host "正在复制注册与清理脚本..."
 Copy-Item -Path (Join-Path $rootDir "注册关联.ps1") -Destination $pkgDir -Force
 Copy-Item -Path (Join-Path $rootDir "取消关联.ps1") -Destination $pkgDir -Force
-Copy-Item -Path (Join-Path $rootDir "一键注册关联.bat") -Destination $pkgDir -Force
-Copy-Item -Path (Join-Path $rootDir "一键取消关联.bat") -Destination $pkgDir -Force
 
 # 5. 生成极简使用说明
 $readmeContent = @"
@@ -88,7 +86,7 @@ Unbox 是专为 Windows 11 设计的极简无扰、双击自动解压工具。
 
 【使用方法】
 1. 首次使用请解压本文件夹到您希望放置的常驻目录（如 D:\Tools\Unbox 或 C:\Program Files\Unbox 等）；
-2. 双击运行【一键注册关联.bat】；
+2. 右键单击【注册关联.ps1】，选择【使用 PowerShell 运行】（或在当前目录打开终端执行 .\注册关联.ps1）；
 3. 系统将自动为常见压缩包格式（.zip, .7z, .rar, .tar.gz 等 44 种格式）登记专用图标与双击解压代理；
 4. 随后直接双击任意压缩包，即可自动开始流式解压！
 5. 解压完成后窗口自动播放提示音并轻盈退出。
@@ -102,7 +100,7 @@ Unbox 是专为 Windows 11 设计的极简无扰、双击自动解压工具。
 - 智能编码还原，杜绝跨平台文件名乱码。
 
 【卸载与清理】
-若您不再需要使用本工具，只需双击运行【一键取消关联.bat】，
+若您不再需要使用本工具，只需右键单击【取消关联.ps1】并选择【使用 PowerShell 运行】，
 即可彻底、干净地清理所有写入系统的关联和注册表项。
 
 开源协议：MIT License / 7-Zip LGPL

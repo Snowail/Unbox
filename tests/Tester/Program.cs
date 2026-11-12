@@ -27,8 +27,20 @@ namespace Tester
             Console.ResetColor();
         }
 
+        [STAThread]
         static int Main(string[] args)
         {
+            if (args.Length > 0 && args[0] == "hero")
+            {
+                string ws = args.Length > 1 ? args[1] : Directory.GetCurrentDirectory();
+                if (!Directory.Exists(Path.Combine(ws, "screenshot")))
+                {
+                    ws = @"C:\WorkSpace\unzip";
+                }
+                HeroGenerator.Generate(ws);
+                return 0;
+            }
+
             Console.WriteLine("==================================================");
             Console.WriteLine("  Windows 双击自动解压代理 · 核心逻辑自动化测试");
             Console.WriteLine("==================================================\n");
