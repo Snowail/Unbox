@@ -781,6 +781,29 @@ namespace Tester
                 skipResult.Delivered && !File.Exists(Path.Combine(skipResult.FinalDirectory, "a-b.txt")));
 
             // -------------------------------------------------------------
+            Console.WriteLine("\n>>> [测试 18] 界面契约：资源键与编码选择面板存在（防止回归为缺失资源）");
+            string sourceRoot = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, @"..\..\..\..\.."));
+            string xamlPath = Path.Combine(sourceRoot, "src", "UnzipProxy", "MainWindow.xaml");
+            string codeBehindPath = Path.Combine(sourceRoot, "src", "UnzipProxy", "MainWindow.xaml.cs");
+            if (File.Exists(xamlPath) && File.Exists(codeBehindPath))
+            {
+                string xaml = File.ReadAllText(xamlPath);
+                string codeBehind = File.ReadAllText(codeBehindPath);
+                foreach (string key in new[] { "Win11Cyan", "Win11Green", "Win11Yellow", "Win11Amber", "Win11Red" })
+                {
+                    Assert($"界面契约: 资源键 {key} 已定义", xaml.Contains($"x:Key=\"{key}\""), key);
+                }
+                Assert("界面契约: 编码选择面板已定义",
+                    xaml.Contains("ModalEncodingPanel") && xaml.Contains("EncodingOptionsPanel"));
+                Assert("界面契约: 不再引用未定义资源 AccentOrangeBrush", !codeBehind.Contains("AccentOrangeBrush"));
+                Assert("界面契约: 界面不再做第二套文件名纠偏", !codeBehind.Contains("FixPotentialMojibake"));
+            }
+            else
+            {
+                Assert("界面契约: 找到界面源码", false, xamlPath);
+            }
+
+            // -------------------------------------------------------------
             Console.WriteLine("\n==================================================");
             Console.WriteLine($"测试总结: 共 {_pass + _fail} 项测试，通过: {_pass}，失败: {_fail}");
             Console.WriteLine("==================================================");

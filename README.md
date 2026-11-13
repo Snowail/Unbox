@@ -1,4 +1,4 @@
-<div align="center">
+﻿<div align="center">
 
 <img src="icon.png" width="128" height="128" alt="Unbox Logo">
 
@@ -295,8 +295,8 @@ graph TD
 
 ## ✅ Quality & Verification
 
-- **发布组件可独立复核**：`dist/Unbox-v1.2.0-win-x64.zip` 的 SHA-256 与测试所用组件记录在 `HANDOFF.md`；包内 `构建信息.txt` 记录 Git 提交号与 `Unbox.exe` / `UnzipWorker.exe` / `7z.dll` 的 SHA-256。
-- **生产完成路径自动化**：`tests/Tester` 直接调用与 WPF 完全相同的 `ExtractionCompleter`（清单对账 → 同名折叠 → 来源标记 → 单次目录改名提交 → 提交后复核 → 逐卷回收），82 项用例覆盖文件名编码、复合 TAR、缺尾卷、空归档、部分完成、回收身份核对，以及真实回收后从回收站落点核对 SHA-256。
+- **发布组件可独立复核**：`dist/Unbox-v1.2.0-win-x64.zip`（SHA-256 `5BA0D530527D9874CF465E42AF96FCA71DDE74690BCB3E81B5E1740AB6E8E659`，源码提交 `20cc0c8`）的完整复核记录写在 `HANDOFF.md`；包内 `构建信息.txt` 记录 Git 提交号与 `Unbox.exe` / `UnzipWorker.exe` / `7z.dll` 的 SHA-256。
+- **生产完成路径自动化**：`tests/Tester` 直接调用与 WPF 完全相同的 `ExtractionCompleter`（清单对账 → 同名折叠 → 来源标记 → 单次目录改名提交 → 提交后复核 → 逐卷回收），90 项用例覆盖文件名编码、复合 TAR、缺尾卷、空归档、部分完成、回收身份核对，以及真实回收后从回收站落点核对 SHA-256。
 - **性能基线**（同机实测）：1,200 个小文件解压 `373 ms` / 13 个进度帧；清单对账 + 单次目录改名提交 `109 ms`。
 
 <br>

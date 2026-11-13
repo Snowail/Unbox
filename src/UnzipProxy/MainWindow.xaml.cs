@@ -931,7 +931,6 @@ namespace UnzipProxy
                 RunningActionPanel.Visibility = Visibility.Collapsed;
                 FinishedActionPanel.Visibility = Visibility.Visible;
                 SystemEffects.PlayFinishedSound();
-                UpdateProgressUi();
                 return;
             }
 
