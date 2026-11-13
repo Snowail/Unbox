@@ -43,38 +43,44 @@
 <!-- Quick Navigation with Icons -->
 <table>
   <tr>
-    <td align="center" width="16%">
+    <td align="center" width="14%">
       <a href="#-the-problem">
         <img src="https://raw.githubusercontent.com/Tarikul-Islam-Anik/Animated-Fluent-Emojis/master/Emojis/Objects/Light%20Bulb.png" width="28"><br>
         <b>痛点与初衷</b>
       </a>
     </td>
-    <td align="center" width="16%">
+    <td align="center" width="14%">
       <a href="#-superpowers">
         <img src="https://raw.githubusercontent.com/Tarikul-Islam-Anik/Animated-Fluent-Emojis/master/Emojis/Travel%20and%20places/Rocket.png" width="28"><br>
         <b>核心特性</b>
       </a>
     </td>
-    <td align="center" width="16%">
+    <td align="center" width="14%">
       <a href="#-get-started">
         <img src="https://raw.githubusercontent.com/Tarikul-Islam-Anik/Animated-Fluent-Emojis/master/Emojis/Objects/Package.png" width="28"><br>
         <b>快速上手</b>
       </a>
     </td>
-    <td align="center" width="16%">
+    <td align="center" width="14%">
       <a href="#-supported-formats">
         <img src="https://raw.githubusercontent.com/Tarikul-Islam-Anik/Animated-Fluent-Emojis/master/Emojis/Activities/Puzzle%20Piece.png" width="28"><br>
         <b>支持格式</b>
       </a>
     </td>
-    <td align="center" width="16%">
+    <td align="center" width="14%">
       <a href="#-architecture">
         <img src="https://raw.githubusercontent.com/Tarikul-Islam-Anik/Animated-Fluent-Emojis/master/Emojis/Objects/Gear.png" width="28"><br>
         <b>架构设计</b>
       </a>
     </td>
-    <td align="center" width="16%">
-      <a href="#-license">
+    <td align="center" width="14%">
+      <a href="#-roadmap">
+        <img src="https://raw.githubusercontent.com/Tarikul-Islam-Anik/Animated-Fluent-Emojis/master/Emojis/Travel%20and%20places/Compass.png" width="28"><br>
+        <b>路线规划</b>
+      </a>
+    </td>
+    <td align="center" width="14%">
+      <a href="#-license--credits">
         <img src="https://raw.githubusercontent.com/Tarikul-Islam-Anik/Animated-Fluent-Emojis/master/Emojis/Smilies/Smiling%20Face%20with%20Hearts.png" width="28"><br>
         <b>开源与致谢</b>
       </a>
@@ -280,6 +286,17 @@ graph TD
   基于 WPF 与 .NET 10 LTS，深度融合 Windows 11 DWM 圆角渲染与深色模式 API。面积图采用高性能分桶推进算法，速度指标经过 500ms EMA 滤波与 30ms 管道限流，UI 帧率极度丝滑；
 - **原生后端（UnzipWorker.exe）**：
   纯原生 C++20 编写，加载官方 `7z.dll` COM 解码接口。依托 Windows `JobObject` 保证主窗口关闭时工作进程 100% 级联终结，绝不发生后台孤儿进程泄漏。
+
+<br>
+
+---
+
+## 🗺️ Roadmap
+
+Unbox 持续演进中，后续版本规划如下：
+
+- [ ] **多国语言国际化 (i18n)**：添加多国语言支持，根据 Windows 系统语言自动选择并切换默认显示语言；
+- [ ] **Windows 11 原生风格归档管理器 (Unbox File Manager)**：提供完整查看、修改、打包压缩包内容的高级文件管理界面，基于 Windows 11 原生 Fluent 风格重新打造类似 7zFM 的现代体验；用户通过**按住 Shift 键双击压缩文件**即可呼出文件管理窗口，兼顾轻量极速解压与深度包内浏览修改的双重需求。
 
 <br>
 
