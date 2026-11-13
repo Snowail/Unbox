@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Threading.Tasks;
@@ -19,6 +20,9 @@ namespace UnzipProxy
     {
         [DllImport("dwmapi.dll")]
         private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
+
+        [DllImport("kernel32.dll")]
+        private static extern uint GetACP();
 
         private const int DWMWA_WINDOW_CORNER_PREFERENCE = 33;
         private const int DWMWCP_ROUND = 2;
@@ -231,10 +235,12 @@ namespace UnzipProxy
                         Directory.CreateDirectory(_plan.StagingDirectory);
                     }
 
+                    uint acp = GetACP();
+                    string cpArg = (acp != 0 && acp != 65001) ? $" --cp {acp}" : "";
                     var psi = new ProcessStartInfo
                     {
                         FileName = workerExe,
-                        Arguments = $"--archive \"{_plan.SourceArchivePath}\" --staging \"{_plan.StagingDirectory}\" --target-root \"{_plan.TargetRootDirName}\"",
+                        Arguments = $"--archive \"{_plan.SourceArchivePath}\" --staging \"{_plan.StagingDirectory}\" --target-root \"{_plan.TargetRootDirName}\"{cpArg}",
                         UseShellExecute = false,
                         RedirectStandardInput = true,
                         RedirectStandardOutput = true,
@@ -249,7 +255,10 @@ namespace UnzipProxy
                         Dispatcher.Invoke(() => TriggerError("启动失败", "无法启动工作进程: " + workerExe));
                         return;
                     }
-                    _jobManager.AssignProcess(_workerProcess);
+                    if (!_jobManager.AssignProcess(_workerProcess))
+                    {
+                        Debug.WriteLine("[WARN] Failed to assign worker process to JobObject");
+                    }
 
                     _workerInput = _workerProcess.StandardInput;
 
@@ -666,7 +675,7 @@ namespace UnzipProxy
             ExpandedContainer.BeginAnimation(OpacityProperty, new DoubleAnimation(targetExpandedOpacity, duration) { EasingFunction = ease });
         }
 
-        // 完成处理 (核验全部条件：退出码 0、无错误、无跳过，方可执行回收)
+        // 完成处理 (严格核验全部条件：Worker 退出码 0、无错误、无跳过、输出落盘完整，方可提交与回收)
         private async void HandleFinished(JsonElement root)
         {
             _isCompleted = true;
@@ -676,6 +685,8 @@ namespace UnzipProxy
             _completedBytes = root.TryGetProperty("completed_bytes", out var cbElem) ? cbElem.GetInt64() : _totalBytes;
             string errorReason = root.TryGetProperty("error_reason", out var erElem) ? (erElem.GetString() ?? "") : "";
             int skippedItems = root.TryGetProperty("skipped_items", out var skpElem) ? skpElem.GetInt32() : 0;
+            int totalItemsReported = root.TryGetProperty("total_items", out var tiElem) ? tiElem.GetInt32() : 0;
+            int extractedItemsReported = root.TryGetProperty("extracted_items", out var eiElem) ? eiElem.GetInt32() : 0;
 
             var openedVols = new List<string>();
             if (root.TryGetProperty("opened_volumes", out var volsElem) && volsElem.ValueKind == JsonValueKind.Array)
@@ -691,17 +702,84 @@ namespace UnzipProxy
                 openedVols.Add(_plan.SourceArchivePath);
             }
 
-            // 等待工作进程彻底退出并获取退出码，保证文件句柄完全释放
-            if (_workerProcess != null && !_workerProcess.HasExited)
+            // 等待工作进程彻底退出并获取退出码，杜绝进程挂死与文件锁未释放
+            bool workerExited = false;
+            if (_workerProcess != null)
             {
-                await Task.Run(() => _workerProcess.WaitForExit(10000));
+                if (!_workerProcess.HasExited)
+                {
+                    workerExited = await Task.Run(() => _workerProcess.WaitForExit(15000));
+                }
+                else
+                {
+                    workerExited = true;
+                }
             }
-            int exitCode = _workerProcess?.ExitCode ?? 0;
-
-            // 处理 TAR.GZ / TGZ 两层复合解压
-            if (_plan != null && Directory.Exists(_plan.StagingDirectory))
+            if (!workerExited && _workerProcess != null)
             {
-                await UnpackInnerTarIfPresentAsync(_plan.StagingDirectory);
+                try { _workerProcess.Kill(); } catch { }
+            }
+            int exitCode = (workerExited && _workerProcess != null) ? _workerProcess.ExitCode : -1;
+
+            // 严格综合判定：必须同时满足状态 ok、退出码 0、无错误原因、无跳过项、进程正常退出
+            bool isFailedOrPartial = (status != "ok") || (exitCode != 0) || !string.IsNullOrEmpty(errorReason) || _hasSkippedItems || (skippedItems > 0) || !workerExited;
+
+            // 严格输出落盘核验：确保解压文件真实写入目标磁盘
+            if (!isFailedOrPartial && _plan != null)
+            {
+                if (totalItemsReported > 0 || extractedItemsReported > 0 || _totalBytes > 0)
+                {
+                    if (!Directory.Exists(_plan.StagingDirectory) || !Directory.EnumerateFileSystemEntries(_plan.StagingDirectory).Any())
+                    {
+                        isFailedOrPartial = true;
+                        errorReason = "output_verification_failed";
+                    }
+                }
+            }
+
+            if (isFailedOrPartial)
+            {
+                // 立即清理暂存残损目录，绝不提交正式目录，绝不回收源包
+                if (_plan != null && Directory.Exists(_plan.StagingDirectory))
+                {
+                    try { Directory.Delete(_plan.StagingDirectory, true); } catch { }
+                }
+
+                MainStatusText.Text = "解压未完成";
+                if (errorReason == "crc_error")
+                {
+                    PathInfoText.Text = "解压失败：文件数据校验 (CRC) 错误，源压缩包已保留。";
+                }
+                else if (errorReason == "data_error")
+                {
+                    PathInfoText.Text = "解压失败：条目数据损坏或归档不完整，源压缩包已保留。";
+                }
+                else if (errorReason == "unsupported_method")
+                {
+                    PathInfoText.Text = "解压失败：压缩算法不受支持，源压缩包已保留。";
+                }
+                else if (errorReason == "corrupted_archive" || errorReason == "unrecognized_or_corrupted_inner_archive")
+                {
+                    PathInfoText.Text = "解压失败：归档已损坏或缺少后续分卷，源压缩包已保留。";
+                }
+                else if (errorReason == "insufficient_disk_space")
+                {
+                    PathInfoText.Text = "解压失败：目标磁盘可用空间不足，已安全终止。";
+                }
+                else if (_hasSkippedItems || skippedItems > 0)
+                {
+                    PathInfoText.Text = "部分条目因字符非法或路径不安全已被跳过，源压缩包已保留。";
+                }
+                else
+                {
+                    PathInfoText.Text = $"解压未完整结束 (Worker 退出码: {exitCode})，源压缩包已安全保留。";
+                }
+
+                PathInfoText.ToolTip = PathInfoText.Text;
+                TitleText.Text = $"解压失败 - {Path.GetFileName(_archivePath)}";
+                RunningActionPanel.Visibility = Visibility.Collapsed;
+                FinishedActionPanel.Visibility = Visibility.Visible;
+                return;
             }
 
             // 提交暂存目录
@@ -711,50 +789,40 @@ namespace UnzipProxy
                 return;
             }
 
-            bool isPartial = (status == "partial") || _hasSkippedItems || (exitCode != 0) || !string.IsNullOrEmpty(errorReason);
-
-            if (isPartial)
+            // 来源标记传递 (Mark of the Web)
+            if (_plan != null && !string.IsNullOrEmpty(_plan.SourceArchivePath) && !string.IsNullOrEmpty(_plan.FinalTargetDirectory))
             {
-                MainStatusText.Text = "部分完成";
-                if (errorReason == "crc_error")
-                {
-                    PathInfoText.Text = "解压完成，但部分文件存在数据校验 (CRC) 错误，源压缩包已保留。";
-                }
-                else if (errorReason == "data_error")
-                {
-                    PathInfoText.Text = "解压完成，但部分条目数据损坏，源压缩包已保留。";
-                }
-                else if (errorReason == "unsupported_method")
-                {
-                    PathInfoText.Text = "压缩算法不受当前引擎支持，源压缩包已保留。";
-                }
-                else if (_hasSkippedItems || skippedItems > 0)
-                {
-                    PathInfoText.Text = "部分条目因字符非法或路径不安全已被跳过，源压缩包已保留。";
-                }
-                else
-                {
-                    PathInfoText.Text = $"解压未完全成功 (状态代码: {exitCode})，源压缩包已安全保留。";
-                }
+                PropagateZoneIdentifier(_plan.SourceArchivePath, _plan.FinalTargetDirectory);
+            }
 
+            // 仅在完全通过时才按用户选择回收源卷
+            string recycleErrMsg = "";
+            bool recycleFailed = false;
+            if (RecycleCheckBox.IsChecked == true && openedVols.Count > 0)
+            {
+                var (recOk, recMsg) = ShellRecycleBin.RecycleOpenedVolumes(openedVols);
+                if (!recOk)
+                {
+                    recycleFailed = true;
+                    recycleErrMsg = recMsg;
+                }
+            }
+
+            if (recycleFailed)
+            {
+                // 阻断项修复：回收失败必须明确向用户反馈，窗口保持打开供用户核实，严禁静默吞错！
+                MainStatusText.Text = "解压完成（源文件回收失败）";
+                MainStatusText.Foreground = (Brush)FindResource("AccentOrangeBrush");
+                DetailEtaText.Text = "已完成";
+                DetailRemainingText.Text = "源文件保留";
+                PathInfoText.Text = $"解压已完成，但无法移入回收站: {recycleErrMsg}。源压缩包已保留在原位。";
                 PathInfoText.ToolTip = PathInfoText.Text;
-                TitleText.Text = $"部分完成 - {Path.GetFileName(_archivePath)}";
                 RunningActionPanel.Visibility = Visibility.Collapsed;
                 FinishedActionPanel.Visibility = Visibility.Visible;
+                SystemEffects.PlayFinishedSound();
             }
             else
             {
-                // 仅在严格成功 (exitCode == 0 && status == ok && errorReason 为空 && 无跳过项) 时才回收
-                string recycleNotice = "";
-                if (RecycleCheckBox.IsChecked == true && openedVols.Count > 0)
-                {
-                    var (recOk, recMsg) = ShellRecycleBin.RecycleOpenedVolumes(openedVols);
-                    if (!recOk)
-                    {
-                        recycleNotice = $" ({recMsg})";
-                    }
-                }
-
                 ExtractProgressBar.Value = 100;
                 TitleText.Text = "已完成 100%";
                 MainStatusText.Text = "已完成 100%";
@@ -770,67 +838,32 @@ namespace UnzipProxy
             }
         }
 
-        // 复合 TAR 归档（如 .tar.gz / .tgz）两层自动解压支持
-        private async Task UnpackInnerTarIfPresentAsync(string stagingDir)
+        // 来源标记传递：若源压缩包带有 Windows 下载安全标记 (:Zone.Identifier)，将其传递给所有解压文件
+        private static void PropagateZoneIdentifier(string sourcePath, string targetDirectory)
         {
             try
             {
-                string[] files = Directory.GetFiles(stagingDir, "*", SearchOption.TopDirectoryOnly);
-                string[] dirs = Directory.GetDirectories(stagingDir, "*", SearchOption.TopDirectoryOnly);
+                string zoneStreamPath = sourcePath + ":Zone.Identifier";
+                if (!File.Exists(zoneStreamPath)) return;
 
-                // 如果外层解压后仅产生一个 .tar 文件且无其它文件/目录
-                if (files.Length == 1 && dirs.Length == 0 && files[0].EndsWith(".tar", StringComparison.OrdinalIgnoreCase))
+                byte[] zoneData = File.ReadAllBytes(zoneStreamPath);
+                if (zoneData == null || zoneData.Length == 0) return;
+
+                foreach (var filePath in Directory.EnumerateFiles(targetDirectory, "*", SearchOption.AllDirectories))
                 {
-                    string tarPath = files[0];
-                    string innerStaging = Path.Combine(stagingDir, $".inner_tar_{Guid.NewGuid():N}");
-                    Directory.CreateDirectory(innerStaging);
-
-                    string appDir = AppDomain.CurrentDomain.BaseDirectory;
-                    string workerExe = Path.Combine(appDir, "UnzipWorker.exe");
-                    if (!File.Exists(workerExe))
+                    try
                     {
-                        string altWorker = Path.GetFullPath(Path.Combine(appDir, @"..\..\..\..\bin\UnzipWorker.exe"));
-                        if (File.Exists(altWorker)) workerExe = altWorker;
+                        File.WriteAllBytes(filePath + ":Zone.Identifier", zoneData);
                     }
-
-                    var psi = new ProcessStartInfo
+                    catch
                     {
-                        FileName = workerExe,
-                        Arguments = $"--archive \"{tarPath}\" --staging \"{innerStaging}\" --target-root \"inner\"",
-                        UseShellExecute = false,
-                        CreateNoWindow = true
-                    };
-
-                    using var p = Process.Start(psi);
-                    if (p != null)
-                    {
-                        await p.WaitForExitAsync();
-                        if (p.ExitCode == 0)
-                        {
-                            // 删除中间过渡的 .tar 文件
-                            File.Delete(tarPath);
-
-                            // 将内层解出的所有文件和目录移动到 stagingDir
-                            foreach (var dir in Directory.GetDirectories(innerStaging))
-                            {
-                                string destDir = Path.Combine(stagingDir, Path.GetFileName(dir));
-                                if (Directory.Exists(destDir)) Directory.Delete(destDir, true);
-                                Directory.Move(dir, destDir);
-                            }
-                            foreach (var file in Directory.GetFiles(innerStaging))
-                            {
-                                string destFile = Path.Combine(stagingDir, Path.GetFileName(file));
-                                if (File.Exists(destFile)) File.Delete(destFile);
-                                File.Move(file, destFile);
-                            }
-                            Directory.Delete(innerStaging, true);
-                        }
+                        // 忽略单个文件的非致命属性写入异常
                     }
                 }
             }
             catch
             {
-                // 复合 TAR 内层解压降级：保留外层提取出的 tar 文件
+                // 来源标记传递防御性异常隔离
             }
         }
 

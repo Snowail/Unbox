@@ -58,12 +58,16 @@ $publishTemp = Join-Path $distDir ".publish_temp"
 if (Test-Path $publishTemp) { Remove-Item -Path $publishTemp -Recurse -Force }
 New-Item -ItemType Directory -Path $publishTemp -Force | Out-Null
 
+& $dotnetExe restore "$rootDir\src\UnzipProxy\UnzipProxy.csproj" -r win-x64
+if ($LASTEXITCODE -ne 0) {
+    throw "Unbox.exe 依赖还原失败！"
+}
+
 & $dotnetExe publish "$rootDir\src\UnzipProxy\UnzipProxy.csproj" `
     -c Release `
     -r win-x64 `
     --self-contained false `
     -p:PublishSingleFile=true `
-    --no-restore `
     -o $publishTemp
 
 if ($LASTEXITCODE -ne 0) {

@@ -34,7 +34,7 @@ if (-not $vcvars) {
 Write-Host "[BUILD] Compiling UnzipWorker.exe..." -ForegroundColor Cyan
 
 $cmd = @"
-`"$vcvars`" && cl.exe /nologo /O2 /std:c++20 /EHsc /DUNICODE /D_UNICODE /I`"$RootDir\src\UnzipWorker`" `"$RootDir\src\UnzipWorker\main.cpp`" /Fe`"$BinDir\UnzipWorker.exe`" /link ole32.lib oleaut32.lib bcrypt.lib advapi32.lib shell32.lib
+`"$vcvars`" && cl.exe /nologo /O2 /utf-8 /std:c++20 /EHsc /DUNICODE /D_UNICODE /I`"$RootDir\src\UnzipWorker`" `"$RootDir\src\UnzipWorker\main.cpp`" /Fe`"$BinDir\UnzipWorker.exe`" /link ole32.lib oleaut32.lib bcrypt.lib advapi32.lib shell32.lib
 "@
 
 cmd.exe /c $cmd

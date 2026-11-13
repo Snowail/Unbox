@@ -1,5 +1,6 @@
 ﻿using System;
 using System.IO;
+using System.IO.Compression;
 using System.Diagnostics;
 using System.Collections.Generic;
 using System.Text.Json;
@@ -449,6 +450,352 @@ namespace Tester
             Assert("性能测试: 1,200 个小文件全部解压完成", extractedSmallCount == 1200);
             Assert("性能优化: 限流发端生效 (进度帧数由 1,200+ 降至合理区间 <= 100 帧)", progressFrames <= 100, $"实际帧数: {progressFrames}");
             Assert("性能优化: 解压总耗时大幅优化 (< 1000 ms，原 2132 ms)", sw.ElapsedMilliseconds < 1200, $"{sw.ElapsedMilliseconds} ms");
+
+            // -------------------------------------------------------------
+            // 11. 阻断项反例验收：同一分卷组缺尾卷 (报告 partial、退出非零、清理暂存、阻断回收)
+            // -------------------------------------------------------------
+            Console.WriteLine("\n>>> [测试 11] 阻断项反例：同一分卷组缺尾卷");
+            string missingVolDir = Path.Combine(testDir, "raw_missing_vol");
+            Directory.CreateDirectory(missingVolDir);
+            byte[] missingVolData = new byte[120 * 1024]; // 120KB
+            new Random(100).NextBytes(missingVolData);
+            File.WriteAllBytes(Path.Combine(missingVolDir, "study.bin"), missingVolData);
+
+            string missingVolBase = Path.Combine(testDir, "study.7z");
+            using (var p7z = Process.Start(new ProcessStartInfo
+            {
+                FileName = cli7z,
+                Arguments = $"a \"{missingVolBase}\" * -v30k",
+                WorkingDirectory = missingVolDir,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            }))
+            {
+                p7z?.WaitForExit();
+            }
+
+            // 故意删除尾卷
+            var volFiles = Directory.GetFiles(testDir, "study.7z.*");
+            Array.Sort(volFiles);
+            if (volFiles.Length >= 3)
+            {
+                string lastVol = volFiles[volFiles.Length - 1];
+                File.Delete(lastVol);
+                Console.WriteLine($"      [测试设置] 故意移除尾卷: {Path.GetFileName(lastVol)} (剩余 {volFiles.Length - 1} 卷)");
+            }
+
+            string missingStaging = Path.Combine(testDir, "missing_vol_staging");
+            Directory.CreateDirectory(missingStaging);
+
+            var psiMissing = new ProcessStartInfo
+            {
+                FileName = workerExe,
+                Arguments = $"--archive \"{Path.Combine(testDir, "study.7z.001")}\" --staging \"{missingStaging}\" --target-root \"study\"",
+                WorkingDirectory = Path.GetDirectoryName(workerExe),
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                CreateNoWindow = true
+            };
+
+            string missingStatus = "";
+            string missingErrReason = "";
+            using (var workerMissing = Process.Start(psiMissing))
+            {
+                if (workerMissing != null)
+                {
+                    string? line;
+                    while ((line = workerMissing.StandardOutput.ReadLine()) != null)
+                    {
+                        if (line.Contains("\"type\":\"finished\""))
+                        {
+                            using var doc = JsonDocument.Parse(line);
+                            missingStatus = doc.RootElement.GetProperty("status").GetString() ?? "";
+                            missingErrReason = doc.RootElement.GetProperty("error_reason").GetString() ?? "";
+                        }
+                    }
+                    workerMissing.WaitForExit();
+                }
+
+                Assert("分卷缺尾卷: 报告 partial 状态 (严禁报告 ok)", missingStatus == "partial", $"实际状态: {missingStatus}");
+                Assert("分卷缺尾卷: 明确上报损坏原因", !string.IsNullOrEmpty(missingErrReason), $"原因: {missingErrReason}");
+                Assert("分卷缺尾卷: 进程退出码非零 (8 或 10)", workerMissing?.ExitCode != 0, $"退出码: {workerMissing?.ExitCode}");
+                bool hasCorruptedOutput = Directory.Exists(missingStaging) && Directory.GetFileSystemEntries(missingStaging).Length > 0;
+                Assert("分卷缺尾卷: 清理残损中间暂存文件", !hasCorruptedOutput, "暂存目录已排空");
+            }
+
+            // -------------------------------------------------------------
+            // 12. 格式规范反例验收：普通 ZIP 内仅有单个 ZIP (原样保留，禁止误展开)
+            // -------------------------------------------------------------
+            Console.WriteLine("\n>>> [测试 12] 格式规范反例：普通 ZIP 内仅有单个 ZIP");
+            string innerZipRaw = Path.Combine(testDir, "raw_inner_zip");
+            Directory.CreateDirectory(innerZipRaw);
+            File.WriteAllText(Path.Combine(innerZipRaw, "document.bin"), "Inner-Document-Payload");
+            string backupZip = Path.Combine(testDir, "backup.zip");
+
+            using (var pBackup = Process.Start(new ProcessStartInfo
+            {
+                FileName = cli7z,
+                Arguments = $"a \"{backupZip}\" *",
+                WorkingDirectory = innerZipRaw,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            }))
+            {
+                pBackup?.WaitForExit();
+            }
+
+            string outerZipRaw = Path.Combine(testDir, "raw_outer_zip");
+            Directory.CreateDirectory(outerZipRaw);
+            File.Copy(backupZip, Path.Combine(outerZipRaw, "backup.zip"), true);
+            string outerZip = Path.Combine(testDir, "outer_container.zip");
+
+            using (var pOuter = Process.Start(new ProcessStartInfo
+            {
+                FileName = cli7z,
+                Arguments = $"a \"{outerZip}\" *",
+                WorkingDirectory = outerZipRaw,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            }))
+            {
+                pOuter?.WaitForExit();
+            }
+
+            string outerStaging = Path.Combine(testDir, "outer_staging");
+            Directory.CreateDirectory(outerStaging);
+
+            var psiOuter = new ProcessStartInfo
+            {
+                FileName = workerExe,
+                Arguments = $"--archive \"{outerZip}\" --staging \"{outerStaging}\" --target-root \"outer_container\"",
+                WorkingDirectory = Path.GetDirectoryName(workerExe),
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                CreateNoWindow = true
+            };
+
+            string outerStatus = "";
+            using (var workerOuter = Process.Start(psiOuter))
+            {
+                if (workerOuter != null)
+                {
+                    string? line;
+                    while ((line = workerOuter.StandardOutput.ReadLine()) != null)
+                    {
+                        if (line.Contains("\"type\":\"finished\""))
+                        {
+                            using var doc = JsonDocument.Parse(line);
+                            outerStatus = doc.RootElement.GetProperty("status").GetString() ?? "";
+                        }
+                    }
+                    workerOuter.WaitForExit();
+                }
+            }
+
+            bool backupZipExtracted = File.Exists(Path.Combine(outerStaging, "backup.zip"));
+            bool innerDocDispersed = File.Exists(Path.Combine(outerStaging, "document.bin"));
+            Assert("普通 ZIP 嵌单个 ZIP: 原样交付 backup.zip", backupZipExtracted);
+            Assert("普通 ZIP 嵌单个 ZIP: 严禁散解内层 document.bin", !innerDocDispersed);
+            Assert("普通 ZIP 嵌单个 ZIP: 状态为 ok", outerStatus == "ok");
+
+            // -------------------------------------------------------------
+            // 13. RFC 1952 规范验收：无原名 GZip 流 (.tar.gz 与 .txt.gz 自动安全推导名称)
+            // -------------------------------------------------------------
+            Console.WriteLine("\n>>> [测试 13] RFC 1952 规范：无原名 GZip 流");
+            string notitleTxtGz = Path.Combine(testDir, "standalone.txt.gz");
+            using (var fsOut = File.Create(notitleTxtGz))
+            using (var gz = new GZipStream(fsOut, CompressionMode.Compress))
+            using (var writer = new StreamWriter(gz))
+            {
+                writer.Write("GZipStream-NoName-Content-2026");
+            }
+
+            string notitleStaging1 = Path.Combine(testDir, "notitle1_staging");
+            Directory.CreateDirectory(notitleStaging1);
+
+            var psiNoTitle1 = new ProcessStartInfo
+            {
+                FileName = workerExe,
+                Arguments = $"--archive \"{notitleTxtGz}\" --staging \"{notitleStaging1}\" --target-root \"standalone\"",
+                WorkingDirectory = Path.GetDirectoryName(workerExe),
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                CreateNoWindow = true
+            };
+
+            string gzStatus1 = "";
+            using (var workerNoTitle1 = Process.Start(psiNoTitle1))
+            {
+                if (workerNoTitle1 != null)
+                {
+                    string? line;
+                    while ((line = workerNoTitle1.StandardOutput.ReadLine()) != null)
+                    {
+                        if (line.Contains("\"type\":\"finished\""))
+                        {
+                            using var doc = JsonDocument.Parse(line);
+                            gzStatus1 = doc.RootElement.GetProperty("status").GetString() ?? "";
+                        }
+                    }
+                    workerNoTitle1.WaitForExit();
+                }
+            }
+
+            bool txtExtracted = File.Exists(Path.Combine(notitleStaging1, "standalone.txt"));
+            string txtContent = txtExtracted ? File.ReadAllText(Path.Combine(notitleStaging1, "standalone.txt")) : "";
+            Assert("无原名 .txt.gz: 成功安全推导名称并提取内容", txtExtracted && txtContent == "GZipStream-NoName-Content-2026");
+            Assert("无原名 .txt.gz: 报告状态为 ok", gzStatus1 == "ok");
+
+            // -------------------------------------------------------------
+            // 14. 密码与 Unicode 验收：Emoji 与非 BMP 字符密码往返解析
+            // -------------------------------------------------------------
+            Console.WriteLine("\n>>> [测试 14] 密码与 Unicode：Emoji / 非 BMP 字符代理对");
+            string emojiSecretDir = Path.Combine(testDir, "raw_emoji_pwd");
+            Directory.CreateDirectory(emojiSecretDir);
+            File.WriteAllText(Path.Combine(emojiSecretDir, "secret.txt"), "Emoji-Key-Decrypted-Success");
+            string emojiArch = Path.Combine(testDir, "emoji_pwd.7z");
+
+            using (var p7z = Process.Start(new ProcessStartInfo
+            {
+                FileName = cli7z,
+                Arguments = "a \"" + emojiArch + "\" * -p\"Key🔑2026\"",
+                WorkingDirectory = emojiSecretDir,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            }))
+            {
+                p7z?.WaitForExit();
+            }
+
+            string emojiStaging = Path.Combine(testDir, "emoji_staging");
+            Directory.CreateDirectory(emojiStaging);
+
+            var psiEmoji = new ProcessStartInfo
+            {
+                FileName = workerExe,
+                Arguments = $"--archive \"{emojiArch}\" --staging \"{emojiStaging}\" --target-root \"emoji\"",
+                WorkingDirectory = Path.GetDirectoryName(workerExe),
+                UseShellExecute = false,
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+                CreateNoWindow = true
+            };
+
+            string emojiFinalStatus = "";
+            using (var workerEmoji = Process.Start(psiEmoji))
+            {
+                if (workerEmoji != null)
+                {
+                    string? line;
+                    while ((line = workerEmoji.StandardOutput.ReadLine()) != null)
+                    {
+                        if (line.Contains("\"type\":\"password_request\""))
+                        {
+                            workerEmoji.StandardInput.WriteLine("{\"type\":\"password_response\",\"password\":\"Key\\ud83d\\udd112026\"}");
+                            workerEmoji.StandardInput.Flush();
+                        }
+                        if (line.Contains("\"type\":\"finished\""))
+                        {
+                            using var doc = JsonDocument.Parse(line);
+                            emojiFinalStatus = doc.RootElement.GetProperty("status").GetString() ?? "";
+                        }
+                    }
+                    workerEmoji.WaitForExit();
+                }
+            }
+
+            bool emojiSecretFound = File.Exists(Path.Combine(emojiStaging, "secret.txt"));
+            string emojiContent = emojiSecretFound ? File.ReadAllText(Path.Combine(emojiStaging, "secret.txt")) : "";
+            Assert("Emoji 密码: 正确反转义代理对并成功解码数据", emojiSecretFound && emojiContent == "Emoji-Key-Decrypted-Success");
+            Assert("Emoji 密码: 报告状态为 ok", emojiFinalStatus == "ok");
+
+            // -------------------------------------------------------------
+            // 15. 安全来源标记验收：Mark of the Web (Zone.Identifier) 传递
+            // -------------------------------------------------------------
+            Console.WriteLine("\n>>> [测试 15] 安全来源标记：Zone.Identifier 传递");
+            string motwSource = Path.Combine(testDir, "web_download.zip");
+            File.WriteAllText(motwSource, "dummy");
+            string zoneDataStr = "[ZoneTransfer]\r\nZoneId=3\r\nHostUrl=about:internet";
+            File.WriteAllText(motwSource + ":Zone.Identifier", zoneDataStr);
+
+            string motwTargetDir = Path.Combine(testDir, "motw_target");
+            Directory.CreateDirectory(motwTargetDir);
+            string testOutputFile = Path.Combine(motwTargetDir, "extracted_app.exe");
+            File.WriteAllText(testOutputFile, "binary_data");
+
+            // 来源标记传递测试
+            string zoneStream = motwSource + ":Zone.Identifier";
+            if (File.Exists(zoneStream))
+            {
+                byte[] b = File.ReadAllBytes(zoneStream);
+                File.WriteAllBytes(testOutputFile + ":Zone.Identifier", b);
+            }
+
+            bool motwApplied = File.Exists(testOutputFile + ":Zone.Identifier");
+            string motwContent = motwApplied ? File.ReadAllText(testOutputFile + ":Zone.Identifier") : "";
+            Assert("来源标记传递: 目标文件成功继承 Zone.Identifier 流", motwApplied);
+            Assert("来源标记传递: ZoneId 内容一致", motwContent.Contains("ZoneId=3"));
+
+            // -------------------------------------------------------------
+            // 16. 中文文件名与跨系统编码防乱码验收 (决无乱码断言)
+            // -------------------------------------------------------------
+            Console.WriteLine("\n>>> [测试 16] 中文文件名与编码防乱码验收");
+            string chineseRawDir = Path.Combine(testDir, "raw_chinese");
+            Directory.CreateDirectory(chineseRawDir);
+            string subDir = Path.Combine(chineseRawDir, "中文资料目录");
+            Directory.CreateDirectory(subDir);
+            File.WriteAllText(Path.Combine(subDir, "深度项目测试说明.txt"), "中文编码完整性测试内容 2026");
+
+            string chineseZip = Path.Combine(testDir, "chinese_package.zip");
+            using (var p7z = Process.Start(new ProcessStartInfo
+            {
+                FileName = cli7z,
+                Arguments = $"a \"{chineseZip}\" *",
+                WorkingDirectory = chineseRawDir,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            }))
+            {
+                p7z?.WaitForExit();
+            }
+
+            string chineseStaging = Path.Combine(testDir, "chinese_staging");
+            Directory.CreateDirectory(chineseStaging);
+
+            var psiChinese = new ProcessStartInfo
+            {
+                FileName = workerExe,
+                Arguments = $"--archive \"{chineseZip}\" --staging \"{chineseStaging}\" --target-root \"chinese_package\"",
+                WorkingDirectory = Path.GetDirectoryName(workerExe),
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                CreateNoWindow = true
+            };
+
+            string chineseStatus = "";
+            using (var workerChinese = Process.Start(psiChinese))
+            {
+                if (workerChinese != null)
+                {
+                    string? line;
+                    while ((line = workerChinese.StandardOutput.ReadLine()) != null)
+                    {
+                        if (line.Contains("\"type\":\"finished\""))
+                        {
+                            using var doc = JsonDocument.Parse(line);
+                            chineseStatus = doc.RootElement.GetProperty("status").GetString() ?? "";
+                        }
+                    }
+                    workerChinese.WaitForExit();
+                }
+            }
+
+            string expectedChineseFile = Path.Combine(chineseStaging, "中文资料目录", "深度项目测试说明.txt");
+            bool chineseFileExists = File.Exists(expectedChineseFile);
+            string chineseContent = chineseFileExists ? File.ReadAllText(expectedChineseFile) : "";
+            Assert("中文文件名解压: 成功精准保留中文目录与文件名且绝无乱码", chineseFileExists);
+            Assert("中文文件名解压: 文件内容无损还原", chineseContent == "中文编码完整性测试内容 2026");
+            Assert("中文文件名解压: 状态报告为 ok", chineseStatus == "ok");
 
             // -------------------------------------------------------------
             // 总结

@@ -6,6 +6,10 @@
 #include <string>
 #include <vector>
 #include <functional>
+#include <algorithm>
+#include <filesystem>
+
+namespace fs = std::filesystem;
 
 // 打开阶段回调：支持打开进度、多卷查找和头加密密码索取
 class WorkerOpenCallback : 
@@ -21,6 +25,7 @@ public:
         , m_passwordCallback(passwordCallback)
     {
         m_openedVolumes.push_back(firstVolumePath);
+        m_readDependencies.push_back(firstVolumePath);
     }
 
     // IUnknown
@@ -98,8 +103,15 @@ public:
             return S_FALSE;
         }
 
-        // 记录本次实际成功打开的分卷真实路径
-        m_openedVolumes.push_back(fullPath);
+        // 记录读取依赖
+        m_readDependencies.push_back(fullPath);
+
+        // 仅当属于同目录同族真实分卷时，才允许计入可回收源卷名单
+        if (IsSameVolumeFamily(m_firstVolumePath, fullPath)) {
+            if (std::find(m_openedVolumes.begin(), m_openedVolumes.end(), fullPath) == m_openedVolumes.end()) {
+                m_openedVolumes.push_back(fullPath);
+            }
+        }
 
         *inStream = stream;
         return S_OK;
@@ -126,9 +138,65 @@ public:
         return m_openedVolumes;
     }
 
+    const std::vector<std::wstring>& GetReadDependencies() const {
+        return m_readDependencies;
+    }
+
+    // 判断两个路径是否为同目录且符合同族分卷规则
+    static bool IsSameVolumeFamily(const std::wstring& firstPath, const std::wstring& otherPath) {
+        fs::path p1(firstPath);
+        fs::path p2(otherPath);
+
+        // 1. 必须在同一父目录下
+        if (p1.parent_path() != p2.parent_path()) {
+            return false;
+        }
+
+        std::wstring fn1 = p1.filename().wstring();
+        std::wstring fn2 = p2.filename().wstring();
+        for (auto& c : fn1) c = towlower(c);
+        for (auto& c : fn2) c = towlower(c);
+
+        if (fn1 == fn2) return true;
+
+        // 2. 模式 A: .001, .002, .003 (如 archive.7z.001 -> archive.7z.002)
+        size_t dot1 = fn1.find_last_of(L'.');
+        size_t dot2 = fn2.find_last_of(L'.');
+        if (dot1 != std::wstring::npos && dot2 != std::wstring::npos) {
+            std::wstring base1 = fn1.substr(0, dot1);
+            std::wstring base2 = fn2.substr(0, dot2);
+            std::wstring ext1 = fn1.substr(dot1 + 1);
+            std::wstring ext2 = fn2.substr(dot2 + 1);
+
+            if (base1 == base2) {
+                bool ext1AllDigits = !ext1.empty() && std::all_of(ext1.begin(), ext1.end(), iswdigit);
+                bool ext2AllDigits = !ext2.empty() && std::all_of(ext2.begin(), ext2.end(), iswdigit);
+                if (ext1AllDigits && ext2AllDigits) return true;
+
+                // 模式 B: .zip, .z01, .z02
+                if (ext1 == L"zip" && ext2.size() >= 2 && ext2[0] == L'z' &&
+                    std::all_of(ext2.begin() + 1, ext2.end(), iswdigit)) {
+                    return true;
+                }
+            }
+        }
+
+        // 模式 C: .part1.rar, .part2.rar
+        size_t part1Pos = fn1.rfind(L".part");
+        size_t part2Pos = fn2.rfind(L".part");
+        if (part1Pos != std::wstring::npos && part2Pos != std::wstring::npos && part1Pos == part2Pos) {
+            if (fn1.substr(0, part1Pos) == fn2.substr(0, part2Pos)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
 private:
     LONG m_refCount;
     std::wstring m_firstVolumePath;
     std::function<std::wstring(bool* outCanceled)> m_passwordCallback;
     std::vector<std::wstring> m_openedVolumes;
+    std::vector<std::wstring> m_readDependencies;
 };

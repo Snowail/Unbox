@@ -30,7 +30,7 @@ set ROOT_DIR=%~dp0..
 if not exist "%ROOT_DIR%\bin" mkdir "%ROOT_DIR%\bin"
 
 echo [BUILD] Compiling UnzipWorker.exe...
-cl.exe /nologo /O2 /std:c++20 /EHsc /DUNICODE /D_UNICODE ^
+cl.exe /nologo /O2 /utf-8 /std:c++20 /EHsc /DUNICODE /D_UNICODE ^
     /I"%ROOT_DIR%\src\UnzipWorker" ^
     "%ROOT_DIR%\src\UnzipWorker\main.cpp" ^
     /Fe"%ROOT_DIR%\bin\UnzipWorker.exe" ^

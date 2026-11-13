@@ -26,8 +26,10 @@ SOFTWARE.
 
 - **7-Zip (7z.dll)**:
   Copyright (C) 1999-2026 Igor Pavlov.
-  Licensed under the GNU LGPL (Lesser General Public License).
-  Source code: https://www.7-zip.org/
+  7-Zip is licensed under the GNU LGPL (Lesser General Public License).
+  The unRAR portion of 7-Zip is covered by the unRAR license restrictions.
+  Full distribution license and terms: https://www.7-zip.org/license.txt
+  Official homepage and source code: https://www.7-zip.org/
 
 - **Icons**:
   Icon original artwork designed by smalllikeart (Flaticon) and adapted for file type associations.

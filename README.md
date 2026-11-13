@@ -215,10 +215,10 @@ Unbox 让解压体验变得像 macOS 的 Archive Utility 一样自然，同时�
 
 ### 1. 下载便携包 (Portable)
 
-直接在 [Releases](https://github.com/Snowa/Unbox/releases) 页面下载最新的 `Unbox-v1.0.0-win-x64.zip`。
+直接在 [Releases](https://github.com/Snowa/Unbox/releases) 页面下载最新的 `Unbox-v1.1.0-win-x64.zip`。
 
 - **免安装**：解压即可使用，支持随身 U 盘便携携带；
-- **自包含单文件**：内置轻量化运行时，无需在系统中提前安装 .NET 或外部组件。
+- **现代轻量化部署**：采用 **.NET 10 LTS 框架依赖部署 (Framework-Dependent)**，包体积仅 ~2.6 MB（缩减 95.3%）。系统仅需安装官方 Windows x64 .NET 10 桌面运行时 (Desktop Runtime)。
 
 ### 2. 一键注册关联
 
@@ -268,16 +268,16 @@ Unbox 采用现代客户端软件的典型**进程隔离双核心架构**：
 
 ```mermaid
 graph TD
-    User([双击压缩包]) --> Proxy[Unbox.exe 主进程<br>WPF / C# .NET 9]
+    User([双击压缩包]) --> Proxy[Unbox.exe 主进程<br>WPF / C# .NET 10 LTS]
     Proxy -->|Win11 任务窗口| UI[Fluent 现代对话框<br>堆积面积图 / 状态机 / 提示音]
     Proxy -->|JobObject 强生命周期绑定| Worker[UnzipWorker.exe 解压核心<br>纯原生 C++20]
     Worker -->|加载 COM 接口| Engine[(7z.dll 官方 26.06 解码库)]
-    Worker -->|匿名管道 JSON 通信 25ms 限流| Proxy
+    Worker -->|匿名管道 JSON 通信 30ms 限流| Proxy
     Worker -->|流式解压 / 字符清洗 / Mac 过滤| Disk[(目标磁盘目录)]
 ```
 
 - **前端交互（Unbox.exe）**：
-  基于 WPF 与 .NET 9，深度融合 Windows 11 DWM 圆角渲染与深色模式 API。面积图采用高性能分桶推进算法，速度指标经过 500ms EMA 滤波与 25ms 管道限流，UI 帧率极度丝滑；
+  基于 WPF 与 .NET 10 LTS，深度融合 Windows 11 DWM 圆角渲染与深色模式 API。面积图采用高性能分桶推进算法，速度指标经过 500ms EMA 滤波与 30ms 管道限流，UI 帧率极度丝滑；
 - **原生后端（UnzipWorker.exe）**：
   纯原生 C++20 编写，加载官方 `7z.dll` COM 解码接口。依托 Windows `JobObject` 保证主窗口关闭时工作进程 100% 级联终结，绝不发生后台孤儿进程泄漏。
 

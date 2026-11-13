@@ -150,6 +150,10 @@ public:
         if (isDir) {
             std::error_code ec;
             fs::create_directories(safeFullPath, ec);
+            if (ec) {
+                m_hasError = true;
+                return HRESULT_FROM_WIN32(ec.value());
+            }
             return S_OK;
         }
 
@@ -159,6 +163,10 @@ public:
         if (parentDir != m_lastCreatedParentDir) {
             std::error_code ec;
             fs::create_directories(parentDir, ec);
+            if (ec) {
+                m_hasError = true;
+                return HRESULT_FROM_WIN32(ec.value());
+            }
             m_lastCreatedParentDir = parentDir;
         }
 

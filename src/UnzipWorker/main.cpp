@@ -64,7 +64,7 @@ std::string EscapeJsonString(const std::string& s) {
     return out;
 }
 
-// 严谨的 JSON 字符串字段提取与反转义（支持包含引号、反斜杠及 Unicode 的合法密码）
+// 严谨的 JSON 字符串字段提取与反转义（完整支持 Unicode 代理对与合法非 BMP 字符/表情/特殊符号）
 std::string ExtractJsonStringField(const std::string& json, const std::string& fieldName) {
     std::string key = "\"" + fieldName + "\":\"";
     size_t pos = json.find(key);
@@ -89,18 +89,33 @@ std::string ExtractJsonStringField(const std::string& json, const std::string& f
                 std::string hexStr = json.substr(i + 1, 4);
                 try {
                     uint32_t codePoint = std::stoul(hexStr, nullptr, 16);
+                    i += 4;
+                    // RFC 8259 规范：处理高低代理对 (High: 0xD800-0xDBFF, Low: 0xDC00-0xDFFF)
+                    if (codePoint >= 0xD800 && codePoint <= 0xDBFF && i + 6 < json.length() && json[i + 1] == '\\' && json[i + 2] == 'u') {
+                        std::string hexLow = json.substr(i + 3, 4);
+                        uint32_t lowPoint = std::stoul(hexLow, nullptr, 16);
+                        if (lowPoint >= 0xDC00 && lowPoint <= 0xDFFF) {
+                            codePoint = 0x10000 + ((codePoint - 0xD800) << 10) + (lowPoint - 0xDC00);
+                            i += 6;
+                        }
+                    }
+
                     if (codePoint < 0x80) {
                         res.push_back((char)codePoint);
                     } else if (codePoint < 0x800) {
                         res.push_back((char)(0xC0 | (codePoint >> 6)));
                         res.push_back((char)(0x80 | (codePoint & 0x3F)));
-                    } else {
+                    } else if (codePoint < 0x10000) {
                         res.push_back((char)(0xE0 | (codePoint >> 12)));
+                        res.push_back((char)(0x80 | ((codePoint >> 6) & 0x3F)));
+                        res.push_back((char)(0x80 | (codePoint & 0x3F)));
+                    } else {
+                        res.push_back((char)(0xF0 | (codePoint >> 18)));
+                        res.push_back((char)(0x80 | ((codePoint >> 12) & 0x3F)));
                         res.push_back((char)(0x80 | ((codePoint >> 6) & 0x3F)));
                         res.push_back((char)(0x80 | (codePoint & 0x3F)));
                     }
                 } catch (...) {}
-                i += 4;
             } else {
                 res.push_back(c);
             }
@@ -116,6 +131,45 @@ std::string ExtractJsonStringField(const std::string& json, const std::string& f
         }
     }
     return res;
+}
+
+// 判断是否为切分分卷入口（.001）
+bool IsSplitVolume(const std::wstring& path) {
+    if (path.size() >= 4) {
+        std::wstring ext = path.substr(path.size() - 4);
+        for (auto& c : ext) c = towlower(c);
+        if (ext == L".001") return true;
+    }
+    return false;
+}
+
+// 判断是否为约定的复合 TAR 归档格式（.tar.gz, .tgz, .tar.bz2 等）
+bool IsCompoundTarArchive(const std::wstring& path) {
+    std::wstring lower = path;
+    for (auto& c : lower) c = towlower(c);
+    const wchar_t* suffixes[] = {
+        L".tar.gz", L".tgz", L".tar.bz2", L".tbz2", L".tbz",
+        L".tar.xz", L".txz", L".tar.zst", L".tzst", L".tar.lzma"
+    };
+    for (const auto& suf : suffixes) {
+        size_t len = wcslen(suf);
+        if (lower.size() >= len && lower.compare(lower.size() - len, len, suf) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// 从归档文件名安全推导单一流的缺省文件名（解决标准 RFC 1952 GZip 无原名头的规范兼容）
+std::wstring DeriveSingleStreamFilename(const std::wstring& archivePath) {
+    fs::path p(archivePath);
+    std::wstring ext = p.extension().wstring();
+    for (auto& c : ext) c = towlower(c);
+    if (ext == L".gz" || ext == L".bz2" || ext == L".xz" || ext == L".zst" || ext == L".lzma" || ext == L".001") {
+        std::wstring stem = p.stem().wstring();
+        if (!stem.empty()) return stem;
+    }
+    return L"extracted_file";
 }
 
 // IPC 发送函数
@@ -224,39 +278,82 @@ std::wstring RequestPasswordFromProxy(bool* outCanceled = nullptr) {
     return g_receivedPassword;
 }
 
-// 复合归档与分卷自动嵌套解压支持（如 split_data.7z.001 展开后为 split_data.7z，或 TAR.GZ 展开后为 TAR）
-bool TryExtractInnerArchive(SevenZipLibrary& lib7z,
-                           WorkerOpenCallback* openCallback,
-                           const std::wstring& stagingDir,
-                           const std::wstring& extractedRelPath,
-                           uint32_t userCodePage,
-                           uint32_t& outInnerItems,
-                           uint32_t& outInnerExtracted) {
-    fs::path innerPath = fs::path(stagingDir) / extractedRelPath;
-    std::error_code ec;
-    if (!fs::exists(innerPath, ec) || fs::is_directory(innerPath, ec)) return false;
+enum class InnerExtractResult {
+    NotApplicable,
+    Success,
+    Failed,
+    Canceled
+};
 
+// 复合归档与分卷自动嵌套解压支持（如 split_data.7z.001 展开后为 split_data.7z，或 TAR.GZ 展开后为 TAR）
+InnerExtractResult TryExtractInnerArchive(SevenZipLibrary& lib7z,
+                                         const std::wstring& stagingDir,
+                                         const std::wstring& actualDiskPath,
+                                         uint32_t userCodePage,
+                                         uint32_t& outInnerItems,
+                                         uint32_t& outInnerExtracted,
+                                         std::string& outErrReason) {
+    outErrReason = "";
+    std::error_code ec;
+    if (!fs::exists(actualDiskPath, ec) || fs::is_directory(actualDiskPath, ec)) {
+        return InnerExtractResult::NotApplicable;
+    }
+
+    fs::path innerPath(actualDiskPath);
     std::wstring ext = innerPath.extension().wstring();
     for (auto& c : ext) c = towlower(c);
     if (ext != L".7z" && ext != L".tar" && ext != L".zip" && ext != L".rar" && ext != L".iso") {
-        return false;
+        return InnerExtractResult::NotApplicable;
     }
 
-    CInFileStream* innerStream = CInFileStream::OpenFile(innerPath.c_str());
-    if (!innerStream) return false;
+    CInFileStream* innerStream = CInFileStream::OpenFile(actualDiskPath.c_str());
+    if (!innerStream) {
+        outErrReason = "cannot_open_inner_stream";
+        return InnerExtractResult::Failed;
+    }
+
+    WorkerOpenCallback* innerOpenCallback = new WorkerOpenCallback(actualDiskPath, [](bool* outCanceled) {
+        return RequestPasswordFromProxy(outCanceled);
+    });
 
     IInArchive* innerArchive = nullptr;
-    if (!lib7z.DetectAndCreateArchive(innerStream, ext, &innerArchive, openCallback, userCodePage) || !innerArchive) {
+    if (!lib7z.DetectAndCreateArchive(innerStream, ext, &innerArchive, innerOpenCallback, userCodePage) || !innerArchive) {
+        innerOpenCallback->Release();
         innerStream->Release();
-        return false;
+        outErrReason = "unrecognized_or_corrupted_inner_archive";
+        return InnerExtractResult::Failed;
     }
 
     uint32_t innerNumItems = 0;
     if (FAILED(innerArchive->GetNumberOfItems(&innerNumItems)) || innerNumItems == 0) {
         innerArchive->Close();
         innerArchive->Release();
+        innerOpenCallback->Release();
         innerStream->Release();
-        return false;
+        outErrReason = "empty_or_corrupted_inner_archive";
+        return InnerExtractResult::Failed;
+    }
+
+    // 统计未压缩总字节数并做磁盘空间预算预检
+    uint64_t totalInnerBytes = 0;
+    for (uint32_t i = 0; i < innerNumItems; ++i) {
+        PROPVARIANT propSize;
+        PropVariantInit(&propSize);
+        if (SUCCEEDED(innerArchive->GetProperty(i, kpidSize, &propSize))) {
+            if (propSize.vt == VT_UI8) totalInnerBytes += propSize.uhVal.QuadPart;
+            else if (propSize.vt == VT_UI4) totalInnerBytes += propSize.ulVal;
+        }
+        PropVariantClear(&propSize);
+    }
+
+    fs::space_info spaceInfo = fs::space(stagingDir, ec);
+    if (!ec && spaceInfo.available < totalInnerBytes) {
+        innerArchive->Close();
+        innerArchive->Release();
+        innerOpenCallback->Release();
+        innerStream->Release();
+        outErrReason = "insufficient_disk_space";
+        return InnerExtractResult::Failed;
     }
 
     // 创建内层过渡暂存目录
@@ -289,18 +386,30 @@ bool TryExtractInnerArchive(SevenZipLibrary& lib7z,
 
     HRESULT hr = innerArchive->Extract(nullptr, (uint32_t)-1, false, innerCallback);
 
-    bool ok = SUCCEEDED(hr) && !innerCallback->HasError();
+    bool ok = SUCCEEDED(hr) && !innerCallback->HasError() && !innerCallback->HasSkipped();
+    if (innerCallback->HasCrcError()) outErrReason = "crc_error";
+    else if (innerCallback->HasDataError()) outErrReason = "data_error";
+    else if (innerCallback->HasUnsupportedMethod()) outErrReason = "unsupported_method";
+    else if (innerCallback->HasError()) outErrReason = "extract_error";
+
     outInnerItems = innerNumItems;
     outInnerExtracted = (uint32_t)innerCallback->GetExtractedItems().size();
 
+    // 关键对称释放：在文件系统移动与删除前，彻底释放全部 COM 实例与文件流
     innerCallback->Release();
     innerArchive->Close();
     innerArchive->Release();
+    innerOpenCallback->Release();
     innerStream->Release();
 
+    if (g_isCanceled) {
+        fs::remove_all(tempSubDir, ec);
+        return InnerExtractResult::Canceled;
+    }
+
     if (ok) {
-        // 删除中间过渡归档
-        fs::remove(innerPath, ec);
+        // 删除中间过渡归档（文件锁已完全释放）
+        fs::remove(actualDiskPath, ec);
 
         // 将内层解出项上移至 stagingDir
         for (const auto& entry : fs::directory_iterator(tempSubDir, ec)) {
@@ -309,10 +418,10 @@ bool TryExtractInnerArchive(SevenZipLibrary& lib7z,
             fs::rename(entry.path(), dest, ec);
         }
         fs::remove_all(tempSubDir, ec);
-        return true;
+        return InnerExtractResult::Success;
     } else {
         fs::remove_all(tempSubDir, ec);
-        return false;
+        return InnerExtractResult::Failed;
     }
 }
 
@@ -416,6 +525,11 @@ int wmain(int argc, wchar_t* argv[]) {
             itemPath = propPath.bstrVal;
         }
         PropVariantClear(&propPath);
+
+        // 标准 RFC 1952 GZip 流可能不含原始文件名头：单流模式下从源归档名智能推导有效安全名称
+        if (itemPath.empty() && numItems == 1) {
+            itemPath = DeriveSingleStreamFilename(archivePath);
+        }
 
         // D5: 自动修复跨系统或代码页可能带来的文件名乱码 (纯 ASCII 路径直接快速略过)
         PathSanitizer::FixMojibake(itemPath, userCodePage != 0 ? userCodePage : SevenZipLibrary::GetDefaultArchiveCodePage());
@@ -594,21 +708,53 @@ int wmain(int argc, wchar_t* argv[]) {
     else if (callback->HasUnsupportedMethod()) errReason = "unsupported_method";
     else if (callback->HasError()) errReason = "extract_error";
 
-    std::vector<std::wstring> openedVolumes = openCallback->GetOpenedVolumes();
+    // 复合归档与分卷自动嵌套解压支持：
+    // 严格约束：仅当外层为分卷入口（.001）或约定复合 TAR（.tar.gz/.tgz 等）时才尝试内层展开；普通归档内的单个嵌入归档保持原样交付
+    bool isSplit = IsSplitVolume(archivePath);
+    bool isCompoundTar = IsCompoundTarArchive(archivePath);
 
-    // 复合归档与分卷自动嵌套解压支持（如 split_data.7z.001 展开后为 split_data.7z，或 TAR.GZ 展开后为 TAR）
-    if (!isPartial && numItems == 1 && extractedCount == 1 && !itemTargetPaths.empty()) {
+    if (!isPartial && (isSplit || isCompoundTar) && numItems == 1 && extractedCount == 1 && !callback->GetExtractedItems().empty()) {
+        std::wstring innerActualDiskPath = callback->GetExtractedItems()[0].diskPath;
         uint32_t innerItems = 0;
         uint32_t innerExtracted = 0;
-        if (TryExtractInnerArchive(lib7z, openCallback, stagingDir, itemTargetPaths[0], userCodePage, innerItems, innerExtracted)) {
+        std::string innerErrReason = "";
+        InnerExtractResult innerRes = TryExtractInnerArchive(
+            lib7z,
+            stagingDir,
+            innerActualDiskPath,
+            userCodePage,
+            innerItems,
+            innerExtracted,
+            innerErrReason
+        );
+
+        if (innerRes == InnerExtractResult::Success) {
             numItems = innerItems;
             extractedCount = innerExtracted;
+        } else if (innerRes == InnerExtractResult::Failed) {
+            // 内层解压失败（如缺尾卷导致拼接不全、内层破损）：必须确立失败状态并清理残损中间文件，坚决阻断源包误删
+            isPartial = true;
+            errReason = innerErrReason.empty() ? "corrupted_archive" : innerErrReason;
+            std::error_code ec;
+            fs::remove_all(stagingDir, ec);
+        } else if (innerRes == InnerExtractResult::Canceled) {
+            std::error_code ec;
+            fs::remove_all(stagingDir, ec);
+            callback->Release();
+            archive->Close();
+            archive->Release();
+            openCallback->Release();
+            inStream->Release();
+            SendIpcMessage("{\"type\":\"canceled\"}");
+            return 0;
         }
     }
 
-    // 关键生命周期对称性修复：
-    // 在发送 finished 消息前，必须关闭全部解压句柄、释放输入流与 COM 实例！
-    // 杜绝“源文件仍被占用导致源包回收失败”或“暂存未落盘导致数据丢失”
+    // 关键安全修复：在 Release() 销毁对象前提前拷贝完指标数据，根除 Use-After-Free 释放后读取
+    uint64_t finalCompletedBytes = callback->GetCompletedBytes();
+    std::vector<std::wstring> openedVolumes = openCallback->GetOpenedVolumes();
+
+    // 严格生命周期对称性：先关闭全部解压句柄、释放输入流与 COM 实例，彻底解绑源文件
     callback->Release();
     archive->Close();
     archive->Release();
@@ -621,7 +767,7 @@ int wmain(int argc, wchar_t* argv[]) {
               << "\",\"total_items\":" << numItems
               << ",\"extracted_items\":" << extractedCount
               << ",\"skipped_items\":" << skippedCount
-              << ",\"completed_bytes\":" << callback->GetCompletedBytes()
+              << ",\"completed_bytes\":" << finalCompletedBytes
               << ",\"error_reason\":\"" << errReason << "\""
               << ",\"opened_volumes\":[";
     for (size_t v = 0; v < openedVolumes.size(); ++v) {
