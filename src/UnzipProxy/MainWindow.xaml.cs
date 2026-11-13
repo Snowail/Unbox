@@ -733,12 +733,36 @@ namespace UnzipProxy
             if (!_isCompleted)
             {
                 SendWorkerMessage("{\"type\":\"cancel\"}");
-                if (_plan != null)
-                {
-                    ArchiveTaskPlanner.CleanupStaging(_plan);
-                }
+                StopWorkerAndCleanup();
+                _isCompleted = true;
             }
             Close();
+        }
+
+        /// <summary>
+        /// 取消或关闭窗口时：先等待工作进程真正退出（必要时强杀），再清理暂存目录，
+        /// 避免在文件仍被占用时清理而留下残留。
+        /// </summary>
+        private void StopWorkerAndCleanup()
+        {
+            try
+            {
+                if (_workerProcess != null && !_workerProcess.HasExited)
+                {
+                    if (!_workerProcess.WaitForExit(3000))
+                    {
+                        _workerProcess.Kill();
+                        _workerProcess.WaitForExit(2000);
+                    }
+                }
+            }
+            catch { }
+
+            if (_plan != null)
+            {
+                ArchiveTaskPlanner.CleanupStaging(_plan);
+            }
+            CleanupManifest();
         }
 
         private void OnCloseClick(object sender, RoutedEventArgs e)
@@ -1105,17 +1129,12 @@ namespace UnzipProxy
         private void OnWindowClosing(object? sender, System.ComponentModel.CancelEventArgs e)
         {
             _speedTimer.Stop();
-            try
+            if (!_isCompleted)
             {
-                if (_workerProcess != null && !_workerProcess.HasExited)
-                {
-                    SendWorkerMessage("{\"type\":\"cancel\"}");
-                    _workerProcess.Kill();
-                }
+                SendWorkerMessage("{\"type\":\"cancel\"}");
+                StopWorkerAndCleanup();
             }
-            catch { }
             _jobManager?.Dispose();
-            CleanupManifest();
         }
     }
 }
