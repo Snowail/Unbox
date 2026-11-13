@@ -62,6 +62,12 @@ namespace Tester
         [STAThread]
         static int Main(string[] args)
         {
+            try
+            {
+                System.Text.Encoding.RegisterProvider(System.Text.CodePagesEncodingProvider.Instance);
+            }
+            catch { }
+
             if (args.Length > 0 && args[0] == "hero")
             {
                 string ws = args.Length > 1 ? args[1] : Directory.GetCurrentDirectory();
@@ -769,10 +775,12 @@ namespace Tester
                 WorkingDirectory = Path.GetDirectoryName(workerExe),
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
+                StandardOutputEncoding = System.Text.Encoding.UTF8,
                 CreateNoWindow = true
             };
 
             string chineseStatus = "";
+            string chineseProgressReported = "";
             using (var workerChinese = Process.Start(psiChinese))
             {
                 if (workerChinese != null)
@@ -780,6 +788,11 @@ namespace Tester
                     string? line;
                     while ((line = workerChinese.StandardOutput.ReadLine()) != null)
                     {
+                        if (line.Contains("\"type\":\"progress\"") && line.Contains("\"current_file\""))
+                        {
+                            using var doc = JsonDocument.Parse(line);
+                            chineseProgressReported = doc.RootElement.GetProperty("current_file").GetString() ?? "";
+                        }
                         if (line.Contains("\"type\":\"finished\""))
                         {
                             using var doc = JsonDocument.Parse(line);
@@ -796,6 +809,16 @@ namespace Tester
             Assert("中文文件名解压: 成功精准保留中文目录与文件名且绝无乱码", chineseFileExists);
             Assert("中文文件名解压: 文件内容无损还原", chineseContent == "中文编码完整性测试内容 2026");
             Assert("中文文件名解压: 状态报告为 ok", chineseStatus == "ok");
+
+            // 验证 UI 进度条与 IPC 管道中文防乱码双重保障
+            bool progressHasChinese = !string.IsNullOrEmpty(chineseProgressReported);
+            bool progressHasNoMojibake = !chineseProgressReported.Contains("甯");
+            Assert("中文详细信息UI管道: progress 汇报中文文件名无乱码 (非甯字开头乱码)", progressHasChinese && progressHasNoMojibake, $"汇报名称: {chineseProgressReported}");
+
+            // 验证 FixPotentialMojibake 双重保险自动修复逻辑
+            string testMojibake = "甯屾嵎涓撲慨\\甯屾嵎鍥锲轰欢\\测试.txt";
+            string autoFixed = UnzipProxy.MainWindow.FixPotentialMojibake(testMojibake);
+            Assert("中文UI双保险修复: 自动纠正 UTF-8 被误按 GBK 解码的乱码", autoFixed.StartsWith("希捷专修"), $"纠正结果: {autoFixed}");
 
             // -------------------------------------------------------------
             // 总结

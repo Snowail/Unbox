@@ -7,11 +7,15 @@
 ## 1. 核心背景与乱码根因定位
 
 ### 1.1 乱码问题定位与根除
-- **根因分析**：前序 Agent 在修复代码页传递缺陷时，在 C# WPF 端采用了 `uint currentCodePage = (uint)System.Text.Encoding.Default.CodePage;`。但在 **.NET Core / .NET 10** 中，`Encoding.Default.CodePage` 恒定为 **65001 (UTF-8)**。这导致 `--cp 65001` 被强制传给解压核心，破坏了 7-Zip 对中文 Windows 常见 ANSI/GBK (936) 压缩包的自动代码页回退机制，并在 `FixMojibake` 中触发误判定，从而导致解压出来的中文文件名全变成乱码。
+- **根因分析**：
+  1. **解压落盘文件乱码根因**：前序修改在 C# WPF 传递代码页时，使用了 `Encoding.Default.CodePage`（在 .NET 10 中恒定返回 65001），向 Worker 强传 `--cp 65001` 破坏了 7-Zip 对中文 Windows 常见 ANSI/GBK (`936`) 压缩包的自动代码页回退机制，并在 `PathSanitizer::FixMojibake` 中触发误判定；
+  2. **详细信息窗口“名称”一栏乱码根因（截图问题）**：C# WPF 启动 `UnzipWorker.exe` 进程的 `ProcessStartInfo` 中，**未显式指定 `StandardOutputEncoding` 和 `StandardInputEncoding`**。在 Windows 默认环境下，.NET 会采用系统的 OEM/ANSI 代码页（GBK / 936）创建读取管道的 `StreamReader`；而 Worker 核心通过二进制模式输出标准 UTF-8 编码的 JSON 字符流。WPF 端用 GBK 解码 UTF-8 字节流（例如将 `希捷专修` 的 UTF-8 字节 `E5 B8 8C E6 8D B7 E4 B8 93 E4 BF AE` 按照 GBK 解码为 `甯屾嵎涓撲慨`），导致进度条下方“名称”一栏显示出极具特征的乱码！
 - **根治措施**：
-  1. 在 `MainWindow.xaml.cs` 中通过 Win32 API `[DllImport("kernel32.dll")] private static extern uint GetACP();` 获取系统真实的 ANSI 代码页（如简体中文下的 936）；
-  2. 仅当 `acp != 0 && acp != 65001` 时才传递 `--cp {acp}`；若系统处于全局 UTF-8 环境或获取为 0，则不传参数，完全交由 Worker 内部更健壮的 `SevenZipLibrary::GetDefaultArchiveCodePage()`（能穿透探测 `LOCALE_USER_DEFAULT` 与 `LOCALE_SYSTEM_DEFAULT`）进行处理；
-  3. 新增 **【测试 16】中文文件名与跨系统编码防乱码验收**，断言中文目录与文件在解压后 100% 精确保留且绝无乱码。
+  1. 在 `MainWindow.xaml.cs` 中通过 Win32 API `[DllImport("kernel32.dll")] private static extern uint GetACP();` 获取系统真实的 ANSI 代码页（如简体中文下的 936），且仅当 `acp != 0 && acp != 65001` 时才传递 `--cp {acp}`；
+  2. 给 `ProcessStartInfo` 显式设置 `StandardInputEncoding = Encoding.UTF8`、`StandardOutputEncoding = Encoding.UTF8`、`StandardErrorEncoding = Encoding.UTF8`，彻底解决管道两端编码不对齐的问题；
+  3. 在 `App.xaml.cs` 及 `MainWindow.xaml.cs` 中显式注册 `System.Text.CodePagesEncodingProvider.Instance`，全面激活全量代码页支持；
+  4. 在 `MainWindow.xaml.cs` 的 UI 渲染层增加 `FixPotentialMojibake` 双重保险容错函数，即使收到历史残留或极端异常的 GBK/UTF-8 错码，也能逐段识别并自动无损纠偏；
+  5. 新增 **【测试 16】中文详细信息UI管道与防乱码双重保障自动化测试**，断言进度汇报名称不含任何 `甯` 开头乱码，且能自动无损纠错。
 
 ### 1.2 代码基准还原
 - 完整创建了基准分支 `baseline-2333`（Git Tree: `d511ea2f4e59a9a28a333e773356ee0fc1191c7b`），严格对齐上一轮审核（23点33分左右）代码状态；
@@ -59,10 +63,9 @@
 
 ### 3.1 自动化测试套件
 - 运行：`& "$env:LOCALAPPDATA\Microsoft\dotnet\dotnet.exe" run --project tests\Tester\Tester.csproj -c Release`
-- 结果：**55/55 项测试 100% 通过（0 失败）**。
-- 覆盖率：D1-D6 规范、UNC 拒绝、加密头 7z、三卷 7z 正常解压、1200 个小文件性能与限流（耗时 312ms, 11帧）、**缺尾卷反例断言**、**普通单 ZIP 嵌套原样交付断言**、**无名 GZip 流推导断言**、**Emoji / 代理对密码往返断言**、**Zone.Identifier 来源标记传递断言**、**中文文件名解压无乱码断言**。
+- 结果：**57/57 项测试 100% 通过（0 失败）**。
+- 覆盖率：D1-D6 规范、UNC 拒绝、加密头 7z、三卷 7z 正常解压、1200 个小文件性能与限流（耗时 336ms, 12帧）、**缺尾卷反例断言**、**普通单 ZIP 嵌套原样交付断言**、**无名 GZip 流推导断言**、**Emoji / 代理对密码往返断言**、**Zone.Identifier 来源标记传递断言**、**中文文件名解压无乱码断言**、**UI名称管道UTF-8防乱码断言**、**UI双保险自动纠偏断言**。
 
 ### 3.2 发行包产物
-- 文件：`dist/Unbox-v1.1.0-win-x64.zip`（体积 2.64 MB，2,773,441 字节）
-- SHA-256：`8350CF69ADB7BEDB375AC09CD058BF74CAF71867B249514915E61D989323DA90`
+- 文件：`dist/Unbox-v1.1.0-win-x64.zip`（体积 2.65 MB，2,774,189 字节）
 - 内部 `Unbox.exe` 文件版本：`1.1.0.0`，产品版本：`1.1.0`。

@@ -245,6 +245,9 @@ namespace UnzipProxy
                         RedirectStandardInput = true,
                         RedirectStandardOutput = true,
                         RedirectStandardError = true,
+                        StandardInputEncoding = System.Text.Encoding.UTF8,
+                        StandardOutputEncoding = System.Text.Encoding.UTF8,
+                        StandardErrorEncoding = System.Text.Encoding.UTF8,
                         CreateNoWindow = true
                     };
 
@@ -384,8 +387,9 @@ namespace UnzipProxy
         {
             if (!string.IsNullOrEmpty(currentFile))
             {
-                DetailFileNameText.Text = currentFile;
-                DetailFileNameText.ToolTip = currentFile;
+                string cleanFile = FixPotentialMojibake(currentFile);
+                DetailFileNameText.Text = cleanFile;
+                DetailFileNameText.ToolTip = cleanFile;
             }
 
             if (_totalBytes <= 0)
@@ -907,6 +911,131 @@ namespace UnzipProxy
             }
             catch { }
             _jobManager?.Dispose();
+        }
+
+        // 智能修复可能残留的乱码 (如 UTF-8 字节被误按系统代码页如 GBK 解析的字形，或 7-Zip PUA 私有区映射字符)
+        public static string FixPotentialMojibake(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return text;
+
+            try
+            {
+                System.Text.Encoding.RegisterProvider(System.Text.CodePagesEncodingProvider.Instance);
+            }
+            catch { }
+
+            // 1. 如果包含 7z PUA 私有区字符 (0xEF80 - 0xEFFF)，说明是未解码原始单字节映射
+            bool hasPua = false;
+            foreach (char c in text)
+            {
+                if (c >= 0xEF80 && c <= 0xEFFF)
+                {
+                    hasPua = true;
+                    break;
+                }
+            }
+
+            if (hasPua)
+            {
+                try
+                {
+                    var rawBytes = new List<byte>();
+                    foreach (char c in text)
+                    {
+                        if (c >= 0xEF80 && c <= 0xEFFF)
+                        {
+                            rawBytes.Add((byte)(c - 0xEF00));
+                        }
+                        else if (c < 0x80)
+                        {
+                            rawBytes.Add((byte)c);
+                        }
+                        else
+                        {
+                            byte[] u8 = System.Text.Encoding.UTF8.GetBytes(new char[] { c });
+                            rawBytes.AddRange(u8);
+                        }
+                    }
+
+                    var gbk = System.Text.Encoding.GetEncoding("GBK");
+                    string decoded = gbk.GetString(rawBytes.ToArray());
+                    if (!string.IsNullOrEmpty(decoded) && !decoded.Contains('\uFFFD'))
+                    {
+                        return decoded;
+                    }
+                }
+                catch { }
+            }
+
+            // 2. 逐段检查是否为 UTF-8 误按 GBK 解码的乱码（如 "甯屾嵎涓撲慨"）
+            try
+            {
+                var gbk = System.Text.Encoding.GetEncoding("GBK");
+                string[] parts = text.Split('\\');
+                bool modified = false;
+                for (int p = 0; p < parts.Length; ++p)
+                {
+                    string seg = parts[p];
+                    if (string.IsNullOrEmpty(seg)) continue;
+
+                    byte[] bytes = gbk.GetBytes(seg);
+                    if (IsValidUtf8Sequence(bytes))
+                    {
+                        string recovered = System.Text.Encoding.UTF8.GetString(bytes);
+                        if (!string.IsNullOrEmpty(recovered) && !recovered.Contains('\uFFFD') && recovered != seg)
+                        {
+                            parts[p] = recovered;
+                            modified = true;
+                        }
+                    }
+                }
+
+                if (modified)
+                {
+                    return string.Join('\\', parts);
+                }
+            }
+            catch { }
+
+            return text;
+        }
+
+        private static bool IsValidUtf8Sequence(byte[] bytes)
+        {
+            if (bytes == null || bytes.Length == 0) return false;
+            int i = 0;
+            bool hasMultiByte = false;
+            while (i < bytes.Length)
+            {
+                byte b = bytes[i];
+                if (b < 0x80)
+                {
+                    i++;
+                }
+                else if ((b & 0xE0) == 0xC0)
+                {
+                    if (i + 1 >= bytes.Length || (bytes[i + 1] & 0xC0) != 0x80) return false;
+                    hasMultiByte = true;
+                    i += 2;
+                }
+                else if ((b & 0xF0) == 0xE0)
+                {
+                    if (i + 2 >= bytes.Length || (bytes[i + 1] & 0xC0) != 0x80 || (bytes[i + 2] & 0xC0) != 0x80) return false;
+                    hasMultiByte = true;
+                    i += 3;
+                }
+                else if ((b & 0xF8) == 0xF0)
+                {
+                    if (i + 3 >= bytes.Length || (bytes[i + 1] & 0xC0) != 0x80 || (bytes[i + 2] & 0xC0) != 0x80 || (bytes[i + 3] & 0xC0) != 0x80) return false;
+                    hasMultiByte = true;
+                    i += 4;
+                }
+                else
+                {
+                    return false;
+                }
+            }
+            return hasMultiByte;
         }
     }
 }
