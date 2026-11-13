@@ -111,6 +111,74 @@ namespace UnzipProxy.Core
             };
         }
 
+        // 如果压缩包解压后的根目录只有唯一一个和压缩包同名的文件夹，折叠这一级冗余同名目录
+        public static bool TryCollapseRedundantSameNameFolder(string stagingDir, string archivePath, string targetRootDirName)
+        {
+            try
+            {
+                if (!Directory.Exists(stagingDir)) return false;
+
+                string[] subDirs = Directory.GetDirectories(stagingDir);
+                string[] subFiles = Directory.GetFiles(stagingDir);
+
+                // 必须满足：根目录下仅有唯一一个子目录，且没有任何其它同级文件
+                if (subDirs.Length != 1 || subFiles.Length != 0) return false;
+
+                string nestedDirPath = subDirs[0];
+                string nestedDirName = Path.GetFileName(nestedDirPath);
+
+                string archiveBaseName = GetArchiveBaseName(archivePath);
+
+                // 判断是否与压缩包同名（不区分大小写），或与目标规划根目录同名
+                bool isSameName = string.Equals(nestedDirName, archiveBaseName, StringComparison.OrdinalIgnoreCase) ||
+                                  string.Equals(nestedDirName, targetRootDirName, StringComparison.OrdinalIgnoreCase);
+
+                // 兼容处理可能带有的递增后缀，如 "希捷专修 (2)" 对应 "希捷专修"
+                if (!isSameName && !string.IsNullOrEmpty(targetRootDirName))
+                {
+                    Match m = Regex.Match(targetRootDirName, @"^(.*?)(?: \(\d+\))?$");
+                    if (m.Success && string.Equals(nestedDirName, m.Groups[1].Value, StringComparison.OrdinalIgnoreCase))
+                    {
+                        isSameName = true;
+                    }
+                }
+
+                if (!isSameName) return false;
+
+                // 执行目录折叠：将子目录内的所有项目上移至 stagingDir
+                string tempNested = Path.Combine(stagingDir, $".unbox_collapse_{Guid.NewGuid():N}");
+                Directory.Move(nestedDirPath, tempNested);
+
+                foreach (var dir in Directory.GetDirectories(tempNested))
+                {
+                    string destDir = Path.Combine(stagingDir, Path.GetFileName(dir));
+                    if (Directory.Exists(destDir))
+                    {
+                        Directory.Delete(destDir, true);
+                    }
+                    Directory.Move(dir, destDir);
+                }
+
+                foreach (var file in Directory.GetFiles(tempNested))
+                {
+                    string destFile = Path.Combine(stagingDir, Path.GetFileName(file));
+                    if (File.Exists(destFile))
+                    {
+                        File.Delete(destFile);
+                    }
+                    File.Move(file, destFile);
+                }
+
+                Directory.Delete(tempNested, true);
+                return true;
+            }
+            catch
+            {
+                // 折叠失败时降级保留原始层级，绝不影响整体解压交付
+                return false;
+            }
+        }
+
         // 提交暂存目录到最终目标目录
         public static bool CommitStagingDirectory(ExtractionPlan plan, out string error)
         {
@@ -122,6 +190,9 @@ namespace UnzipProxy.Core
                     error = "暂存目录不存在";
                     return false;
                 }
+
+                // 检查并折叠冗余的同名单根目录（如 希捷专修.zip -> 希捷专修/希捷专修/... 优化为 希捷专修/...）
+                TryCollapseRedundantSameNameFolder(plan.StagingDirectory, plan.SourceArchivePath, plan.TargetRootDirName);
 
                 // 如果目标目录碰巧刚被创建，重新规划名称
                 string finalPath = plan.FinalTargetDirectory;

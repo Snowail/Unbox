@@ -821,6 +821,84 @@ namespace Tester
             Assert("中文UI双保险修复: 自动纠正 UTF-8 被误按 GBK 解码的乱码", autoFixed.StartsWith("希捷专修"), $"纠正结果: {autoFixed}");
 
             // -------------------------------------------------------------
+            // 17. 同名唯一根目录折叠验收（消灭如 希捷专修/希捷专修/... 冗余双层嵌套）
+            // -------------------------------------------------------------
+            Console.WriteLine("\n>>> [测试 17] 同名唯一根目录折叠验收 (消除冗余双层嵌套)");
+            string collapseTestDir = Path.Combine(testDir, "collapse_suite");
+            Directory.CreateDirectory(collapseTestDir);
+
+            // 正例：压缩包 希捷专修.zip，内部包含单个同名文件夹 希捷专修/
+            string rawSeagateDir = Path.Combine(collapseTestDir, "raw_seagate");
+            Directory.CreateDirectory(rawSeagateDir);
+            string innerSeagateDir = Path.Combine(rawSeagateDir, "希捷专修");
+            string innerFwDir = Path.Combine(innerSeagateDir, "希捷固件");
+            Directory.CreateDirectory(innerFwDir);
+            File.WriteAllText(Path.Combine(innerFwDir, "firmware.bin"), "Seagate-Firmware-Payload-2026");
+            File.WriteAllText(Path.Combine(innerSeagateDir, "使用说明.txt"), "这是希捷专修工具说明文档");
+
+            string seagateZip = Path.Combine(collapseTestDir, "希捷专修.zip");
+            using (var pZip = Process.Start(new ProcessStartInfo
+            {
+                FileName = cli7z,
+                Arguments = $"a \"{seagateZip}\" *",
+                WorkingDirectory = rawSeagateDir,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            }))
+            {
+                pZip?.WaitForExit();
+            }
+
+            // 执行提取规划
+            var seagatePlan = ArchiveTaskPlanner.Plan(seagateZip);
+            Directory.CreateDirectory(seagatePlan.StagingDirectory);
+
+            // 使用 Worker 将其解压至 staging
+            var psiSeagate = new ProcessStartInfo
+            {
+                FileName = workerExe,
+                Arguments = $"--archive \"{seagateZip}\" --staging \"{seagatePlan.StagingDirectory}\" --target-root \"{seagatePlan.TargetRootDirName}\"",
+                WorkingDirectory = Path.GetDirectoryName(workerExe),
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                StandardOutputEncoding = System.Text.Encoding.UTF8,
+                CreateNoWindow = true
+            };
+            using (var pWorker = Process.Start(psiSeagate))
+            {
+                pWorker?.WaitForExit();
+            }
+
+            // 提交暂存目录 (应自动折叠多余同名层级)
+            bool commitOk = ArchiveTaskPlanner.CommitStagingDirectory(seagatePlan, out string commitErr);
+            Assert("同名根目录折叠: 提交暂存目录成功", commitOk, commitErr);
+
+            // 验证产物层级：只有一层 "希捷专修"，直接包含 "希捷固件" 和 "使用说明.txt"
+            string finalFolder = seagatePlan.FinalTargetDirectory;
+            bool directReadmeExists = File.Exists(Path.Combine(finalFolder, "使用说明.txt"));
+            bool directFwDirExists = Directory.Exists(Path.Combine(finalFolder, "希捷固件"));
+            bool doubleNestExists = Directory.Exists(Path.Combine(finalFolder, "希捷专修"));
+
+            Assert("同名根目录折叠: 第一级直属包含解压文件 (消除双层嵌套)", directReadmeExists);
+            Assert("同名根目录折叠: 第一级直属包含子文件夹", directFwDirExists);
+            Assert("同名根目录折叠: 不存在第二层同名冗余子目录", !doubleNestExists);
+
+            // 反例 1：如果根目录有同名目录，但同时有同级文件，坚决不折叠
+            string noFoldStaging1 = Path.Combine(collapseTestDir, "nofold_staging1");
+            Directory.CreateDirectory(Path.Combine(noFoldStaging1, "测试包"));
+            File.WriteAllText(Path.Combine(noFoldStaging1, "测试包", "sub.txt"), "sub");
+            File.WriteAllText(Path.Combine(noFoldStaging1, "root_file.txt"), "root");
+            bool folded1 = ArchiveTaskPlanner.TryCollapseRedundantSameNameFolder(noFoldStaging1, "C:\\test\\测试包.zip", "测试包");
+            Assert("同名目录折叠反例: 存在同级独立文件时不折叠", !folded1);
+
+            // 反例 2：唯一子目录但名称与压缩包不同，坚决不折叠
+            string noFoldStaging2 = Path.Combine(collapseTestDir, "nofold_staging2");
+            Directory.CreateDirectory(Path.Combine(noFoldStaging2, "不同名子目录"));
+            File.WriteAllText(Path.Combine(noFoldStaging2, "不同名子目录", "sub.txt"), "sub");
+            bool folded2 = ArchiveTaskPlanner.TryCollapseRedundantSameNameFolder(noFoldStaging2, "C:\\test\\测试包.zip", "测试包");
+            Assert("同名目录折叠反例: 唯一子目录不同名时不折叠", !folded2);
+
+            // -------------------------------------------------------------
             // 总结
             // -------------------------------------------------------------
             Console.WriteLine("\n==================================================");
