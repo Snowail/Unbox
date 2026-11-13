@@ -10,6 +10,9 @@ namespace UnzipProxy.Core
         public string InvalidCharsAction { get; set; } = "ask"; // "ask", "batch_rename", "skip"
         public bool RememberInvalidCharsAction { get; set; } = false;
         public bool IsDetailsExpanded { get; set; } = false; // 记忆详细信息展开状态，默认折叠
+        // 文件名编码：0 表示自动（按系统 ANSI 代码页），否则使用指定代码页
+        public int ArchiveCodePage { get; set; } = 0;
+        public bool RememberArchiveCodePage { get; set; } = false;
     }
 
     public static class ConfigManager

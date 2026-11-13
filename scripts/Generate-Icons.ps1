@@ -94,4 +94,54 @@ foreach ($png in $pngFiles) {
     Write-Host "  已生成: $icoName (含 16~256px)"
 }
 
+# 为非 Windows 原生的虚拟机镜像生成带格式文字的专用图标（不再复用 VHD 图标）
+$badgeSources = @(
+    @{ Name = "vmdk"; Label = "VMDK" },
+    @{ Name = "vdi";  Label = "VDI" },
+    @{ Name = "qcow"; Label = "QCOW" }
+)
+$badgeBasePng = Join-Path $iconsSourceDir "origin.png"
+if (Test-Path $badgeBasePng) {
+    foreach ($badge in $badgeSources) {
+        $tempPng = Join-Path ([System.IO.Path]::GetTempPath()) ("unbox_badge_" + $badge.Name + ".png")
+        $sourceImg = [System.Drawing.Image]::FromFile($badgeBasePng)
+        $bitmap = New-Object System.Drawing.Bitmap 256, 256
+        $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+        $graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+        $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
+        $graphics.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
+        $graphics.DrawImage($sourceImg, 0, 0, 256, 256)
+        $sourceImg.Dispose()
+
+        # origin.png 中间的黄色标签区域（512 源图 48..316 x 112..262 -> 256 图 24..158 x 56..131）
+        $labelRect = New-Object System.Drawing.RectangleF 24, 56, 134, 75
+        $labelText = $badge.Label
+        $fontSize = 46
+        $font = New-Object System.Drawing.Font "Segoe UI", $fontSize, ([System.Drawing.FontStyle]::Bold), ([System.Drawing.GraphicsUnit]::Pixel)
+        $textSize = $graphics.MeasureString($labelText, $font)
+        while ($textSize.Width -gt ($labelRect.Width - 10) -and $fontSize -gt 18) {
+            $font.Dispose()
+            $fontSize -= 2
+            $font = New-Object System.Drawing.Font "Segoe UI", $fontSize, ([System.Drawing.FontStyle]::Bold), ([System.Drawing.GraphicsUnit]::Pixel)
+            $textSize = $graphics.MeasureString($labelText, $font)
+        }
+        $format = New-Object System.Drawing.StringFormat
+        $format.Alignment = [System.Drawing.StringAlignment]::Center
+        $format.LineAlignment = [System.Drawing.StringAlignment]::Center
+        $textBrush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(255, 30, 41, 59))
+        $graphics.DrawString($labelText, $font, $textBrush, $labelRect, $format)
+        $graphics.Dispose()
+        $font.Dispose()
+        $format.Dispose()
+        $textBrush.Dispose()
+
+        $bitmap.Save($tempPng, [System.Drawing.Imaging.ImageFormat]::Png)
+        $bitmap.Dispose()
+
+        Convert-PngToMultiSizeIco -sourcePngPath $tempPng -outputIcoPath (Join-Path $outputIconsDir ("$($badge.Name).ico"))
+        Remove-Item -Path $tempPng -Force
+        Write-Host "  已生成: $($badge.Name).ico (按格式文字定制的镜像图标)"
+    }
+}
+
 Write-Host "[OK] 全部图标生成完毕！"

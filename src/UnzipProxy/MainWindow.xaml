@@ -1,4 +1,4 @@
-﻿<Window x:Class="UnzipProxy.MainWindow"
+<Window x:Class="UnzipProxy.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
@@ -384,6 +384,28 @@
                             <CheckBox x:Name="RememberInvalidCharsCheck" Content="记住我的选择，以后不再询问" FontSize="11" Foreground="{DynamicResource SubTextBrush}" Margin="0,0,0,14" />
 
                             <Button Style="{StaticResource FluentPrimaryButtonStyle}" Content="确定应用" HorizontalAlignment="Right" Click="OnInvalidCharsSubmitClick" />
+                        </StackPanel>
+
+                        <!-- 文件名编码选择弹窗（编码不确定时） -->
+                        <StackPanel x:Name="ModalEncodingPanel" Visibility="Collapsed">
+                            <TextBlock Text="压缩包内的文件名缺少可靠的编码声明，请选择能正确显示文件名的解码方式：" 
+                                       TextWrapping="Wrap" 
+                                       FontSize="12" 
+                                       Foreground="{DynamicResource TextForegroundBrush}" 
+                                       Margin="0,0,0,8" />
+                            <Border Background="{DynamicResource CardBackgroundBrush}" 
+                                    BorderBrush="{DynamicResource WindowBorderBrush}" 
+                                    BorderThickness="1" 
+                                    CornerRadius="4" 
+                                    Padding="8" 
+                                    MaxHeight="150" 
+                                    Margin="0,0,0,10">
+                                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                                    <StackPanel x:Name="EncodingOptionsPanel" />
+                                </ScrollViewer>
+                            </Border>
+                            <CheckBox x:Name="RememberEncodingCheck" Content="记住我的选择，以后遇到同类压缩包不再询问" FontSize="11" Foreground="{DynamicResource SubTextBrush}" Margin="0,0,0,14" />
+                            <Button Style="{StaticResource FluentPrimaryButtonStyle}" Content="应用并继续" HorizontalAlignment="Right" Click="OnEncodingSubmitClick" />
                         </StackPanel>
                     </StackPanel>
                 </Border>

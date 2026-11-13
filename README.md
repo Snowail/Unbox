@@ -14,7 +14,7 @@
 
 <p>
   <a href="https://github.com/Snowa/Unbox/releases">
-    <img src="https://img.shields.io/badge/Release-v1.0.0-00C853?style=for-the-badge&logo=github&labelColor=000000" alt="Release">
+    <img src="https://img.shields.io/badge/Release-v1.2.0-00C853?style=for-the-badge&logo=github&labelColor=000000" alt="Release">
   </a>
   <a href="https://github.com/Snowa/Unbox">
     <img src="https://img.shields.io/badge/Platform-Windows_11_%7C_10-0078D4?style=for-the-badge&logo=windows&labelColor=000000" alt="Platform">
@@ -23,7 +23,7 @@
     <img src="https://img.shields.io/badge/Architecture-x64-555555?style=for-the-badge&logo=amd&labelColor=000000" alt="Architecture">
   </a>
   <a href="https://github.com/Snowa/Unbox">
-    <img src="https://img.shields.io/badge/Core-C%2B%2B20_%7C_WPF_.NET_9-512BD4?style=for-the-badge&logo=dotnet&labelColor=000000" alt="Core">
+    <img src="https://img.shields.io/badge/Core-C%2B%2B20_%7C_WPF_.NET_10-512BD4?style=for-the-badge&logo=dotnet&labelColor=000000" alt="Core">
   </a>
   <a href="https://www.7-zip.org/">
     <img src="https://img.shields.io/badge/Engine-7--Zip_26.06-FF8C00?style=for-the-badge&labelColor=000000" alt="Engine">
@@ -164,8 +164,9 @@ Unbox 让解压体验变得像 macOS 的 Archive Utility 一样自然，同时�
         <sub>包内层级完整保留</sub>
       </td>
       <td>
-        • <b>不折叠顶层目录</b>：压缩包解压后统一以包名建立根目录（如 <code>测试.zip</code> 内有 <code>release/src/main.c</code>，解压后得到 <code>测试/release/src/main.c</code>）；<br>
-        • <b>复合扩展名智能剥离</b>：<code>.tar.gz</code>、<code>.tar.xz</code>、<code>.tgz</code> 一步到位提取内部内容并建立纯净包名根目录；<br>
+        • <b>保留包内层级</b>：压缩包解压后统一以包名建立根目录（如 <code>测试.zip</code> 内有 <code>release/src/main.c</code>，解压后得到 <code>测试/release/src/main.c</code>）；<br>
+        • <b>同名唯一根目录折叠</b>：仅当包内<strong>恰好只有一个子目录、无同级文件、且该子目录与压缩包基名一致</strong>时，才折叠这一级冗余同名目录（<code>希捷专修.zip</code> → <code>希捷专修/…</code>）。包名本身带 <code>(2)</code> 之类的后缀不会被误判；<br>
+        • <b>复合扩展名智能剥离</b>：<code>.tar.gz</code>、<code>.tar.xz</code>、<code>.tgz</code> 按<strong>内容</strong>确认内层 TAR 后再展开，无原名、原名无扩展名的样本同样交付最终正文；<br>
         • <b>同名自动递增</b>：目标同级目录下若存在同名文件夹，自动递增命名为 <code>测试 (2)</code>、<code>测试 (3)</code>，<b>绝不覆盖已有文件</b>。
       </td>
     </tr>
@@ -177,7 +178,8 @@ Unbox 让解压体验变得像 macOS 的 Archive Utility 一样自然，同时�
       <td>
         • <b>偏好持久化记忆</b>：界面勾选“解压完成后移入回收站”自动跨会话持久化保存；<br>
         • <b>分卷与无校验格式警示</b>：每次取消勾选后重新勾选时，贴心提示分卷包整组移入风险；<br>
-        • <b>安全兜底原则</b>：仅当解压 100% 成功且校验通过时才回收源包；网络路径、不支持回收介质、中途取消或跳过条目时，<b>绝对保留源包</b>。
+        • <b>逐卷可验证的回收</b>：只回收本次真正读取过的源卷；回收前用<b>卷序列号 + 128 位文件 ID + 长度 + 修改时间</b>核对身份（被替换的文件拒绝回收），随后通过 Shell <code>IFileOperation</code> 显式回收，并<b>逐卷报告真实结果与回收站落点</b>；<br>
+        • <b>安全兜底原则</b>：仅当全部交付内容通过<b>逐项清单对账</b>（路径/类型/长度，回收前追加 CRC32 摘要）时才回收源包；网络路径、不支持回收介质、中途取消、用户跳过条目或任一校验不一致时，<b>绝对保留源包</b>。按产品规则过滤的 macOS 元数据不计为跳过项。
       </td>
     </tr>
     <tr>
@@ -196,8 +198,8 @@ Unbox 让解压体验变得像 macOS 的 Archive Utility 一样自然，同时�
         <sub>告别乱码与苹果垃圾文件</sub>
       </td>
       <td>
-        • <b>跨平台编码自动还原</b>：智能探测并修复 GBK、Shift-JIS 及 UTF-8 编码，消除从 macOS/Linux 转移到 Windows 的乱码困扰；<br>
-        • <b>静默过滤苹果辅助文件</b>：解压时自动拦截并丢弃 <code>__MACOSX/</code> 目录、<code>.DS_Store</code> 及 <code>._*</code> 资源分叉文件，保持输出目录干净整洁。
+        • <b>尊重归档声明的文件名编码</b>：ZIP 通用标志位（bit 11）声明为 UTF-8 的名称逐字保留，未声明编码的名称按系统代码页解码；仅当编码确实不确定时才弹出<b>编码选择框</b>（可选 UTF-8 / GBK / Big5 / Shift-JIS / EUC-KR 等，并附示例名）；<br>
+        • <b>静默过滤苹果辅助文件</b>：解压时自动拦截并丢弃 <code>__MACOSX/</code> 目录、<code>.DS_Store</code> 及 <code>._*</code> 资源分叉文件，保持输出目录干净整洁；过滤项单独计数，不会导致正常文件被丢弃。
       </td>
     </tr>
     <tr>
@@ -207,7 +209,7 @@ Unbox 让解压体验变得像 macOS 的 Archive Utility 一样自然，同时�
       </td>
       <td>
         • <b>非法字符自动清洗</b>：Windows 禁用字符（<code>:*?"<>|</code> 等）默认批量替换为 <code>-</code>，系统保留设备名（<code>CON</code>、<code>AUX</code> 等）自动加安全前缀；<br>
-        • <b>跳过项联动规则</b>：若用户选择跳过非法条目，任务最终明确显示为“部分完成”，且源压缩包自动保留，杜绝数据意外丢失。
+        • <b>跳过项联动规则</b>：若用户选择跳过非法条目，<b>可表示的文件仍会正常交付</b>，任务最终明确显示为“部分完成”，源压缩包自动保留，杜绝数据意外丢失；提取失败（CRC/数据损坏/缺卷）则整体不交付。
       </td>
     </tr>
   </tbody>
@@ -221,7 +223,7 @@ Unbox 让解压体验变得像 macOS 的 Archive Utility 一样自然，同时�
 
 ### 1. 下载便携包 (Portable)
 
-直接在 [Releases](https://github.com/Snowa/Unbox/releases) 页面下载最新的 `Unbox-v1.1.0-win-x64.zip`。
+直接在 [Releases](https://github.com/Snowa/Unbox/releases) 页面下载最新的 `Unbox-v1.2.0-win-x64.zip`。
 
 - **免安装**：解压即可使用，支持随身 U 盘便携携带；
 - **现代轻量化部署**：采用 **.NET 10 LTS 框架依赖部署 (Framework-Dependent)**，包体积仅 ~2.6 MB（缩减 95.3%）。系统仅需安装官方 Windows x64 .NET 10 桌面运行时 (Desktop Runtime)。
@@ -286,6 +288,16 @@ graph TD
   基于 WPF 与 .NET 10 LTS，深度融合 Windows 11 DWM 圆角渲染与深色模式 API。面积图采用高性能分桶推进算法，速度指标经过 500ms EMA 滤波与 30ms 管道限流，UI 帧率极度丝滑；
 - **原生后端（UnzipWorker.exe）**：
   纯原生 C++20 编写，加载官方 `7z.dll` COM 解码接口。依托 Windows `JobObject` 保证主窗口关闭时工作进程 100% 级联终结，绝不发生后台孤儿进程泄漏。
+
+<br>
+
+---
+
+## ✅ Quality & Verification
+
+- **发布组件可独立复核**：`dist/Unbox-v1.2.0-win-x64.zip` 的 SHA-256 与测试所用组件记录在 `HANDOFF.md`；包内 `构建信息.txt` 记录 Git 提交号与 `Unbox.exe` / `UnzipWorker.exe` / `7z.dll` 的 SHA-256。
+- **生产完成路径自动化**：`tests/Tester` 直接调用与 WPF 完全相同的 `ExtractionCompleter`（清单对账 → 同名折叠 → 来源标记 → 单次目录改名提交 → 提交后复核 → 逐卷回收），82 项用例覆盖文件名编码、复合 TAR、缺尾卷、空归档、部分完成、回收身份核对，以及真实回收后从回收站落点核对 SHA-256。
+- **性能基线**（同机实测）：1,200 个小文件解压 `373 ms` / 13 个进度帧；清单对账 + 单次目录改名提交 `109 ms`。
 
 <br>
 

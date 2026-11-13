@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -7,6 +7,7 @@ using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Controls;
 using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
@@ -32,15 +33,19 @@ namespace UnzipProxy
         private JobObjectManager? _jobManager;
         private Process? _workerProcess;
         private StreamWriter? _workerInput;
+        private string _manifestPath = "";
 
         private UserSettings _settings;
         private bool _isDarkMode = true;
         private bool _isPaused = false;
         private bool _isCompleted = false;
-        private bool _hasSkippedItems = false;
         private bool _isDetailsExpanded = false;
 
-        // 精确匹配原生 Win11 尺寸：宽度 480，折叠 156，展开 306，全系统 DPI 缩放下绝不截断
+        // 完成 / 错误消息只允许被处理一次，杜绝 EOF 兜底覆盖具体错误
+        private bool _finishedHandled = false;
+        private bool _workerErrorShown = false;
+
+        // 精确匹配原生 Win11 尺寸
         private const double CollapsedHeight = 156.0;
         private const double ExpandedHeight = 306.0;
         private const double ExpandedDetailsHeight = 158.0;
@@ -48,8 +53,8 @@ namespace UnzipProxy
         // 速度采样与指标
         private readonly DispatcherTimer _speedTimer;
         private long _lastBytes = 0;
-        private DateTime _lastTime = DateTime.UtcNow;
         private DateTime _startTime = DateTime.UtcNow;
+        private DateTime _lastTime = DateTime.UtcNow;
         private double _currentSpeedMBps = 0.0;
         private double _displayedSpeedMBps = 0.0;
         private DateTime _lastSpeedDisplayTime = DateTime.UtcNow;
@@ -61,6 +66,9 @@ namespace UnzipProxy
         private volatile bool _isUiUpdatePending = false;
         private string _pendingCurrentFile = "";
 
+        // 编码选择状态
+        private uint _pendingPreferredCodePage = 0;
+
         public MainWindow(string archivePath)
         {
             InitializeComponent();
@@ -70,7 +78,6 @@ namespace UnzipProxy
             ApplyWin11Theme();
             InitWindowCorner();
 
-            // 恢复配置与记忆展开状态
             RecycleCheckBox.IsChecked = _settings.RecycleOnSuccess;
             _isDetailsExpanded = _settings.IsDetailsExpanded;
 
@@ -95,7 +102,6 @@ namespace UnzipProxy
                 ToggleDetailsText.Text = "详细信息";
             }
 
-            // 周期性速度与 ETA 辅助刷新定时器 (100ms)
             _speedTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(100) };
             _speedTimer.Tick += OnSpeedTimerTick;
 
@@ -148,9 +154,8 @@ namespace UnzipProxy
                 Resources["ButtonPressedBrush"] = new SolidColorBrush(Color.FromRgb(66, 66, 66));
                 Resources["ProgressTrackBrush"] = new SolidColorBrush(Color.FromRgb(55, 55, 55));
 
-                // 暗色模式：运行中为 Win11 亮青蓝 (#4CC2FF)，暂停为亮金黄 (#FCE100)
-                Resources["AccentProgressBrush"] = _isPaused 
-                    ? (SolidColorBrush)Resources["Win11Yellow"] 
+                Resources["AccentProgressBrush"] = _isPaused
+                    ? (SolidColorBrush)Resources["Win11Yellow"]
                     : (SolidColorBrush)Resources["Win11Cyan"];
 
                 SpeedGraph.IsDarkMode = true;
@@ -168,9 +173,8 @@ namespace UnzipProxy
                 Resources["ButtonPressedBrush"] = new SolidColorBrush(Color.FromRgb(225, 225, 225));
                 Resources["ProgressTrackBrush"] = new SolidColorBrush(Color.FromRgb(230, 230, 230));
 
-                // 浅色模式：运行中为 Win11 翠绿 (#107C41)，暂停为琥珀金 (#C19C00)
-                Resources["AccentProgressBrush"] = _isPaused 
-                    ? (SolidColorBrush)Resources["Win11Amber"] 
+                Resources["AccentProgressBrush"] = _isPaused
+                    ? (SolidColorBrush)Resources["Win11Amber"]
                     : (SolidColorBrush)Resources["Win11Green"];
 
                 SpeedGraph.IsDarkMode = false;
@@ -187,7 +191,6 @@ namespace UnzipProxy
                 return;
             }
 
-            // 规划目录结构 (D1 规则)
             _plan = ArchiveTaskPlanner.Plan(_archivePath);
             TitleText.Text = "已完成 0%";
             MainStatusText.Text = "已完成 0%";
@@ -222,25 +225,28 @@ namespace UnzipProxy
 
                     if (!File.Exists(workerExe))
                     {
-                        Dispatcher.Invoke(() =>
-                        {
-                            TriggerError("启动失败", "找不到解压工作组件: UnzipWorker.exe");
-                        });
+                        Dispatcher.Invoke(() => TriggerError("启动失败", "找不到解压工作组件: UnzipWorker.exe"));
                         return;
                     }
 
-                    // 创建独占暂存目录
                     if (!Directory.Exists(_plan!.StagingDirectory))
                     {
                         Directory.CreateDirectory(_plan.StagingDirectory);
                     }
 
-                    uint acp = GetACP();
-                    string cpArg = (acp != 0 && acp != 65001) ? $" --cp {acp}" : "";
+                    // 交付清单放在暂存目录之外，避免进入最终交付树
+                    _manifestPath = Path.Combine(_plan.DestinationParentDir, $".unbox_manifest_{Guid.NewGuid():N}.json");
+
+                    uint codePage = _settings.ArchiveCodePage != 0
+                        ? (uint)_settings.ArchiveCodePage
+                        : GetACP();
+                    string cpArg = (codePage != 0 && codePage != 65001) ? $" --cp {codePage}" : "";
+
                     var psi = new ProcessStartInfo
                     {
                         FileName = workerExe,
-                        Arguments = $"--archive \"{_plan.SourceArchivePath}\" --staging \"{_plan.StagingDirectory}\" --target-root \"{_plan.TargetRootDirName}\"{cpArg}",
+                        Arguments = $"--archive \"{_plan.SourceArchivePath}\" --staging \"{_plan.StagingDirectory}\" " +
+                                    $"--target-root \"{_plan.TargetRootDirName}\"{cpArg} --manifest \"{_manifestPath}\"",
                         UseShellExecute = false,
                         RedirectStandardInput = true,
                         RedirectStandardOutput = true,
@@ -267,24 +273,21 @@ namespace UnzipProxy
 
                     ListenWorkerOutput(_workerProcess.StandardOutput);
 
-                    // 管道读完后等待工作进程退出
                     _workerProcess.WaitForExit();
-                    if (!_isCompleted && !_isPaused)
+                    if (!_finishedHandled && !_workerErrorShown && !_isCompleted)
                     {
                         string stdErr = _workerProcess.StandardError.ReadToEnd();
                         int exitCode = _workerProcess.ExitCode;
                         Dispatcher.Invoke(() =>
                         {
-                            TriggerError("解压中断", $"工作进程异常退出 (退出代码: {exitCode}) {(string.IsNullOrEmpty(stdErr) ? "" : ": " + stdErr)}");
+                            TriggerError("解压中断", $"工作进程异常退出 (退出代码: {exitCode})" +
+                                                     (string.IsNullOrEmpty(stdErr) ? "" : ": " + stdErr));
                         });
                     }
                 }
                 catch (Exception ex)
                 {
-                    Dispatcher.Invoke(() =>
-                    {
-                        TriggerError("解压启动出错", ex.Message);
-                    });
+                    Dispatcher.Invoke(() => TriggerError("解压启动出错", ex.Message));
                 }
             });
         }
@@ -303,10 +306,9 @@ namespace UnzipProxy
 
                     if (type == "progress")
                     {
-                        // 高频 progress 消息：异步非阻塞投递，保证 UI 线程绝对流畅
-                        _pendingCurrentFile = root.GetProperty("current_file").GetString() ?? "";
-                        _completedBytes = root.GetProperty("completed_bytes").GetInt64();
-                        long reportedTotal = root.GetProperty("total_bytes").GetInt64();
+                        _pendingCurrentFile = root.TryGetProperty("current_file", out var cf) ? (cf.GetString() ?? "") : "";
+                        _completedBytes = root.TryGetProperty("completed_bytes", out var cb) ? cb.GetInt64() : _completedBytes;
+                        long reportedTotal = root.TryGetProperty("total_bytes", out var tb) ? tb.GetInt64() : 0;
                         if (reportedTotal > 0) _totalBytes = reportedTotal;
 
                         if (!_isUiUpdatePending)
@@ -321,11 +323,13 @@ namespace UnzipProxy
                     }
                     else
                     {
-                        // 状态类消息：立即同步处理
                         Dispatcher.Invoke(() => HandleWorkerMessage(type, root));
                     }
                 }
-                catch { }
+                catch
+                {
+                    // 单行解析失败不影响其余状态流
+                }
             }
         }
 
@@ -334,8 +338,8 @@ namespace UnzipProxy
             switch (type)
             {
                 case "init":
-                    _totalItems = root.GetProperty("total_items").GetInt32();
-                    _totalBytes = root.GetProperty("total_bytes").GetInt64();
+                    _totalItems = root.TryGetProperty("total_items", out var ti) ? ti.GetInt32() : _totalItems;
+                    _totalBytes = root.TryGetProperty("total_bytes", out var tb) ? tb.GetInt64() : _totalBytes;
                     if (_plan != null)
                     {
                         string srcName = Path.GetFileName(_archivePath);
@@ -351,16 +355,21 @@ namespace UnzipProxy
                     HandleInvalidChars(root);
                     break;
 
+                case "encoding_options":
+                    HandleEncodingOptions(root);
+                    break;
+
                 case "password_request":
                     ShowPasswordDialog();
                     break;
 
                 case "finished":
-                    HandleFinished(root);
+                    _ = HandleFinishedAsync(root);
                     break;
 
                 case "error":
-                    string msg = root.GetProperty("message").GetString() ?? "未知错误";
+                    _workerErrorShown = true;
+                    string msg = root.TryGetProperty("message", out var m) ? (m.GetString() ?? "未知错误") : "未知错误";
                     TriggerError("解压失败", msg);
                     break;
             }
@@ -387,9 +396,9 @@ namespace UnzipProxy
         {
             if (!string.IsNullOrEmpty(currentFile))
             {
-                string cleanFile = FixPotentialMojibake(currentFile);
-                DetailFileNameText.Text = cleanFile;
-                DetailFileNameText.ToolTip = cleanFile;
+                // 名称由 Worker 唯一决定（显示、写盘、对账共用同一份名称），UI 不再二次纠偏
+                DetailFileNameText.Text = currentFile;
+                DetailFileNameText.ToolTip = currentFile;
             }
 
             if (_totalBytes <= 0)
@@ -407,7 +416,6 @@ namespace UnzipProxy
             TitleText.Text = statusText;
             MainStatusText.Text = statusText;
 
-            // 实时瞬时速度计算 (EMA 滤波)
             DateTime now = DateTime.UtcNow;
             double elapsedSec = (now - _lastTime).TotalSeconds;
             if (elapsedSec >= 0.03)
@@ -422,23 +430,19 @@ namespace UnzipProxy
                 _lastTime = now;
             }
 
-            // 速度数值每 500ms 刷新一次，彻底解决数字一直跳跃晃动的问题
             if ((now - _lastSpeedDisplayTime).TotalMilliseconds >= 500 || _displayedSpeedMBps <= 0.0 || _isPaused)
             {
                 _displayedSpeedMBps = _currentSpeedMBps;
                 _lastSpeedDisplayTime = now;
             }
 
-            // 实时向面积图推点，波形水平连续展开，数值平滑不跳动
             SpeedGraph.PushSample(progress, _currentSpeedMBps, _displayedSpeedMBps);
 
-            // 实时更新剩余项目与剩余大小 (1:1 Win11 格式: 8 (5.04 GB))
             long remainingBytes = Math.Max(0, _totalBytes - _completedBytes);
             int estimatedRemainingItems = Math.Max(0, (int)Math.Ceiling((1.0 - progress) * _totalItems));
             if (remainingBytes > 0 && estimatedRemainingItems == 0) estimatedRemainingItems = 1;
             DetailRemainingText.Text = $"{estimatedRemainingItems} ({FormatBytes(remainingBytes)})";
 
-            // 实时更新剩余时间，绝不卡死在“正在计算...”
             if (progress >= 1.0 || remainingBytes == 0)
             {
                 DetailEtaText.Text = "完成";
@@ -489,19 +493,22 @@ namespace UnzipProxy
                 return;
             }
 
-            var itemsArray = root.GetProperty("items");
             var previewLines = new List<string>();
-            foreach (var it in itemsArray.EnumerateArray())
+            if (root.TryGetProperty("items", out var itemsArray) && itemsArray.ValueKind == JsonValueKind.Array)
             {
-                string raw = it.GetProperty("raw").GetString() ?? "";
-                string sanitized = it.GetProperty("sanitized").GetString() ?? "";
-                previewLines.Add($"• 原名: {raw}  ->  建议: {sanitized}");
+                foreach (var it in itemsArray.EnumerateArray())
+                {
+                    string raw = it.TryGetProperty("raw", out var r) ? (r.GetString() ?? "") : "";
+                    string sanitized = it.TryGetProperty("sanitized", out var s) ? (s.GetString() ?? "") : "";
+                    previewLines.Add($"• 原名: {raw}  ->  建议: {sanitized}");
+                }
             }
             InvalidItemsListText.Text = string.Join("\n", previewLines);
 
             ModalTitleText.Text = "文件名包含非法字符";
             ModalRecycleAlertPanel.Visibility = Visibility.Collapsed;
             ModalPasswordPanel.Visibility = Visibility.Collapsed;
+            ModalEncodingPanel.Visibility = Visibility.Collapsed;
             ModalInvalidCharsPanel.Visibility = Visibility.Visible;
             ModalOverlay.Visibility = Visibility.Visible;
         }
@@ -509,10 +516,6 @@ namespace UnzipProxy
         private void OnInvalidCharsSubmitClick(object sender, RoutedEventArgs e)
         {
             string action = RadioBatchRename.IsChecked == true ? "batch_rename" : "skip";
-            if (RadioSkipInvalid.IsChecked == true)
-            {
-                _hasSkippedItems = true;
-            }
 
             if (RememberInvalidCharsCheck.IsChecked == true)
             {
@@ -525,12 +528,122 @@ namespace UnzipProxy
             SendWorkerMessage($"{{\"type\":\"invalid_chars_response\",\"action\":\"{action}\"}}");
         }
 
+        // 文件名编码选择（编码不确定时）
+        private void HandleEncodingOptions(JsonElement root)
+        {
+            var options = new List<(uint CodePage, string Label, List<string> Samples)>();
+            if (root.TryGetProperty("options", out var optionsArray) && optionsArray.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var option in optionsArray.EnumerateArray())
+                {
+                    uint cp = option.TryGetProperty("cp", out var cpElem) ? (uint)cpElem.GetInt32() : 0;
+                    string label = option.TryGetProperty("label", out var labelElem) ? (labelElem.GetString() ?? ("代码页 " + cp)) : ("代码页 " + cp);
+                    var samples = new List<string>();
+                    if (option.TryGetProperty("samples", out var sampleArray) && sampleArray.ValueKind == JsonValueKind.Array)
+                    {
+                        foreach (var sample in sampleArray.EnumerateArray())
+                        {
+                            string? text = sample.GetString();
+                            if (!string.IsNullOrEmpty(text)) samples.Add(text);
+                        }
+                    }
+                    options.Add((cp, label, samples));
+                }
+            }
+            if (options.Count == 0)
+            {
+                SendWorkerMessage("{\"type\":\"encoding_response\",\"cp\":0}");
+                return;
+            }
+
+            _pendingPreferredCodePage = options[0].CodePage;
+
+            // 已有记忆偏好时直接静默回答，不再打断用户
+            if (_settings.RememberArchiveCodePage && _settings.ArchiveCodePage != 0)
+            {
+                SendWorkerMessage($"{{\"type\":\"encoding_response\",\"cp\":{_settings.ArchiveCodePage}}}");
+                return;
+            }
+
+            EncodingOptionsPanel.Children.Clear();
+            bool first = true;
+            foreach (var option in options)
+            {
+                var radio = new RadioButton
+                {
+                    GroupName = "EncodingOptions",
+                    Content = option.Label,
+                    Tag = option.CodePage,
+                    IsChecked = first,
+                    FontSize = 12,
+                    Margin = new Thickness(0, 0, 0, 4),
+                    Foreground = (Brush)Resources["TextForegroundBrush"]
+                };
+                radio.Checked += OnEncodingOptionChecked;
+                EncodingOptionsPanel.Children.Add(radio);
+
+                if (option.Samples.Count > 0)
+                {
+                    var sampleText = new TextBlock
+                    {
+                        Text = "示例：" + string.Join("  /  ", option.Samples),
+                        FontSize = 11,
+                        Margin = new Thickness(18, 0, 0, 8),
+                        TextWrapping = TextWrapping.Wrap,
+                        Foreground = (Brush)Resources["SubTextBrush"]
+                    };
+                    EncodingOptionsPanel.Children.Add(sampleText);
+                }
+                first = false;
+            }
+
+            RememberEncodingCheck.IsChecked = false;
+            ModalTitleText.Text = "选择文件名编码";
+            ModalRecycleAlertPanel.Visibility = Visibility.Collapsed;
+            ModalPasswordPanel.Visibility = Visibility.Collapsed;
+            ModalInvalidCharsPanel.Visibility = Visibility.Collapsed;
+            ModalEncodingPanel.Visibility = Visibility.Visible;
+            ModalOverlay.Visibility = Visibility.Visible;
+        }
+
+        private void OnEncodingOptionChecked(object sender, RoutedEventArgs e)
+        {
+            if (sender is RadioButton { Tag: uint cp })
+            {
+                _pendingPreferredCodePage = cp;
+            }
+        }
+
+        private void OnEncodingSubmitClick(object sender, RoutedEventArgs e)
+        {
+            uint selected = _pendingPreferredCodePage;
+            foreach (var child in EncodingOptionsPanel.Children)
+            {
+                if (child is RadioButton { IsChecked: true, Tag: uint cp })
+                {
+                    selected = cp;
+                    break;
+                }
+            }
+
+            if (RememberEncodingCheck.IsChecked == true && selected != 0)
+            {
+                _settings.ArchiveCodePage = (int)selected;
+                _settings.RememberArchiveCodePage = true;
+                ConfigManager.Save(_settings);
+            }
+
+            ModalOverlay.Visibility = Visibility.Collapsed;
+            SendWorkerMessage($"{{\"type\":\"encoding_response\",\"cp\":{selected}}}");
+        }
+
         // 密码弹窗
         private void ShowPasswordDialog()
         {
             ModalTitleText.Text = "输入密码";
             ModalRecycleAlertPanel.Visibility = Visibility.Collapsed;
             ModalInvalidCharsPanel.Visibility = Visibility.Collapsed;
+            ModalEncodingPanel.Visibility = Visibility.Collapsed;
             ModalPasswordPanel.Visibility = Visibility.Visible;
             PasswordInputBox.Password = "";
             ModalOverlay.Visibility = Visibility.Visible;
@@ -573,6 +686,7 @@ namespace UnzipProxy
                 ModalTitleText.Text = "移入回收站提示";
                 ModalInvalidCharsPanel.Visibility = Visibility.Collapsed;
                 ModalPasswordPanel.Visibility = Visibility.Collapsed;
+                ModalEncodingPanel.Visibility = Visibility.Collapsed;
                 ModalRecycleAlertPanel.Visibility = Visibility.Visible;
                 ModalOverlay.Visibility = Visibility.Visible;
             }
@@ -642,7 +756,6 @@ namespace UnzipProxy
         {
             _isDetailsExpanded = !_isDetailsExpanded;
 
-            // 记忆用户偏好
             _settings.IsDetailsExpanded = _isDetailsExpanded;
             ConfigManager.Save(_settings);
 
@@ -650,7 +763,7 @@ namespace UnzipProxy
             double targetExpandedHeight = _isDetailsExpanded ? ExpandedDetailsHeight : 0.0;
             double targetExpandedOpacity = _isDetailsExpanded ? 1.0 : 0.0;
             double targetCollapsedHeight = _isDetailsExpanded ? 0.0 : 12.0;
-            double targetCollapsedOpacity = _isDetailsExpanded ? 0.0 : 1.0;
+            double targetCollapsedOpacity = _isDetailsExpanded ? 1.0 : 0.0;
 
             if (_isDetailsExpanded)
             {
@@ -666,47 +779,50 @@ namespace UnzipProxy
             var duration = TimeSpan.FromMilliseconds(220);
             var ease = new CubicEase { EasingMode = EasingMode.EaseInOut };
 
-            // 窗口高度平滑动画
             var animWindow = new DoubleAnimation(targetWindowHeight, duration) { EasingFunction = ease };
             BeginAnimation(HeightProperty, animWindow);
 
-            // 折叠条容器动画 (展开时收起进度条)
             CollapsedContainer.BeginAnimation(HeightProperty, new DoubleAnimation(targetCollapsedHeight, duration) { EasingFunction = ease });
             CollapsedContainer.BeginAnimation(OpacityProperty, new DoubleAnimation(targetCollapsedOpacity, duration) { EasingFunction = ease });
 
-            // 展开图表容器动画
             ExpandedContainer.BeginAnimation(HeightProperty, new DoubleAnimation(targetExpandedHeight, duration) { EasingFunction = ease });
             ExpandedContainer.BeginAnimation(OpacityProperty, new DoubleAnimation(targetExpandedOpacity, duration) { EasingFunction = ease });
         }
 
-        // 完成处理 (严格核验全部条件：Worker 退出码 0、无错误、无跳过、输出落盘完整，方可提交与回收)
-        private async void HandleFinished(JsonElement root)
+        /// <summary>
+        /// 完成处理：先取回 Worker 的完整结果与退出码，再做清单对账、目录提交与（可选）源包回收。
+        /// 未通过任何一项即不提交、不回收，并如实说明原因。
+        /// </summary>
+        private async Task HandleFinishedAsync(JsonElement root)
         {
+            if (_finishedHandled) return;
+            _finishedHandled = true;
             _isCompleted = true;
             _speedTimer.Stop();
 
-            string status = root.TryGetProperty("status", out var stElem) ? (stElem.GetString() ?? "ok") : "ok";
-            _completedBytes = root.TryGetProperty("completed_bytes", out var cbElem) ? cbElem.GetInt64() : _totalBytes;
-            string errorReason = root.TryGetProperty("error_reason", out var erElem) ? (erElem.GetString() ?? "") : "";
-            int skippedItems = root.TryGetProperty("skipped_items", out var skpElem) ? skpElem.GetInt32() : 0;
-            int totalItemsReported = root.TryGetProperty("total_items", out var tiElem) ? tiElem.GetInt32() : 0;
-            int extractedItemsReported = root.TryGetProperty("extracted_items", out var eiElem) ? eiElem.GetInt32() : 0;
-
-            var openedVols = new List<string>();
-            if (root.TryGetProperty("opened_volumes", out var volsElem) && volsElem.ValueKind == JsonValueKind.Array)
+            // 必需字段一律不得缺省；缺失即视为失败，绝不默认成功
+            if (!TryReadRequired(root, "status", out string status) ||
+                !TryReadRequired(root, "manifest", out string manifestPath) ||
+                !TryReadRequired(root, "delivery_root", out string deliveryRoot) ||
+                !root.TryGetProperty("total_items", out _) ||
+                !root.TryGetProperty("extracted_items", out _) ||
+                !root.TryGetProperty("skipped_items", out _) ||
+                !root.TryGetProperty("completed_bytes", out _))
             {
-                foreach (var v in volsElem.EnumerateArray())
-                {
-                    string? s = v.GetString();
-                    if (!string.IsNullOrEmpty(s)) openedVols.Add(s);
-                }
-            }
-            if (openedVols.Count == 0 && _plan != null)
-            {
-                openedVols.Add(_plan.SourceArchivePath);
+                FailWithoutCommit("Worker 完成消息不完整，已中止交付并保留源包。", true);
+                return;
             }
 
-            // 等待工作进程彻底退出并获取退出码，杜绝进程挂死与文件锁未释放
+            int policyFiltered = root.TryGetProperty("policy_filtered_items", out var pf) ? pf.GetInt32() : 0;
+            int skippedItems = root.GetProperty("skipped_items").GetInt32();
+            int unsafeItems = root.TryGetProperty("unsafe_items", out var ui) ? ui.GetInt32() : 0;
+            string errorReason = root.TryGetProperty("error_reason", out var er) ? (er.GetString() ?? "") : "";
+            bool emptyArchive = root.TryGetProperty("empty_archive", out var ea) && ea.ValueKind == JsonValueKind.True;
+            bool manifestOk = !root.TryGetProperty("manifest_ok", out var mo) || mo.ValueKind == JsonValueKind.True;
+
+            var volumes = ParseVolumeIdentities(root);
+
+            // 等待工作进程彻底退出并获取退出码
             bool workerExited = false;
             if (_workerProcess != null)
             {
@@ -725,149 +841,238 @@ namespace UnzipProxy
             }
             int exitCode = (workerExited && _workerProcess != null) ? _workerProcess.ExitCode : -1;
 
-            // 严格综合判定：必须同时满足状态 ok、退出码 0、无错误原因、无跳过项、进程正常退出
-            bool isFailedOrPartial = (status != "ok") || (exitCode != 0) || !string.IsNullOrEmpty(errorReason) || _hasSkippedItems || (skippedItems > 0) || !workerExited;
+            // 硬失败：状态、退出码、错误原因、清单任何一项异常都不得提交
+            bool hardFailure = status == "failed"
+                               || !string.IsNullOrEmpty(errorReason)
+                               || !manifestOk
+                               || !workerExited;
+            if (status == "ok" && exitCode != 0) hardFailure = true;
+            if (status == "partial" && exitCode != 0 && exitCode != 11) hardFailure = true;
 
-            // 严格输出落盘核验：确保解压文件真实写入目标磁盘
-            if (!isFailedOrPartial && _plan != null)
+            if (hardFailure)
             {
-                if (totalItemsReported > 0 || extractedItemsReported > 0 || _totalBytes > 0)
-                {
-                    if (!Directory.Exists(_plan.StagingDirectory) || !Directory.EnumerateFileSystemEntries(_plan.StagingDirectory).Any())
-                    {
-                        isFailedOrPartial = true;
-                        errorReason = "output_verification_failed";
-                    }
-                }
-            }
-
-            if (isFailedOrPartial)
-            {
-                // 立即清理暂存残损目录，绝不提交正式目录，绝不回收源包
-                if (_plan != null && Directory.Exists(_plan.StagingDirectory))
-                {
-                    try { Directory.Delete(_plan.StagingDirectory, true); } catch { }
-                }
-
-                MainStatusText.Text = "解压未完成";
-                if (errorReason == "crc_error")
-                {
-                    PathInfoText.Text = "解压失败：文件数据校验 (CRC) 错误，源压缩包已保留。";
-                }
-                else if (errorReason == "data_error")
-                {
-                    PathInfoText.Text = "解压失败：条目数据损坏或归档不完整，源压缩包已保留。";
-                }
-                else if (errorReason == "unsupported_method")
-                {
-                    PathInfoText.Text = "解压失败：压缩算法不受支持，源压缩包已保留。";
-                }
-                else if (errorReason == "corrupted_archive" || errorReason == "unrecognized_or_corrupted_inner_archive")
-                {
-                    PathInfoText.Text = "解压失败：归档已损坏或缺少后续分卷，源压缩包已保留。";
-                }
-                else if (errorReason == "insufficient_disk_space")
-                {
-                    PathInfoText.Text = "解压失败：目标磁盘可用空间不足，已安全终止。";
-                }
-                else if (_hasSkippedItems || skippedItems > 0)
-                {
-                    PathInfoText.Text = "部分条目因字符非法或路径不安全已被跳过，源压缩包已保留。";
-                }
-                else
-                {
-                    PathInfoText.Text = $"解压未完整结束 (Worker 退出码: {exitCode})，源压缩包已安全保留。";
-                }
-
-                PathInfoText.ToolTip = PathInfoText.Text;
-                TitleText.Text = $"解压失败 - {Path.GetFileName(_archivePath)}";
-                RunningActionPanel.Visibility = Visibility.Collapsed;
-                FinishedActionPanel.Visibility = Visibility.Visible;
+                FailWithoutCommit(DescribeFailure(errorReason, exitCode, status), false);
+                CleanupManifest();
                 return;
             }
 
-            // 提交暂存目录
-            if (_plan != null && !ArchiveTaskPlanner.CommitStagingDirectory(_plan, out string commitErr))
+            // 读取交付清单并做逐项对账 + 提交（在后台线程执行，避免阻塞 UI）
+            DeliveryManifest manifest;
+            try
             {
-                TriggerError("提交最终目录失败", commitErr);
+                manifest = DeliveryManifest.Load(manifestPath);
+            }
+            catch (Exception ex)
+            {
+                FailWithoutCommit("无法读取交付清单，已中止交付并保留源包：" + ex.Message, true);
+                CleanupManifest();
                 return;
             }
 
-            // 来源标记传递 (Mark of the Web)
-            if (_plan != null && !string.IsNullOrEmpty(_plan.SourceArchivePath) && !string.IsNullOrEmpty(_plan.FinalTargetDirectory))
+            bool recycleRequested = RecycleCheckBox.IsChecked == true && status == "ok";
+            var request = new CompletionRequest
             {
-                PropagateZoneIdentifier(_plan.SourceArchivePath, _plan.FinalTargetDirectory);
+                Plan = _plan!,
+                DeliveryRootRelative = deliveryRoot,
+                Manifest = manifest,
+                RecycleRequested = recycleRequested,
+                Volumes = volumes,
+                PropagateZoneIdentifier = true
+            };
+
+            CompletionResult result;
+            try
+            {
+                result = await Task.Run(() => ExtractionCompleter.Complete(request));
+            }
+            catch (Exception ex)
+            {
+                FailWithoutCommit("完成处理异常，已保留暂存目录：" + ex.Message, true);
+                CleanupManifest();
+                return;
             }
 
-            // 仅在完全通过时才按用户选择回收源卷
-            string recycleErrMsg = "";
-            bool recycleFailed = false;
-            if (RecycleCheckBox.IsChecked == true && openedVols.Count > 0)
+            CleanupManifest();
+
+            if (!result.Delivered)
             {
-                var (recOk, recMsg) = ShellRecycleBin.RecycleOpenedVolumes(openedVols);
-                if (!recOk)
+                string detail = result.FailureReason;
+                if (!string.IsNullOrEmpty(result.KeptStagingDirectory))
                 {
-                    recycleFailed = true;
-                    recycleErrMsg = recMsg;
+                    detail += $"\n暂存目录已保留以便恢复：{result.KeptStagingDirectory}";
                 }
+                FailWithoutCommit(detail, result.KeptStagingDirectory.Length > 0);
+                return;
             }
 
-            if (recycleFailed)
+            // 交付成功
+            ExtractProgressBar.Value = 100;
+            DetailEtaText.Text = "完成";
+            DetailRemainingText.Text = "0 (0 B)";
+            SpeedGraph.PushSample(1.0, _currentSpeedMBps, _displayedSpeedMBps);
+
+            string notes = result.Summary;
+            if (policyFiltered > 0) notes += $"；已按产品规则过滤 {policyFiltered} 个 macOS 元数据项";
+            if (skippedItems > 0) notes += $"；{skippedItems} 项被跳过";
+            if (unsafeItems > 0) notes += $"；{unsafeItems} 项因路径不安全被拒绝";
+            if (emptyArchive) notes = "归档为空，已创建空目标目录";
+            if (result.ZoneMarked > 0) notes += $"；已为 {result.ZoneMarked} 个文件保留下载来源标记";
+
+            bool partial = status == "partial" || skippedItems > 0 || unsafeItems > 0;
+            bool recycleProblem = result.Recycle != null && !result.Recycle.Success;
+
+            if (partial)
             {
-                // 阻断项修复：回收失败必须明确向用户反馈，窗口保持打开供用户核实，严禁静默吞错！
-                MainStatusText.Text = "解压完成（源文件回收失败）";
-                MainStatusText.Foreground = (Brush)FindResource("AccentOrangeBrush");
-                DetailEtaText.Text = "已完成";
-                DetailRemainingText.Text = "源文件保留";
-                PathInfoText.Text = $"解压已完成，但无法移入回收站: {recycleErrMsg}。源压缩包已保留在原位。";
+                TitleText.Text = "部分完成";
+                MainStatusText.Text = "部分完成";
+                MainStatusText.Foreground = (Brush)Resources["Win11Amber"];
+                PathInfoText.Text = notes + "；源压缩包已保留。";
                 PathInfoText.ToolTip = PathInfoText.Text;
                 RunningActionPanel.Visibility = Visibility.Collapsed;
                 FinishedActionPanel.Visibility = Visibility.Visible;
                 SystemEffects.PlayFinishedSound();
+                UpdateProgressUi();
+                return;
             }
-            else
+
+            if (recycleProblem)
             {
-                ExtractProgressBar.Value = 100;
+                MainStatusText.Text = "解压完成（源文件回收未完成）";
+                MainStatusText.Foreground = (Brush)Resources["Win11Amber"];
                 TitleText.Text = "已完成 100%";
-                MainStatusText.Text = "已完成 100%";
-                DetailEtaText.Text = "完成";
-                DetailRemainingText.Text = "0 (0 B)";
-                SpeedGraph.PushSample(1.0, _currentSpeedMBps, _displayedSpeedMBps);
-
+                PathInfoText.Text = "解压已完成并已逐项校验。" + result.Recycle!.Message + "。"
+                                    + DescribeRecycleItems(result.Recycle);
+                PathInfoText.ToolTip = PathInfoText.Text;
+                RunningActionPanel.Visibility = Visibility.Collapsed;
+                FinishedActionPanel.Visibility = Visibility.Visible;
                 SystemEffects.PlayFinishedSound();
+                return;
+            }
 
-                // 停留 800ms，让用户看清完成动画与 100% 状态
-                await Task.Delay(800);
-                Close();
+            TitleText.Text = "已完成 100%";
+            MainStatusText.Text = "已完成 100%";
+            MainStatusText.Foreground = (Brush)Resources["TextForegroundBrush"];
+            string finalText = notes;
+            if (result.Recycle != null && result.Recycle.Success)
+            {
+                finalText += "；" + result.Recycle.Message;
+            }
+            PathInfoText.Text = finalText;
+            PathInfoText.ToolTip = finalText;
+
+            SystemEffects.PlayFinishedSound();
+
+            await Task.Delay(800);
+            Close();
+        }
+
+        private static string DescribeRecycleItems(RecycleResult recycle)
+        {
+            var failures = recycle.Items.Where(i => !i.Recycled).Select(i => $"{Path.GetFileName(i.Path)}：{i.Detail}").ToList();
+            if (failures.Count == 0) return "";
+            return "（未回收：" + string.Join("；", failures) + "）";
+        }
+
+        private static List<VolumeIdentity> ParseVolumeIdentities(JsonElement root)
+        {
+            var list = new List<VolumeIdentity>();
+            if (!root.TryGetProperty("volume_identities", out var identities) || identities.ValueKind != JsonValueKind.Array)
+            {
+                return list;
+            }
+            foreach (var element in identities.EnumerateArray())
+            {
+                try
+                {
+                    list.Add(new VolumeIdentity
+                    {
+                        Path = element.TryGetProperty("path", out var p) ? (p.GetString() ?? "") : "",
+                        VolumeSerial = element.TryGetProperty("volume", out var v) ? v.GetUInt64() : 0,
+                        FileIdHigh = element.TryGetProperty("file_id_high", out var fh) ? fh.GetUInt64() : 0,
+                        FileIdLow = element.TryGetProperty("file_id_low", out var fl) ? fl.GetUInt64() : 0,
+                        Size = element.TryGetProperty("size", out var s) ? s.GetInt64() : 0,
+                        LastWriteTime = element.TryGetProperty("mtime", out var m) ? m.GetInt64() : 0,
+                        Valid = element.TryGetProperty("valid", out var va) && va.ValueKind == JsonValueKind.True
+                    });
+                }
+                catch
+                {
+                    // 单条身份解析失败：该卷会在回收时被判为“无法确认身份”而保留
+                }
+            }
+            return list;
+        }
+
+        private static bool TryReadRequired(JsonElement root, string name, out string value)
+        {
+            value = "";
+            if (!root.TryGetProperty(name, out var element) || element.ValueKind != JsonValueKind.String) return false;
+            value = element.GetString() ?? "";
+            return true;
+        }
+
+        private void FailWithoutCommit(string detail, bool keepStaging)
+        {
+            MainStatusText.Text = "解压未完成";
+            PathInfoText.Text = detail;
+            PathInfoText.ToolTip = detail;
+            ExtractProgressBar.Foreground = (Brush)Resources["Win11Red"];
+            RunningActionPanel.Visibility = Visibility.Collapsed;
+            FinishedActionPanel.Visibility = Visibility.Visible;
+            TitleText.Text = $"解压失败 - {Path.GetFileName(_archivePath)}";
+
+            if (!keepStaging && _plan != null)
+            {
+                ArchiveTaskPlanner.CleanupStaging(_plan);
+            }
+
+            Topmost = true;
+            Activate();
+            var hwnd = new WindowInteropHelper(this).Handle;
+            SystemEffects.FlashWindowForError(hwnd);
+        }
+
+        private static string DescribeFailure(string errorReason, int exitCode, string status)
+        {
+            switch (errorReason)
+            {
+                case "crc_error":
+                    return "解压失败：文件数据校验 (CRC) 错误，已放弃交付，源压缩包已保留。";
+                case "data_error":
+                    return "解压失败：条目数据损坏或归档不完整，已放弃交付，源压缩包已保留。";
+                case "unsupported_method":
+                    return "解压失败：压缩算法不受支持，已放弃交付，源压缩包已保留。";
+                case "corrupted_archive":
+                case "unrecognized_or_corrupted_inner_archive":
+                case "corrupted_inner_archive":
+                    return "解压失败：归档已损坏或缺少后续分卷，已放弃交付，源压缩包已保留。";
+                case "inner_not_tar":
+                    return "解压失败：复合 TAR 归档的内层不是有效的 TAR 内容，已放弃交付，源压缩包已保留。";
+                case "inner_payload_missing":
+                    return "解压失败：复合 TAR 归档缺少可展开的内层载荷，已放弃交付，源压缩包已保留。";
+                case "insufficient_disk_space":
+                    return "解压失败：目标磁盘可用空间不足，已安全终止，源压缩包已保留。";
+                case "output_budget_exceeded":
+                    return "解压失败：实际写出数据超出预算（疑似声明大小失真），已安全终止，源压缩包已保留。";
+                case "extract_error":
+                    return "解压失败：写入目标文件时出错，已放弃交付，源压缩包已保留。";
+                default:
+                    return $"解压未完整结束 (状态: {status}, Worker 退出码: {exitCode})，源压缩包已安全保留。";
             }
         }
 
-        // 来源标记传递：若源压缩包带有 Windows 下载安全标记 (:Zone.Identifier)，将其传递给所有解压文件
-        private static void PropagateZoneIdentifier(string sourcePath, string targetDirectory)
+        private void CleanupManifest()
         {
             try
             {
-                string zoneStreamPath = sourcePath + ":Zone.Identifier";
-                if (!File.Exists(zoneStreamPath)) return;
-
-                byte[] zoneData = File.ReadAllBytes(zoneStreamPath);
-                if (zoneData == null || zoneData.Length == 0) return;
-
-                foreach (var filePath in Directory.EnumerateFiles(targetDirectory, "*", SearchOption.AllDirectories))
+                if (!string.IsNullOrEmpty(_manifestPath) && File.Exists(_manifestPath))
                 {
-                    try
-                    {
-                        File.WriteAllBytes(filePath + ":Zone.Identifier", zoneData);
-                    }
-                    catch
-                    {
-                        // 忽略单个文件的非致命属性写入异常
-                    }
+                    File.Delete(_manifestPath);
                 }
             }
             catch
             {
-                // 来源标记传递防御性异常隔离
+                // 清单清理失败不影响交付结果
             }
         }
 
@@ -911,131 +1116,7 @@ namespace UnzipProxy
             }
             catch { }
             _jobManager?.Dispose();
-        }
-
-        // 智能修复可能残留的乱码 (如 UTF-8 字节被误按系统代码页如 GBK 解析的字形，或 7-Zip PUA 私有区映射字符)
-        public static string FixPotentialMojibake(string text)
-        {
-            if (string.IsNullOrEmpty(text)) return text;
-
-            try
-            {
-                System.Text.Encoding.RegisterProvider(System.Text.CodePagesEncodingProvider.Instance);
-            }
-            catch { }
-
-            // 1. 如果包含 7z PUA 私有区字符 (0xEF80 - 0xEFFF)，说明是未解码原始单字节映射
-            bool hasPua = false;
-            foreach (char c in text)
-            {
-                if (c >= 0xEF80 && c <= 0xEFFF)
-                {
-                    hasPua = true;
-                    break;
-                }
-            }
-
-            if (hasPua)
-            {
-                try
-                {
-                    var rawBytes = new List<byte>();
-                    foreach (char c in text)
-                    {
-                        if (c >= 0xEF80 && c <= 0xEFFF)
-                        {
-                            rawBytes.Add((byte)(c - 0xEF00));
-                        }
-                        else if (c < 0x80)
-                        {
-                            rawBytes.Add((byte)c);
-                        }
-                        else
-                        {
-                            byte[] u8 = System.Text.Encoding.UTF8.GetBytes(new char[] { c });
-                            rawBytes.AddRange(u8);
-                        }
-                    }
-
-                    var gbk = System.Text.Encoding.GetEncoding("GBK");
-                    string decoded = gbk.GetString(rawBytes.ToArray());
-                    if (!string.IsNullOrEmpty(decoded) && !decoded.Contains('\uFFFD'))
-                    {
-                        return decoded;
-                    }
-                }
-                catch { }
-            }
-
-            // 2. 逐段检查是否为 UTF-8 误按 GBK 解码的乱码（如 "甯屾嵎涓撲慨"）
-            try
-            {
-                var gbk = System.Text.Encoding.GetEncoding("GBK");
-                string[] parts = text.Split('\\');
-                bool modified = false;
-                for (int p = 0; p < parts.Length; ++p)
-                {
-                    string seg = parts[p];
-                    if (string.IsNullOrEmpty(seg)) continue;
-
-                    byte[] bytes = gbk.GetBytes(seg);
-                    if (IsValidUtf8Sequence(bytes))
-                    {
-                        string recovered = System.Text.Encoding.UTF8.GetString(bytes);
-                        if (!string.IsNullOrEmpty(recovered) && !recovered.Contains('\uFFFD') && recovered != seg)
-                        {
-                            parts[p] = recovered;
-                            modified = true;
-                        }
-                    }
-                }
-
-                if (modified)
-                {
-                    return string.Join('\\', parts);
-                }
-            }
-            catch { }
-
-            return text;
-        }
-
-        private static bool IsValidUtf8Sequence(byte[] bytes)
-        {
-            if (bytes == null || bytes.Length == 0) return false;
-            int i = 0;
-            bool hasMultiByte = false;
-            while (i < bytes.Length)
-            {
-                byte b = bytes[i];
-                if (b < 0x80)
-                {
-                    i++;
-                }
-                else if ((b & 0xE0) == 0xC0)
-                {
-                    if (i + 1 >= bytes.Length || (bytes[i + 1] & 0xC0) != 0x80) return false;
-                    hasMultiByte = true;
-                    i += 2;
-                }
-                else if ((b & 0xF0) == 0xE0)
-                {
-                    if (i + 2 >= bytes.Length || (bytes[i + 1] & 0xC0) != 0x80 || (bytes[i + 2] & 0xC0) != 0x80) return false;
-                    hasMultiByte = true;
-                    i += 3;
-                }
-                else if ((b & 0xF8) == 0xF0)
-                {
-                    if (i + 3 >= bytes.Length || (bytes[i + 1] & 0xC0) != 0x80 || (bytes[i + 2] & 0xC0) != 0x80 || (bytes[i + 3] & 0xC0) != 0x80) return false;
-                    hasMultiByte = true;
-                    i += 4;
-                }
-                else
-                {
-                    return false;
-                }
-            }
-            return hasMultiByte;
+            CleanupManifest();
         }
     }
 }

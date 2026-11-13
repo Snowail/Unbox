@@ -30,7 +30,7 @@ namespace UnzipProxy.Core
             return false;
         }
 
-        // 剥离归档与分卷后缀，得到纯净的包名
+        // 剥离归档与分卷后缀，得到纯净的包名（不再从目标展示名反推）
         public static string GetArchiveBaseName(string filePath)
         {
             string fileName = Path.GetFileName(filePath);
@@ -96,7 +96,6 @@ namespace UnzipProxy.Core
 
             string baseName = GetArchiveBaseName(fullArchivePath);
             string finalDir = ResolveUniqueTargetDirectory(parentDir, baseName);
-            string rootDirName = Path.GetFileName(finalDir);
 
             // 在同卷创建独立临时暂存目录
             string stagingDir = Path.Combine(parentDir, $".unzip_staging_{Guid.NewGuid():N}");
@@ -105,115 +104,44 @@ namespace UnzipProxy.Core
             {
                 SourceArchivePath = fullArchivePath,
                 DestinationParentDir = parentDir,
-                TargetRootDirName = rootDirName,
+                TargetRootDirName = Path.GetFileName(finalDir),
                 FinalTargetDirectory = finalDir,
                 StagingDirectory = stagingDir
             };
         }
 
-        // 如果压缩包解压后的根目录只有唯一一个和压缩包同名的文件夹，折叠这一级冗余同名目录
-        public static bool TryCollapseRedundantSameNameFolder(string stagingDir, string archivePath, string targetRootDirName)
+        /// <summary>
+        /// 同名唯一根目录折叠：只有当交付根下“恰好只有一个子目录、没有任何同级文件、
+        /// 且该子目录名与压缩包自身的基名一致”时，才把该子目录选为交付根。
+        /// 不再对目标展示名做“去掉 (2) 序号”的反推，也不在提交阶段逐项搬移文件。
+        /// </summary>
+        public static string? SelectCollapseRoot(string deliveryRoot, string archivePath)
         {
             try
             {
-                if (!Directory.Exists(stagingDir)) return false;
+                if (!Directory.Exists(deliveryRoot)) return null;
 
-                string[] subDirs = Directory.GetDirectories(stagingDir);
-                string[] subFiles = Directory.GetFiles(stagingDir);
+                var entries = Directory.GetFileSystemEntries(deliveryRoot);
+                if (entries.Length != 1) return null;
 
-                // 必须满足：根目录下仅有唯一一个子目录，且没有任何其它同级文件
-                if (subDirs.Length != 1 || subFiles.Length != 0) return false;
+                string candidate = entries[0];
+                var attributes = File.GetAttributes(candidate);
+                if ((attributes & FileAttributes.Directory) == 0) return null;
+                if ((attributes & FileAttributes.ReparsePoint) != 0) return null;
 
-                string nestedDirPath = subDirs[0];
-                string nestedDirName = Path.GetFileName(nestedDirPath);
+                string childName = Path.GetFileName(candidate);
+                string baseName = GetArchiveBaseName(archivePath);
+                if (string.IsNullOrEmpty(baseName)) return null;
 
-                string archiveBaseName = GetArchiveBaseName(archivePath);
-
-                // 判断是否与压缩包同名（不区分大小写），或与目标规划根目录同名
-                bool isSameName = string.Equals(nestedDirName, archiveBaseName, StringComparison.OrdinalIgnoreCase) ||
-                                  string.Equals(nestedDirName, targetRootDirName, StringComparison.OrdinalIgnoreCase);
-
-                // 兼容处理可能带有的递增后缀，如 "希捷专修 (2)" 对应 "希捷专修"
-                if (!isSameName && !string.IsNullOrEmpty(targetRootDirName))
-                {
-                    Match m = Regex.Match(targetRootDirName, @"^(.*?)(?: \(\d+\))?$");
-                    if (m.Success && string.Equals(nestedDirName, m.Groups[1].Value, StringComparison.OrdinalIgnoreCase))
-                    {
-                        isSameName = true;
-                    }
-                }
-
-                if (!isSameName) return false;
-
-                // 执行目录折叠：将子目录内的所有项目上移至 stagingDir
-                string tempNested = Path.Combine(stagingDir, $".unbox_collapse_{Guid.NewGuid():N}");
-                Directory.Move(nestedDirPath, tempNested);
-
-                foreach (var dir in Directory.GetDirectories(tempNested))
-                {
-                    string destDir = Path.Combine(stagingDir, Path.GetFileName(dir));
-                    if (Directory.Exists(destDir))
-                    {
-                        Directory.Delete(destDir, true);
-                    }
-                    Directory.Move(dir, destDir);
-                }
-
-                foreach (var file in Directory.GetFiles(tempNested))
-                {
-                    string destFile = Path.Combine(stagingDir, Path.GetFileName(file));
-                    if (File.Exists(destFile))
-                    {
-                        File.Delete(destFile);
-                    }
-                    File.Move(file, destFile);
-                }
-
-                Directory.Delete(tempNested, true);
-                return true;
+                return string.Equals(childName, baseName, StringComparison.OrdinalIgnoreCase) ? candidate : null;
             }
             catch
             {
-                // 折叠失败时降级保留原始层级，绝不影响整体解压交付
-                return false;
+                return null;
             }
         }
 
-        // 提交暂存目录到最终目标目录
-        public static bool CommitStagingDirectory(ExtractionPlan plan, out string error)
-        {
-            error = "";
-            try
-            {
-                if (!Directory.Exists(plan.StagingDirectory))
-                {
-                    error = "暂存目录不存在";
-                    return false;
-                }
-
-                // 检查并折叠冗余的同名单根目录（如 希捷专修.zip -> 希捷专修/希捷专修/... 优化为 希捷专修/...）
-                TryCollapseRedundantSameNameFolder(plan.StagingDirectory, plan.SourceArchivePath, plan.TargetRootDirName);
-
-                // 如果目标目录碰巧刚被创建，重新规划名称
-                string finalPath = plan.FinalTargetDirectory;
-                if (Directory.Exists(finalPath) || File.Exists(finalPath))
-                {
-                    finalPath = ResolveUniqueTargetDirectory(plan.DestinationParentDir, plan.TargetRootDirName);
-                    plan.FinalTargetDirectory = finalPath;
-                    plan.TargetRootDirName = Path.GetFileName(finalPath);
-                }
-
-                Directory.Move(plan.StagingDirectory, finalPath);
-                return true;
-            }
-            catch (Exception ex)
-            {
-                error = ex.Message;
-                return false;
-            }
-        }
-
-        // 清理暂存目录（任务取消或失败时）
+        // 清理暂存目录（任务取消时）
         public static void CleanupStaging(ExtractionPlan plan)
         {
             try

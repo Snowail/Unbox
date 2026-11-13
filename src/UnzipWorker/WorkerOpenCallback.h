@@ -8,17 +8,30 @@
 #include <functional>
 #include <algorithm>
 #include <filesystem>
+#include <cwctype>
 
 namespace fs = std::filesystem;
 
+// 输入卷身份快照：把“本次任务实际读取过的对象”绑定到卷序列号 + 128 位文件 ID + 大小 + 修改时间，
+// 供 Proxy 在回收前逐卷核对，避免同名替换或误回收。
+struct VolumeIdentityInfo {
+    std::wstring path;
+    uint64_t volumeSerial = 0;
+    uint64_t fileIdHigh = 0;
+    uint64_t fileIdLow = 0;
+    uint64_t size = 0;
+    uint64_t lastWriteTime = 0;
+    bool valid = false;
+};
+
 // 打开阶段回调：支持打开进度、多卷查找和头加密密码索取
-class WorkerOpenCallback : 
+class WorkerOpenCallback :
     public IArchiveOpenCallback,
     public IArchiveOpenVolumeCallback,
     public ICryptoGetTextPassword
 {
 public:
-    WorkerOpenCallback(const std::wstring& firstVolumePath, 
+    WorkerOpenCallback(const std::wstring& firstVolumePath,
                        std::function<std::wstring(bool* outCanceled)> passwordCallback)
         : m_refCount(1)
         , m_firstVolumePath(firstVolumePath)
@@ -26,6 +39,7 @@ public:
     {
         m_openedVolumes.push_back(firstVolumePath);
         m_readDependencies.push_back(firstVolumePath);
+        AddVolumeIdentity(firstVolumePath);
     }
 
     // IUnknown
@@ -103,13 +117,14 @@ public:
             return S_FALSE;
         }
 
-        // 记录读取依赖
+        // 读取依赖：仅用于诊断，不参与回收决策
         m_readDependencies.push_back(fullPath);
 
-        // 仅当属于同目录同族真实分卷时，才允许计入可回收源卷名单
+        // 仅当属于同目录同族真实分卷时，才计入可回收源卷名单
         if (IsSameVolumeFamily(m_firstVolumePath, fullPath)) {
             if (std::find(m_openedVolumes.begin(), m_openedVolumes.end(), fullPath) == m_openedVolumes.end()) {
                 m_openedVolumes.push_back(fullPath);
+                AddVolumeIdentity(fullPath);
             }
         }
 
@@ -138,8 +153,58 @@ public:
         return m_openedVolumes;
     }
 
+    const std::vector<VolumeIdentityInfo>& GetVolumeIdentities() const {
+        return m_volumeIdentities;
+    }
+
     const std::vector<std::wstring>& GetReadDependencies() const {
         return m_readDependencies;
+    }
+
+    // 捕获单个卷的对象身份（句柄级读取，避免路径被替换后的误判）
+    static bool CaptureIdentity(const std::wstring& path, VolumeIdentityInfo& out) {
+        out = VolumeIdentityInfo{};
+        out.path = path;
+        HANDLE h = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+
+        bool ok = true;
+        FILE_ID_INFO idInfo{};
+        if (GetFileInformationByHandleEx(h, FileIdInfo, &idInfo, sizeof(idInfo))) {
+            out.volumeSerial = idInfo.VolumeSerialNumber;
+            out.fileIdLow = ((uint64_t)idInfo.FileId.Identifier[8]) |
+                            ((uint64_t)idInfo.FileId.Identifier[9] << 8) |
+                            ((uint64_t)idInfo.FileId.Identifier[10] << 16) |
+                            ((uint64_t)idInfo.FileId.Identifier[11] << 24) |
+                            ((uint64_t)idInfo.FileId.Identifier[12] << 32) |
+                            ((uint64_t)idInfo.FileId.Identifier[13] << 40) |
+                            ((uint64_t)idInfo.FileId.Identifier[14] << 48) |
+                            ((uint64_t)idInfo.FileId.Identifier[15] << 56);
+            out.fileIdHigh = ((uint64_t)idInfo.FileId.Identifier[0]) |
+                             ((uint64_t)idInfo.FileId.Identifier[1] << 8) |
+                             ((uint64_t)idInfo.FileId.Identifier[2] << 16) |
+                             ((uint64_t)idInfo.FileId.Identifier[3] << 24) |
+                             ((uint64_t)idInfo.FileId.Identifier[4] << 32) |
+                             ((uint64_t)idInfo.FileId.Identifier[5] << 40) |
+                             ((uint64_t)idInfo.FileId.Identifier[6] << 48) |
+                             ((uint64_t)idInfo.FileId.Identifier[7] << 56);
+        } else {
+            ok = false;
+        }
+
+        BY_HANDLE_FILE_INFORMATION info{};
+        if (GetFileInformationByHandle(h, &info)) {
+            out.size = ((uint64_t)info.nFileSizeHigh << 32) | info.nFileSizeLow;
+            out.lastWriteTime = ((uint64_t)info.ftLastWriteTime.dwHighDateTime << 32) | info.ftLastWriteTime.dwLowDateTime;
+        } else {
+            ok = false;
+        }
+
+        CloseHandle(h);
+        out.valid = ok;
+        return ok;
     }
 
     // 判断两个路径是否为同目录且符合同族分卷规则
@@ -147,7 +212,6 @@ public:
         fs::path p1(firstPath);
         fs::path p2(otherPath);
 
-        // 1. 必须在同一父目录下
         if (p1.parent_path() != p2.parent_path()) {
             return false;
         }
@@ -159,7 +223,7 @@ public:
 
         if (fn1 == fn2) return true;
 
-        // 2. 模式 A: .001, .002, .003 (如 archive.7z.001 -> archive.7z.002)
+        // 模式 A: .001, .002, .003（如 archive.7z.001 -> archive.7z.002）
         size_t dot1 = fn1.find_last_of(L'.');
         size_t dot2 = fn2.find_last_of(L'.');
         if (dot1 != std::wstring::npos && dot2 != std::wstring::npos) {
@@ -181,12 +245,23 @@ public:
             }
         }
 
-        // 模式 C: .part1.rar, .part2.rar
+        // 模式 C: .part1.rar, .part2.rar（必须数字后缀 + .rar 扩展名，且前缀完全一致）
         size_t part1Pos = fn1.rfind(L".part");
         size_t part2Pos = fn2.rfind(L".part");
         if (part1Pos != std::wstring::npos && part2Pos != std::wstring::npos && part1Pos == part2Pos) {
-            if (fn1.substr(0, part1Pos) == fn2.substr(0, part2Pos)) {
-                return true;
+            std::wstring rest1 = fn1.substr(part1Pos + 5);
+            std::wstring rest2 = fn2.substr(part2Pos + 5);
+            if (rest1.size() > 4 && rest2.size() > 4) {
+                std::wstring num1 = rest1.substr(0, rest1.size() - 4);
+                std::wstring num2 = rest2.substr(0, rest2.size() - 4);
+                std::wstring ext1 = rest1.substr(rest1.size() - 4);
+                std::wstring ext2 = rest2.substr(rest2.size() - 4);
+                if (ext1 == L".rar" && ext2 == L".rar" &&
+                    !num1.empty() && std::all_of(num1.begin(), num1.end(), iswdigit) &&
+                    !num2.empty() && std::all_of(num2.begin(), num2.end(), iswdigit) &&
+                    fn1.substr(0, part1Pos) == fn2.substr(0, part2Pos)) {
+                    return true;
+                }
             }
         }
 
@@ -194,9 +269,17 @@ public:
     }
 
 private:
+    void AddVolumeIdentity(const std::wstring& path) {
+        VolumeIdentityInfo info;
+        if (CaptureIdentity(path, info)) {
+            m_volumeIdentities.push_back(info);
+        }
+    }
+
     LONG m_refCount;
     std::wstring m_firstVolumePath;
     std::function<std::wstring(bool* outCanceled)> m_passwordCallback;
     std::vector<std::wstring> m_openedVolumes;
     std::vector<std::wstring> m_readDependencies;
+    std::vector<VolumeIdentityInfo> m_volumeIdentities;
 };

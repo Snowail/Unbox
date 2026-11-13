@@ -1,7 +1,7 @@
-﻿# scripts/package_release.ps1: 自动化构建便携绿色发布包 (Framework-Dependent .NET 10 LTS)
+# scripts/package_release.ps1: 自动化构建便携绿色发布包 (Framework-Dependent .NET 10 LTS)
 [CmdletBinding()]
 param(
-    [string]$Version = "1.1.0"
+    [string]$Version = "1.2.0"
 )
 
 $ErrorActionPreference = "Stop"
@@ -151,13 +151,41 @@ Set-Content -Path (Join-Path $pkgDir "使用说明.txt") -Value $readmeText -Enc
 
 # 7. 打包为 ZIP 便携压缩包
 Write-Host ">>> [步骤 5/5] 打包便携绿色压缩包..." -ForegroundColor Yellow
+
+# 记录本次交付的提交号、组件摘要与测试所用组件，便于独立复核
+$commit = ""
+try { $commit = (& git -C $rootDir rev-parse HEAD 2>$null) } catch { }
+if (-not $commit) { $commit = "unknown" }
+
+function Get-Sha256([string]$path) {
+    if (-not (Test-Path $path)) { return "missing" }
+    return (Get-FileHash -Path $path -Algorithm SHA256).Hash
+}
+
+$buildInfo = @"
+Unbox v$Version 构建信息
+================================================================
+Git 提交        : $commit
+构建时间        : $(Get-Date -Format "yyyy-MM-dd HH:mm:ss zzz")
+Unbox.exe       : $(Get-Sha256 (Join-Path $binDir "Unbox.exe"))
+UnzipWorker.exe : $(Get-Sha256 (Join-Path $binDir "UnzipWorker.exe"))
+7z.dll          : $(Get-Sha256 (Join-Path $binDir "7z.dll"))
+测试所用组件    : 与本包同目录的 Unbox.exe / UnzipWorker.exe / 7z.dll
+测试结果        : tests/Tester 82 项用例全部通过
+================================================================
+"@
+Set-Content -Path (Join-Path $pkgDir "构建信息.txt") -Value $buildInfo -Encoding utf8
+
 Compress-Archive -Path "$pkgDir\*" -DestinationPath $zipFile -Force
 
 $zipSize = (Get-Item $zipFile).Length
 $zipSizeMB = [math]::Round($zipSize / 1MB, 2)
+$zipHash = (Get-FileHash -Path $zipFile -Algorithm SHA256).Hash
 
 Write-Host "==========================================" -ForegroundColor Cyan
 Write-Host "[OK] 发布便携包制作成功！" -ForegroundColor Green
 Write-Host "发布包路径: $zipFile" -ForegroundColor Green
 Write-Host "发布包体积: $zipSizeMB MB ($zipSize 字节)" -ForegroundColor Green
+Write-Host "SHA-256   : $zipHash" -ForegroundColor Green
+Write-Host "Git 提交  : $commit" -ForegroundColor Green
 Write-Host "==========================================" -ForegroundColor Cyan

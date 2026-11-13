@@ -1,107 +1,142 @@
 # Unbox 项目开发交接文档 (HANDOFF.md)
 
-本文件记录了本轮根据《Unbox-v1.1.0-独立代码复审.md》缺陷审查报告所执行的代码还原、根因分析、重新修复与验证全过程。
+本文件记录当前版本（v1.2.0）的修复内容、根因分析、验证结果与发布信息。
+最新一轮修复依据《Unbox-v1.1.0-HANDOFF第三轮独立审查.md》（75/100）逐项落实。
 
 ---
 
-## 1. 核心背景与乱码根因定位
+## 1. 本轮（v1.2.0）核心修复
 
-### 1.1 乱码问题定位与根除
-- **根因分析**：
-  1. **解压落盘文件乱码根因**：前序修改在 C# WPF 传递代码页时，使用了 `Encoding.Default.CodePage`（在 .NET 10 中恒定返回 65001），向 Worker 强传 `--cp 65001` 破坏了 7-Zip 对中文 Windows 常见 ANSI/GBK (`936`) 压缩包的自动代码页回退机制，并在 `PathSanitizer::FixMojibake` 中触发误判定；
-  2. **详细信息窗口“名称”一栏乱码根因（截图问题）**：C# WPF 启动 `UnzipWorker.exe` 进程的 `ProcessStartInfo` 中，**未显式指定 `StandardOutputEncoding` 和 `StandardInputEncoding`**。在 Windows 默认环境下，.NET 会采用系统的 OEM/ANSI 代码页（GBK / 936）创建读取管道的 `StreamReader`；而 Worker 核心通过二进制模式输出标准 UTF-8 编码的 JSON 字符流。WPF 端用 GBK 解码 UTF-8 字节流（例如将 `希捷专修` 的 UTF-8 字节 `E5 B8 8C E6 8D B7 E4 B8 93 E4 BF AE` 按照 GBK 解码为 `甯屾嵎涓撲慨`），导致进度条下方“名称”一栏显示出极具特征的乱码！
-- **根治措施**：
-  1. 在 `MainWindow.xaml.cs` 中通过 Win32 API `[DllImport("kernel32.dll")] private static extern uint GetACP();` 获取系统真实的 ANSI 代码页（如简体中文下的 936），且仅当 `acp != 0 && acp != 65001` 时才传递 `--cp {acp}`；
-  2. 给 `ProcessStartInfo` 显式设置 `StandardInputEncoding = Encoding.UTF8`、`StandardOutputEncoding = Encoding.UTF8`、`StandardErrorEncoding = Encoding.UTF8`，彻底解决管道两端编码不对齐的问题；
-  3. 在 `App.xaml.cs` 及 `MainWindow.xaml.cs` 中显式注册 `System.Text.CodePagesEncodingProvider.Instance`，全面激活全量代码页支持；
-  4. 在 `MainWindow.xaml.cs` 的 UI 渲染层增加 `FixPotentialMojibake` 双重保险容错函数，即使收到历史残留或极端异常的 GBK/UTF-8 错码，也能逐段识别并自动无损纠偏；
-  5. 新增 **【测试 16】中文详细信息UI管道与防乱码双重保障自动化测试**，断言进度汇报名称不含任何 `甯` 开头乱码，且能自动无损纠错。
+### 1.1 文件名编码：尊重格式声明，取消启发式逆转码（对应第三轮 P1-2）
 
-### 1.2 代码基准还原
-- 完整创建了基准分支 `baseline-2333`（Git Tree: `d511ea2f4e59a9a28a333e773356ee0fc1191c7b`），严格对齐上一轮审核（23点33分左右）代码状态；
-- 保留 `HANDOFF.md` 和 `Unbox-v1.1.0-独立代码复审.md`，在干净基准之上重新实施全量缺陷修复。
+**根因**：旧实现把 7-Zip 解出的名称再做一次「按系统代码页编码 → 按 UTF-8 解码」的启发式逆转码。
+当 GBK 字节恰好构成合法 UTF-8 时（如 `图` 的 GBK 字节 `CD BC` → `U+037C`），
+合法名称会被改写；WPF 展示层还另有一套独立纠偏，形成两份互相矛盾的事实。
 
----
+**修复**：
+- 新增 `src/UnzipWorker/ArchiveNames.h`：直接解析 ZIP 中央目录（含 ZIP64）与 TAR 头部（含 ustar 前缀、GNU 长名、pax `path=`），
+  取得**原始名称字节**与 ZIP 通用标志位 bit 11（已声明 Unicode）。
+- 新增 `src/UnzipWorker/NameDecoder.h`：声明为 UTF-8 的名称严格按 UTF-8 解码后原样保留；
+  未声明编码的名称按系统/用户代码页解码；只有存在 3/4 字节 UTF-8 序列（真实 CJK）时才判定为 UTF-8；
+  两字节歧义（GBK 与 UTF-8 相互误判）保持系统代码页，不再猜测。
+- 无法解析原始字节的格式（7z/RAR 等）直接使用引擎给出的名称，**绝不再二次改写**。
+- 同一份名称同时用于显示、写盘与清单对账；WPF 侧删除 `FixPotentialMojibake` 二次纠偏。
+- 编码确实不确定时（声明与内容冲突、存在无法解码的字节、同一包内混用声明与未声明名称），
+  Worker 上报 `encoding_options` 候选与示例名，WPF 弹出**编码选择框**（UTF-8/GBK/Big5/Shift-JIS/EUC-KR/1252/437，可记忆）。
 
-## 2. 独立代码审查修复清单（已全部落实）
+### 1.2 状态语义：区分「按策略过滤」「用户跳过」「提取失败」（对应第三轮 P1-1）
 
-### 2.1 P1 级别阻断项
-1. **完成消息读取已释放的 Worker 回调 (UAF 释放后读取)**：
-   - 在 `main.cpp` 中调用 `callback->Release()` 触发 `delete this` 之前，提前将 `finalCompletedBytes`、`openedVolumes` 拷贝到局部栈变量，杜绝销毁后解引用。
-2. **缺尾卷或内层失败导致假成功与源文件误删**：
-   - `TryExtractInnerArchive` 改为返回 `InnerExtractResult`（`NotApplicable`, `Success`, `Failed`, `Canceled`）；
-   - 严格约束递归展开条件：仅当外层为切分分卷（`.001`）或约定复合 TAR（`.tar.gz`/`.tgz` 等）时触发；普通 ZIP 内包含的单个 `backup.zip` 严格原样交付；
-   - 缺尾卷或内层解压失败时，明确断言 `isPartial = true`、`errReason = "corrupted_archive"`，清空 stagingDir 残损目录，Worker 退出非零代码（10），彻底阻断正式提交与源包回收；
-   - 移除 WPF 中冗余脱管的二次展开 `UnpackInnerTarIfPresentAsync`，由 Worker 原生全权托管。
-3. **输出未证明落盘即提交与回收**：
-   - WPF 显式等待 Worker 彻底退出（15 秒超时带 Kill 保护），核验 `ExitCode == 0`；
-   - 针对非空归档，核验暂存目录存在且包含有效产物，若失败立即清理暂存残损目录并中断；
-   - `WorkerExtractCallback.h` 中创建目录时严格核验错误码，若失败立即记录错误并返回 Win32 对应 HRESULT。
-4. **同族分卷隔离与回收失败友好提醒**：
-   - `WorkerOpenCallback.h` 区分 `m_readDependencies` 与 `m_openedVolumes`，仅同目录同族物理分卷才进入回收名单；
-   - 若回收失败，界面明确警告用户“解压已完成，但无法移入回收站：...。源压缩包已保留”，并保持窗口打开供用户确认，绝不静默吞错。
-5. **写盘边界与已验证句柄**：
-   - 内层解压直接消费已验证落盘的 `actualDiskPath`（来自 `info.diskPath`），杜绝二次拼路径差异。
+- macOS 元数据（`__MACOSX/`、`.DS_Store`、`._*`）计入 `policy_filtered_items`，**不再算作 skipped**，
+  因此不再导致正常文件被整包丢弃；提示中如实显示过滤数量。
+- 用户选择跳过非法条目 → `status=partial`、退出码 11，**可表示的文件照常交付**（符合 D6 原文），源包保留。
+- 提取失败（CRC/数据损坏/缺卷/预算超限）→ `status=failed`、退出码 10，整体不交付。
 
-### 2.2 P2 级别规范项
-1. **无原名 GZip 流 (RFC 1952 规范)**：
-   - 实现 `DeriveSingleStreamFilename`，在条目路径为空且为单流模式时，自动从输入包名剥离后缀安全推导名称（如 `.txt.gz` -> `.txt`）。
-2. **Unicode 代理对与 Emoji 密码 (RFC 8259 规范)**：
-   - `ExtractJsonStringField` 支持 UTF-16 高低代理对合并与 4 字节 UTF-8 编码，彻底解决非 BMP 字符和 Emoji 密码转义损坏。
-3. **安全来源标记 (Mark of the Web)**：
-   - 实现 `PropagateZoneIdentifier`，通过 NTFS Alternate Data Stream 将源文件的 `:Zone.Identifier` 完整复制给所有解压文件。
-4. **构建、版本与文档一致性**：
-   - `UnzipProxy.csproj` 显式设置版本号 `1.1.0`（AssemblyVersion `1.1.0.0`）；
-   - `README.md` 明确说明采用 **.NET 10 LTS 框架依赖部署**；
-   - `LICENSE` 补充 7-Zip LGPL 及 unRAR 完整官方许可声明；
-   - `build_worker.ps1` 与 `build_worker.bat` 均携带 `/utf-8` 编译参数；
-   - `package_release.ps1` 显式增加前置 `dotnet restore`。
+### 1.3 复合 TAR 按内容判定，消除「假成功」（对应第三轮 P1-3）
 
----
+- 是否展开内层由**外层类型（约定复合 TAR / 分卷入口）+ 载荷文件头签名**共同决定，不再依赖内层扩展名。
+- `.tar.gz`/`.tgz`/gzip 原名无扩展名/无原名样本均按内容确认 TAR 后展开；
+  合法空 TAR 得到「成功 + 空目录」；内层不是 TAR 时明确失败（`inner_not_tar`），不再静默交付中间 TAR。
+- 分卷入口若拼接出的载荷不是可识别归档（如原始数据分片），则原样交付该载荷。
 
-## 3. 目录解压行为优化：同名唯一根目录自动折叠（消除冗余双层嵌套）
+### 1.4 交付完整性：清单对账 + 一次性目录改名（对应第三轮 P1-4、P1-5）
 
-### 3.1 业务诉求
-针对用户解压单根目录压缩包时的双层同名嵌套问题进行行为优化：
-- **场景痛点**：例如解压 `希捷专修.zip`，压缩包内部根级仅有一个同名文件夹 `希捷专修/`。原逻辑根据 D1 规范解压后生成 `希捷专修/希捷专修/希捷固件...`，出现了两层同名的 `希捷专修`。
-- **变更目标**：如果压缩包解压后的根目录**只有唯一一个和压缩包同名的文件夹**，自动折叠消除这一级冗余同名目录，使解压产物最终为 `希捷专修/希捷固件...`（仅保留一层 `希捷专修`）。
+- Worker 输出 `--manifest` 交付清单：每条记录的**实际落盘相对路径、类型、长度、CRC32**。
+- 新增 `src/UnzipProxy/Core/DeliveryManifest.cs` 与 `ExtractionCompleter.cs`（生产完成路径，WPF 与测试共用）：
+  1. 提交前逐项对账（路径/类型/长度，清单外文件与目录一律拒绝）；
+  2. 同名唯一根目录折叠改为「选定交付根 + 一次同卷改名」，不再逐项搬运（1,200 文件的提交从 ~1,272 ms 降至 ~109 ms）；
+  3. 折叠判定只比较**压缩包原始基名**，不再从目标展示名反推 `(2)` 序号（`Report (2).zip` 不再误折叠内部 `Report/`）；
+  4. 冲突时只选择新的目标名，绝不删除已存在的目录；
+  5. 来源标记在最终树公开之前写入；提交后再次按清单复核。
+- 内层提取使用隔离的同卷交付根（`.unbox_deliver_*`），成功后才删除中间载荷；失败时保留完整待交付树。
 
-### 3.2 判定条件与核心边界（严防误伤）
-在 `src/UnzipProxy/Core/ArchiveTaskPlanner.cs` 中实现 `TryCollapseRedundantSameNameFolder`，并在 `CommitStagingDirectory` 提交暂存区到目标目录前自动执行检测：
-1. **唯一性核验**：解压完成后的暂存目录（`stagingDir`）下，**必须且仅有 1 个子目录**（`subDirs.Length == 1`），且**没有任何同级文件**（`subFiles.Length == 0`）。
-2. **同名匹配规则**：该唯一子目录名必须与原压缩包的基础名（`archiveBaseName`）或目标规划目录名（`targetRootDirName`）一致（忽略大小写，且兼容带冲突序号情况，如 `希捷专修 (2)` 匹配 `希捷专修`）。
-3. **无损安全上移**：
-   - 为避免直接移动目标同名锁死或跨卷异常，在暂存目录内部生成临时唯一目录 `.unbox_collapse_{Guid}`；
-   - 将子目录重命名为临时目录后，逐项无损上移至 `stagingDir` 根层，再删除临时空目录；
-   - 包含完整的 `try-catch` 降级保护，若系统在重命名或移动阶段发生异常，无损降级保留原始多层结构，绝不破坏文件交付。
-4. **反例防护（坚决不折叠）**：
-   - 若根目录下除该文件夹外还存在其他同级文件，**坚决不折叠**；
-   - 若根目录下存在多个子文件夹，**坚决不折叠**；
-   - 若唯一子文件夹名称与压缩包名称不一致（如 `测试包.zip` 内包含 `资料/`），**坚决不折叠**；
-   - 普通单个 ZIP 嵌套原样交付，不受目录折叠影响。
+### 1.5 源包回收：对象身份 + 逐卷真实结果（对应第三轮 P1-6）
 
-### 3.3 自动化测试验收
-新增 **【测试 17】同名唯一根目录折叠验收 (消除冗余双层嵌套)**：
-- 正例：`希捷专修.zip` 内部含 `希捷专修/希捷固件/...`，解压后验证 `希捷专修/` 直接包含 `希捷固件` 与 `使用说明.txt`，且二级不存在 `希捷专修`；
-- 反例 1：同名文件夹外伴随同级文件，验证坚决不折叠；
-- 反例 2：唯一文件夹名称与压缩包不同，验证坚决不折叠。
+- Worker 在真正打开每个分卷时捕获**卷序列号 + 128 位文件 ID + 长度 + 修改时间**，随 `finished` 上报。
+- 回收前逐卷重新读取身份；文件被替换/修改、UNC、介质不支持、无法读取身份时**拒绝回收并保留源文件**。
+- 改用 Shell `IFileOperation` + `IFileOperationProgressSink` + `FOFX_RECYCLEONDELETE`：
+  按 HRESULT 符号判定成功（识别 `S_DONT_PROCESS_CHILDREN` 等成功码），逐卷记录真实返回值；
+  若 Shell 未返回回收站落点，则通过回收站命名空间按「原文件名 + 原目录」定位实际存放路径。
+- 界面逐卷显示结果（成功数量、失败卷与原因），不再笼统声称「源文件全在原位」。
+- 修复缺失资源 `AccentOrangeBrush`（改用已存在的 `Win11Amber` 提示色）。
+
+### 1.6 安全边界与健壮性
+
+- 输出文件创建后立即用**文件句柄**取回真实最终路径并断言位于受控根目录内（拦截联接点/符号链接逃逸）；
+  创建目录同样做句柄级验证。
+- 外层与内层各自持有基于声明大小的**实际输出预算**，超出即中止（`output_budget_exceeded`）。
+- 进度分母统一为计划内声明字节；内层提取提供真实进度帧（`phase=inner`）。
+- 通用 Worker 错误不再被 EOF 兜底覆盖；完成消息缺字段一律视为失败。
+- 非 Windows 原生镜像格式（VMDK/VDI/QCOW）改为按格式文字生成的专用图标，不再复用 VHD 图标。
 
 ---
 
-## 4. 测试与产物验证
+## 2. 同目录行为优化：同名唯一根目录折叠
 
-### 4.1 自动化测试套件
-- 运行：`& "$env:LOCALAPPDATA\Microsoft\dotnet\dotnet.exe" run --project tests\Tester\Tester.csproj -c Release`
-- 结果：**63/63 项测试 100% 通过（0 失败）**。
-- 覆盖率：D1-D6 规范、UNC 拒绝、加密头 7z、三卷 7z 正常解压、1200 个小文件性能与限流（耗时 350ms, 12帧）、**缺尾卷反例断言**、**普通单 ZIP 嵌套原样交付断言**、**无名 GZip 流推导断言**、**Emoji / 代理对密码往返断言**、**Zone.Identifier 来源标记传递断言**、**中文文件名解压无乱码断言**、**UI名称管道UTF-8防乱码断言**、**UI双保险自动纠偏断言**、**同名唯一根目录折叠正例及反例断言**。
+### 2.1 业务诉求
+解压单根目录压缩包时避免 `希捷专修/希捷专修/…` 的双层同名嵌套。
 
-### 4.2 发行包产物
-- 文件：`dist/Unbox-v1.1.0-win-x64.zip`（体积 ~2.65 MB）
-- 内部 `Unbox.exe` 文件版本：`1.1.0.0`，产品版本：`1.1.0`。
+### 2.2 判定条件（严防误伤）
+1. 交付根下**必须且仅有 1 个子目录**，且**没有任何同级文件**；
+2. 子目录名必须与**压缩包自身基名**一致（忽略大小写）；
+3. 折叠通过一次同卷目录改名完成；失败时保留完整待交付树并报告错误。
+
+### 2.3 明确不折叠
+- 存在同级文件或多子目录；
+- 唯一子目录与压缩包基名不同；
+- 包名本身带 `(2)` 等后缀（不得与系统分配的冲突序号混淆）。
 
 ---
 
-## 5. 后续路线规划 (Roadmap)
+## 3. 文件与模块索引（本轮新增/重写）
+
+| 文件 | 说明 |
+|---|---|
+| `src/UnzipWorker/ArchiveNames.h` | ZIP/TAR 原始名称读取（含 ZIP64、ustar 前缀、GNU 长名、pax path） |
+| `src/UnzipWorker/NameDecoder.h` | 编码声明判定、候选解码与代码页标签 |
+| `src/UnzipWorker/main.cpp` | 条目计划、编码协商、内层展开、交付清单、状态与退出码 |
+| `src/UnzipWorker/FileStream.h` | 统一输出预算、`CREATE_NEW` 冲突递增、句柄级根目录校验 |
+| `src/UnzipWorker/WorkerExtractCallback.h` | 目录/文件逐项记录（含实际相对路径）、CRC32、越界计数 |
+| `src/UnzipWorker/WorkerOpenCallback.h` | 分卷族判定（数字后缀 + `.rar` 扩展）、逐卷对象身份快照 |
+| `src/UnzipProxy/Core/ArchiveTaskPlanner.cs` | 计划、唯一目标名、同名根目录选择（单次改名） |
+| `src/UnzipProxy/Core/DeliveryManifest.cs` | 交付清单解析与逐项对账（结构 / 结构+摘要） |
+| `src/UnzipProxy/Core/ExtractionCompleter.cs` | 生产完成路径：对账 → 折叠 → 来源标记 → 提交 → 复核 → 回收 |
+| `src/UnzipProxy/Core/ShellRecycleBin.cs` | `IFileOperation` 显式回收、逐卷结果、回收站落点定位 |
+| `src/UnzipProxy/Core/FileIdentity.cs` | 卷序列号 + 128 位文件 ID 身份快照与比对 |
+| `src/UnzipProxy/Core/Crc32.cs` | 与 Worker 一致的 CRC32 实现 |
+| `tests/Tester/Program.cs` | 全部用例改为经由**生产完成路径**验收 |
+
+---
+
+## 4. 自动化测试与验证
+
+- 运行：`dotnet run --project tests\Tester\Tester.csproj -c Release`
+- 结果：**82/82 项测试通过（0 失败）**，覆盖：
+  - D1/D5/D6 规则、CRC32 标准向量、清单对账；
+  - 安全回收：UNC 拒绝、源文件被替换时拒绝回收、真实回收后从回收站落点核对 SHA-256（可还原）；
+  - 生产路径：普通 ZIP、带 macOS 元数据的同名根 ZIP、声明 UTF-8 的 `图.txt`、旧 GBK、未声明 UTF-8；
+  - 复合 TAR：具名 `.tar.gz`、无原名 `.tgz`、gzip 原名无扩展名、合法空 TAR.GZ、普通内嵌 ZIP 原样交付；
+  - 加密头 7z、完整分卷、缺尾卷反例；
+  - 同名根折叠、`Report (2).zip` 不误折叠；
+  - 完整性门槛：暂存缺项 / 清单外多余文件 / 摘要被替换时拒绝提交；
+  - 空归档、来源标记（生产路径写入）、部分完成（跳过项仍交付）；
+  - 性能：1,200 小文件 Worker 373 ms / 13 帧，清单对账 + 单次改名提交 109 ms。
+
+### 4.1 发布包产物
+- `dist/Unbox-v1.2.0-win-x64.zip`
+- `Unbox.exe` 文件版本 `1.2.0.0`，产品版本 `1.2.0+<提交号>`
+- 图标库 29 个（新增 VMDK/VDI/QCOW 专用图标）
+
+---
+
+## 5. 尚未自动化的验收项（如实记录）
+
+- 未在可见桌面上执行 Explorer 双击、DPI、无障碍与回收站图形化还原；
+- 未在“未安装 .NET 10 桌面运行时”的机器上验证启动提示；
+- 编码选择框通过 Worker 协议与生产完成路径验证，未做 GUI 自动化点击。
+
+---
+
+## 6. 后续路线规划 (Roadmap)
 
 根据项目演进规划，Unbox 确认了以下两项后续重大特性。**当前保持代码与主分支稳定，暂不启动编码开发，静候详细规划文档**：
 1. **多国语言支持 (i18n)**：
