@@ -6,6 +6,7 @@
 #include <atomic>
 #include <memory>
 #include <functional>
+#include <string>
 
 // 输入流包装
 class CInFileStream : public IInStream, public IStreamGetSize {
@@ -95,10 +96,10 @@ private:
     HANDLE m_hFile;
 };
 
-// 输出流包装（流式计算 CRC32、SHA256，支持暂停和取消监控）
+// 输出流包装（流式轻量计算，支持取消和暂停，杜绝重解析点写入）
 class COutFileStream : public ISequentialOutStream {
 public:
-    using PauseCheckCallback = std::function<bool()>; // 返回 false 表示取消任务
+    using PauseCheckCallback = std::function<bool()>;
 
     COutFileStream(HANDLE hFile, 
                    std::function<void(uint64_t)> onBytesWritten,
@@ -119,16 +120,13 @@ public:
     // IUnknown
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **ppvObject) override {
         if (!ppvObject) return E_POINTER;
-        if (iid == IID_IUnknown) {
-            *ppvObject = static_cast<IUnknown*>(static_cast<ISequentialOutStream*>(this));
-        } else if (iid == IID_ISequentialOutStream) {
+        if (iid == IID_IUnknown || iid == IID_ISequentialOutStream) {
             *ppvObject = static_cast<ISequentialOutStream*>(this);
-        } else {
-            *ppvObject = nullptr;
-            return E_NOINTERFACE;
+            AddRef();
+            return S_OK;
         }
-        AddRef();
-        return S_OK;
+        *ppvObject = nullptr;
+        return E_NOINTERFACE;
     }
 
     ULONG STDMETHODCALLTYPE AddRef() override {
@@ -155,7 +153,6 @@ public:
 
         if (bytesWritten > 0) {
             m_crc.Update(data, bytesWritten);
-            m_sha.Update(data, bytesWritten);
             m_totalWritten += bytesWritten;
             if (m_onBytesWritten) {
                 m_onBytesWritten(bytesWritten);
@@ -167,14 +164,56 @@ public:
     }
 
     uint32_t GetCRC() const { return m_crc.GetDigest(); }
-    std::string GetSHA256() { return m_sha.FinishHex(); }
     uint64_t GetTotalWritten() const { return m_totalWritten; }
 
+    // 生产级安全创建：
+    // 1. 检查父目录是否是符号链接/重解析点（拦截提权劫持）
+    // 2. 默认使用 CREATE_NEW 避免静默截断同名文件；若发生同名冲突自动加 "(2)" 序号
     static COutFileStream* CreateOutputFile(const wchar_t* path, 
                                             std::function<void(uint64_t)> onBytesWritten,
-                                            PauseCheckCallback checkPauseOrCancel) {
-        HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                                            PauseCheckCallback checkPauseOrCancel,
+                                            std::wstring* outActualPath = nullptr) {
+        std::wstring p(path);
+        static thread_local std::wstring s_lastCheckedReparseDir = L"";
+        size_t lastSlash = p.find_last_of(L"\\/");
+        if (lastSlash != std::wstring::npos) {
+            std::wstring parentDir = p.substr(0, lastSlash);
+            if (parentDir != s_lastCheckedReparseDir) {
+                DWORD attr = GetFileAttributesW(parentDir.c_str());
+                if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_REPARSE_POINT)) {
+                    // 父级包含符号链接或重解析点，安全拦截！
+                    return nullptr;
+                }
+                s_lastCheckedReparseDir = parentDir;
+            }
+        }
+
+        // 尝试独占新建 CREATE_NEW，若存在则递增序号避免截断
+        std::wstring curPath = p;
+        HANDLE h = CreateFileW(curPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_EXISTS) {
+            // 分解主文件名与扩展名
+            size_t dotPos = curPath.find_last_of(L'.');
+            size_t slashPos = curPath.find_last_of(L"\\/");
+            std::wstring baseName = (dotPos != std::wstring::npos && (slashPos == std::wstring::npos || dotPos > slashPos))
+                ? curPath.substr(0, dotPos) : curPath;
+            std::wstring extName = (dotPos != std::wstring::npos && (slashPos == std::wstring::npos || dotPos > slashPos))
+                ? curPath.substr(dotPos) : L"";
+
+            for (int i = 2; i <= 999; ++i) {
+                curPath = baseName + L" (" + std::to_wstring(i) + L")" + extName;
+                h = CreateFileW(curPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (h != INVALID_HANDLE_VALUE) {
+                    break;
+                }
+                if (GetLastError() != ERROR_FILE_EXISTS) {
+                    break;
+                }
+            }
+        }
+
         if (h == INVALID_HANDLE_VALUE) return nullptr;
+        if (outActualPath) *outActualPath = curPath;
         return new COutFileStream(h, onBytesWritten, checkPauseOrCancel);
     }
 
@@ -183,7 +222,6 @@ private:
     HANDLE m_hFile;
     uint64_t m_totalWritten;
     Crc32Hasher m_crc;
-    Sha256Hasher m_sha;
     std::function<void(uint64_t)> m_onBytesWritten;
     PauseCheckCallback m_checkPauseOrCancel;
 };

@@ -15,17 +15,28 @@ namespace UnzipProxy.Core
 
     public static class ArchiveTaskPlanner
     {
+        private static readonly string[] CompoundSuffixes = new[] {
+            ".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".tar.lzma",
+            ".tgz", ".tbz2", ".tbz", ".txz", ".tzst"
+        };
+
+        public static bool IsCompoundTar(string filePath)
+        {
+            string fileName = Path.GetFileName(filePath);
+            foreach (var suf in CompoundSuffixes)
+            {
+                if (fileName.EndsWith(suf, StringComparison.OrdinalIgnoreCase)) return true;
+            }
+            return false;
+        }
+
         // 剥离归档与分卷后缀，得到纯净的包名
         public static string GetArchiveBaseName(string filePath)
         {
             string fileName = Path.GetFileName(filePath);
 
             // 1. 复合 TAR 后缀
-            string[] compoundSuffixes = new[] {
-                ".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".tar.lzma",
-                ".tgz", ".tbz2", ".tbz", ".txz", ".tzst"
-            };
-            foreach (var suf in compoundSuffixes)
+            foreach (var suf in CompoundSuffixes)
             {
                 if (fileName.EndsWith(suf, StringComparison.OrdinalIgnoreCase))
                 {

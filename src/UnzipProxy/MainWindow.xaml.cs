@@ -244,12 +244,28 @@ namespace UnzipProxy
 
                     _jobManager = new JobObjectManager();
                     _workerProcess = new Process { StartInfo = psi };
-                    _workerProcess.Start();
+                    if (!_workerProcess.Start())
+                    {
+                        Dispatcher.Invoke(() => TriggerError("启动失败", "无法启动工作进程: " + workerExe));
+                        return;
+                    }
                     _jobManager.AssignProcess(_workerProcess);
 
                     _workerInput = _workerProcess.StandardInput;
 
                     ListenWorkerOutput(_workerProcess.StandardOutput);
+
+                    // 管道读完后等待工作进程退出
+                    _workerProcess.WaitForExit();
+                    if (!_isCompleted && !_isPaused)
+                    {
+                        string stdErr = _workerProcess.StandardError.ReadToEnd();
+                        int exitCode = _workerProcess.ExitCode;
+                        Dispatcher.Invoke(() =>
+                        {
+                            TriggerError("解压中断", $"工作进程异常退出 (退出代码: {exitCode}) {(string.IsNullOrEmpty(stdErr) ? "" : ": " + stdErr)}");
+                        });
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -328,9 +344,7 @@ namespace UnzipProxy
                     break;
 
                 case "finished":
-                    string status = root.GetProperty("status").GetString() ?? "ok";
-                    _completedBytes = root.GetProperty("completed_bytes").GetInt64();
-                    HandleFinished(status);
+                    HandleFinished(root);
                     break;
 
                 case "error":
@@ -514,13 +528,28 @@ namespace UnzipProxy
         {
             string pwd = PasswordInputBox.Password;
             ModalOverlay.Visibility = Visibility.Collapsed;
-            SendWorkerMessage($"{{\"type\":\"password_response\",\"password\":\"{pwd}\"}}");
+            var payload = new { type = "password_response", password = pwd };
+            SendWorkerMessage(JsonSerializer.Serialize(payload));
         }
 
         private void OnPasswordCancelClick(object sender, RoutedEventArgs e)
         {
             ModalOverlay.Visibility = Visibility.Collapsed;
+            var payload = new { type = "password_response", canceled = true };
+            SendWorkerMessage(JsonSerializer.Serialize(payload));
             OnCancelClick(sender, e);
+        }
+
+        private void OnPasswordInputKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
+        {
+            if (e.Key == System.Windows.Input.Key.Enter)
+            {
+                OnPasswordSubmitClick(sender, new RoutedEventArgs());
+            }
+            else if (e.Key == System.Windows.Input.Key.Escape)
+            {
+                OnPasswordCancelClick(sender, new RoutedEventArgs());
+            }
         }
 
         // D2 移入回收站告警与偏好记忆
@@ -637,21 +666,43 @@ namespace UnzipProxy
             ExpandedContainer.BeginAnimation(OpacityProperty, new DoubleAnimation(targetExpandedOpacity, duration) { EasingFunction = ease });
         }
 
-        // 完成处理 (播放 Finished.mp3，优雅延时退出)
-        private async void HandleFinished(string status)
+        // 完成处理 (核验全部条件：退出码 0、无错误、无跳过，方可执行回收)
+        private async void HandleFinished(JsonElement root)
         {
             _isCompleted = true;
             _speedTimer.Stop();
 
-            _completedBytes = _totalBytes;
-            UpdateProgressUi();
+            string status = root.TryGetProperty("status", out var stElem) ? (stElem.GetString() ?? "ok") : "ok";
+            _completedBytes = root.TryGetProperty("completed_bytes", out var cbElem) ? cbElem.GetInt64() : _totalBytes;
+            string errorReason = root.TryGetProperty("error_reason", out var erElem) ? (erElem.GetString() ?? "") : "";
+            int skippedItems = root.TryGetProperty("skipped_items", out var skpElem) ? skpElem.GetInt32() : 0;
 
-            ExtractProgressBar.Value = 100;
-            TitleText.Text = "已完成 100%";
-            MainStatusText.Text = "已完成 100%";
-            DetailEtaText.Text = "完成";
-            DetailRemainingText.Text = "0 (0 B)";
-            SpeedGraph.PushSample(1.0, _currentSpeedMBps, _displayedSpeedMBps);
+            var openedVols = new List<string>();
+            if (root.TryGetProperty("opened_volumes", out var volsElem) && volsElem.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var v in volsElem.EnumerateArray())
+                {
+                    string? s = v.GetString();
+                    if (!string.IsNullOrEmpty(s)) openedVols.Add(s);
+                }
+            }
+            if (openedVols.Count == 0 && _plan != null)
+            {
+                openedVols.Add(_plan.SourceArchivePath);
+            }
+
+            // 等待工作进程彻底退出并获取退出码，保证文件句柄完全释放
+            if (_workerProcess != null && !_workerProcess.HasExited)
+            {
+                await Task.Run(() => _workerProcess.WaitForExit(10000));
+            }
+            int exitCode = _workerProcess?.ExitCode ?? 0;
+
+            // 处理 TAR.GZ / TGZ 两层复合解压
+            if (_plan != null && Directory.Exists(_plan.StagingDirectory))
+            {
+                await UnpackInnerTarIfPresentAsync(_plan.StagingDirectory);
+            }
 
             // 提交暂存目录
             if (_plan != null && !ArchiveTaskPlanner.CommitStagingDirectory(_plan, out string commitErr))
@@ -660,12 +711,32 @@ namespace UnzipProxy
                 return;
             }
 
-            bool isPartial = (status == "partial") || _hasSkippedItems;
+            bool isPartial = (status == "partial") || _hasSkippedItems || (exitCode != 0) || !string.IsNullOrEmpty(errorReason);
 
             if (isPartial)
             {
                 MainStatusText.Text = "部分完成";
-                PathInfoText.Text = "部分条目因字符非法已被跳过，源压缩包已保留。";
+                if (errorReason == "crc_error")
+                {
+                    PathInfoText.Text = "解压完成，但部分文件存在数据校验 (CRC) 错误，源压缩包已保留。";
+                }
+                else if (errorReason == "data_error")
+                {
+                    PathInfoText.Text = "解压完成，但部分条目数据损坏，源压缩包已保留。";
+                }
+                else if (errorReason == "unsupported_method")
+                {
+                    PathInfoText.Text = "压缩算法不受当前引擎支持，源压缩包已保留。";
+                }
+                else if (_hasSkippedItems || skippedItems > 0)
+                {
+                    PathInfoText.Text = "部分条目因字符非法或路径不安全已被跳过，源压缩包已保留。";
+                }
+                else
+                {
+                    PathInfoText.Text = $"解压未完全成功 (状态代码: {exitCode})，源压缩包已安全保留。";
+                }
+
                 PathInfoText.ToolTip = PathInfoText.Text;
                 TitleText.Text = $"部分完成 - {Path.GetFileName(_archivePath)}";
                 RunningActionPanel.Visibility = Visibility.Collapsed;
@@ -673,17 +744,93 @@ namespace UnzipProxy
             }
             else
             {
-                if (RecycleCheckBox.IsChecked == true && _plan != null)
+                // 仅在严格成功 (exitCode == 0 && status == ok && errorReason 为空 && 无跳过项) 时才回收
+                string recycleNotice = "";
+                if (RecycleCheckBox.IsChecked == true && openedVols.Count > 0)
                 {
-                    var family = ShellRecycleBin.FindVolumeFamily(_plan.SourceArchivePath);
-                    ShellRecycleBin.RecycleItems(family);
+                    var (recOk, recMsg) = ShellRecycleBin.RecycleOpenedVolumes(openedVols);
+                    if (!recOk)
+                    {
+                        recycleNotice = $" ({recMsg})";
+                    }
                 }
+
+                ExtractProgressBar.Value = 100;
+                TitleText.Text = "已完成 100%";
+                MainStatusText.Text = "已完成 100%";
+                DetailEtaText.Text = "完成";
+                DetailRemainingText.Text = "0 (0 B)";
+                SpeedGraph.PushSample(1.0, _currentSpeedMBps, _displayedSpeedMBps);
 
                 SystemEffects.PlayFinishedSound();
 
                 // 停留 800ms，让用户看清完成动画与 100% 状态
                 await Task.Delay(800);
                 Close();
+            }
+        }
+
+        // 复合 TAR 归档（如 .tar.gz / .tgz）两层自动解压支持
+        private async Task UnpackInnerTarIfPresentAsync(string stagingDir)
+        {
+            try
+            {
+                string[] files = Directory.GetFiles(stagingDir, "*", SearchOption.TopDirectoryOnly);
+                string[] dirs = Directory.GetDirectories(stagingDir, "*", SearchOption.TopDirectoryOnly);
+
+                // 如果外层解压后仅产生一个 .tar 文件且无其它文件/目录
+                if (files.Length == 1 && dirs.Length == 0 && files[0].EndsWith(".tar", StringComparison.OrdinalIgnoreCase))
+                {
+                    string tarPath = files[0];
+                    string innerStaging = Path.Combine(stagingDir, $".inner_tar_{Guid.NewGuid():N}");
+                    Directory.CreateDirectory(innerStaging);
+
+                    string appDir = AppDomain.CurrentDomain.BaseDirectory;
+                    string workerExe = Path.Combine(appDir, "UnzipWorker.exe");
+                    if (!File.Exists(workerExe))
+                    {
+                        string altWorker = Path.GetFullPath(Path.Combine(appDir, @"..\..\..\..\bin\UnzipWorker.exe"));
+                        if (File.Exists(altWorker)) workerExe = altWorker;
+                    }
+
+                    var psi = new ProcessStartInfo
+                    {
+                        FileName = workerExe,
+                        Arguments = $"--archive \"{tarPath}\" --staging \"{innerStaging}\" --target-root \"inner\"",
+                        UseShellExecute = false,
+                        CreateNoWindow = true
+                    };
+
+                    using var p = Process.Start(psi);
+                    if (p != null)
+                    {
+                        await p.WaitForExitAsync();
+                        if (p.ExitCode == 0)
+                        {
+                            // 删除中间过渡的 .tar 文件
+                            File.Delete(tarPath);
+
+                            // 将内层解出的所有文件和目录移动到 stagingDir
+                            foreach (var dir in Directory.GetDirectories(innerStaging))
+                            {
+                                string destDir = Path.Combine(stagingDir, Path.GetFileName(dir));
+                                if (Directory.Exists(destDir)) Directory.Delete(destDir, true);
+                                Directory.Move(dir, destDir);
+                            }
+                            foreach (var file in Directory.GetFiles(innerStaging))
+                            {
+                                string destFile = Path.Combine(stagingDir, Path.GetFileName(file));
+                                if (File.Exists(destFile)) File.Delete(destFile);
+                                File.Move(file, destFile);
+                            }
+                            Directory.Delete(innerStaging, true);
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // 复合 TAR 内层解压降级：保留外层提取出的 tar 文件
             }
         }
 

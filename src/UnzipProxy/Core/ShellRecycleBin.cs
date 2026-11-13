@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
-using System.Text.RegularExpressions;
 
 namespace UnzipProxy.Core
 {
@@ -21,6 +20,14 @@ namespace UnzipProxy.Core
             public string? lpszProgressTitle;
         }
 
+        [StructLayout(LayoutKind.Sequential, Pack = 4)]
+        private struct SHQUERYRBINFO
+        {
+            public int cbSize;
+            public long i64Size;
+            public long i64NumItems;
+        }
+
         private const uint FO_DELETE = 0x0003;
         private const ushort FOF_ALLOWUNDO = 0x0040;
         private const ushort FOF_NOCONFIRMATION = 0x0010;
@@ -30,127 +37,81 @@ namespace UnzipProxy.Core
         [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
         private static extern int SHFileOperation(ref SHFILEOPSTRUCT FileOp);
 
-        // 查找属于同一组的分卷文件
-        public static List<string> FindVolumeFamily(string sourcePath)
-        {
-            var family = new List<string>();
-            if (!File.Exists(sourcePath)) return family;
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+        private static extern int SHQueryRecycleBin(string pszRootPath, ref SHQUERYRBINFO pSHQueryRBInfo);
 
-            string? dir = Path.GetDirectoryName(sourcePath);
-            if (string.IsNullOrEmpty(dir)) dir = Directory.GetCurrentDirectory();
-
-            string fileName = Path.GetFileName(sourcePath);
-
-            // 1. .7z.001 / .001 系列
-            Match m001 = Regex.Match(fileName, @"^(.*?)\.(\d{3})$", RegexOptions.IgnoreCase);
-            if (m001.Success)
-            {
-                string prefix = m001.Groups[1].Value;
-                foreach (string file in Directory.GetFiles(dir, prefix + ".*"))
-                {
-                    if (Regex.IsMatch(Path.GetFileName(file), @"^" + Regex.Escape(prefix) + @"\.\d{3}$", RegexOptions.IgnoreCase))
-                    {
-                        family.Add(file);
-                    }
-                }
-                if (family.Count > 0) return family;
-            }
-
-            // 2. .part01.rar / .part1.rar 系列
-            Match mPart = Regex.Match(fileName, @"^(.*?)\.part(\d+)\.rar$", RegexOptions.IgnoreCase);
-            if (mPart.Success)
-            {
-                string prefix = mPart.Groups[1].Value;
-                foreach (string file in Directory.GetFiles(dir, prefix + ".part*.rar"))
-                {
-                    family.Add(file);
-                }
-                if (family.Count > 0) return family;
-            }
-
-            // 3. .z01, .z02 ... .zip 系列
-            Match mZipPart = Regex.Match(fileName, @"^(.*?)\.(z\d{2}|zip)$", RegexOptions.IgnoreCase);
-            if (mZipPart.Success)
-            {
-                string prefix = mZipPart.Groups[1].Value;
-                foreach (string file in Directory.GetFiles(dir, prefix + ".*"))
-                {
-                    string ext = Path.GetExtension(file);
-                    if (ext.Equals(".zip", StringComparison.OrdinalIgnoreCase) ||
-                        Regex.IsMatch(ext, @"^\.z\d{2}$", RegexOptions.IgnoreCase))
-                    {
-                        family.Add(file);
-                    }
-                }
-                if (family.Count > 0) return family;
-            }
-
-            // 普通单文件
-            family.Add(sourcePath);
-            return family;
-        }
-
-        // 检查路径是否可能支持回收站（网络路径 \\ 和某些虚拟盘通常不支持）
+        // 检查指定路径所在的驱动器是否真正支持回收站（排查 UNC 共享、网络驱动器及回收站禁用的情况）
         public static bool IsRecycleBinSupported(string path)
         {
             try
             {
-                if (path.StartsWith(@"\\")) return false; // UNC 路径不支持回收站
+                if (path.StartsWith(@"\\")) return false; // UNC 共享路径不支持回收站
                 string root = Path.GetPathRoot(path) ?? "";
-                if (string.IsNullOrEmpty(root)) return true;
+                if (string.IsNullOrEmpty(root)) return false;
 
                 var drive = new DriveInfo(root);
-                if (drive.DriveType == DriveType.Network) return false;
-                if (drive.DriveType == DriveType.CDRom) return false;
-                return true;
+                if (drive.DriveType != DriveType.Fixed && drive.DriveType != DriveType.Removable)
+                {
+                    return false;
+                }
+
+                var rbInfo = new SHQUERYRBINFO { cbSize = Marshal.SizeOf(typeof(SHQUERYRBINFO)) };
+                int hr = SHQueryRecycleBin(root, ref rbInfo);
+                return hr == 0;
             }
             catch
             {
-                return true;
+                return false;
             }
         }
 
-        // 安全移入回收站
-        public static (bool success, string message) RecycleItems(IEnumerable<string> filePaths)
+        // 安全移入回收站：严格仅回收 Worker 报告的实际成功打开的分卷真实路径（杜绝正则盲猜与同名误杀）
+        public static (bool success, string message) RecycleOpenedVolumes(IEnumerable<string> openedVolumes)
         {
-            var existingFiles = new List<string>();
-            foreach (var f in filePaths)
+            var targetFiles = new List<string>();
+            foreach (var vol in openedVolumes)
             {
-                if (File.Exists(f))
+                if (string.IsNullOrWhiteSpace(vol)) continue;
+                string fullPath = Path.GetFullPath(vol);
+                if (!File.Exists(fullPath))
                 {
-                    if (!IsRecycleBinSupported(f))
-                    {
-                        return (false, $"路径不支持回收站（网络驱动器或只读介质）：{Path.GetFileName(f)}，源文件已保留");
-                    }
-                    existingFiles.Add(Path.GetFullPath(f));
+                    return (false, $"分卷文件不存在或已被移除：{Path.GetFileName(vol)}，源文件已保留");
                 }
+                if (!IsRecycleBinSupported(fullPath))
+                {
+                    return (false, $"驱动器不支持回收站（可能为网络路径或未启用）：{Path.GetFileName(vol)}，源文件已保留");
+                }
+                targetFiles.Add(fullPath);
             }
 
-            if (existingFiles.Count == 0)
+            if (targetFiles.Count == 0)
             {
                 return (true, "无需回收");
             }
 
-            // SHFileOperation 要求以双 null 结尾的多字符串缓冲
-            string buffer = string.Join("\0", existingFiles) + "\0\0";
+            // 逐个执行回收，并在操作后校验文件是否已离开原位置且未造成意外损坏
+            var recycled = new List<string>();
+            foreach (var file in targetFiles)
+            {
+                // SHFileOperation 要求以双 null 结尾
+                string buffer = file + "\0\0";
+                var op = new SHFILEOPSTRUCT
+                {
+                    wFunc = FO_DELETE,
+                    pFrom = buffer,
+                    fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI,
+                    fAnyOperationsAborted = false
+                };
 
-            var op = new SHFILEOPSTRUCT
-            {
-                wFunc = FO_DELETE,
-                pFrom = buffer,
-                fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI,
-                fAnyOperationsAborted = false
-            };
+                int ret = SHFileOperation(ref op);
+                if (ret != 0 || op.fAnyOperationsAborted || File.Exists(file))
+                {
+                    return (false, $"分卷移入回收站失败：{Path.GetFileName(file)} (错误代码: 0x{ret:X})，后续源文件已停止回收");
+                }
+                recycled.Add(file);
+            }
 
-            int ret = SHFileOperation(ref op);
-            if (ret == 0 && !op.fAnyOperationsAborted)
-            {
-                return (true, $"已成功移入回收站 ({existingFiles.Count} 个文件)");
-            }
-            else
-            {
-                return (false, $"移入回收站未完成 (错误码: 0x{ret:X})，源文件已保留");
-            }
+            return (true, $"已将源压缩包移入回收站 ({recycled.Count} 个分卷)");
         }
     }
 }

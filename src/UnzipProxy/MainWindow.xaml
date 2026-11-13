@@ -353,7 +353,7 @@
                                        FontSize="12" 
                                        Foreground="{DynamicResource TextForegroundBrush}" 
                                        Margin="0,0,0,8" />
-                            <PasswordBox x:Name="PasswordInputBox" Height="28" Margin="0,0,0,16" />
+                            <PasswordBox x:Name="PasswordInputBox" Height="28" Margin="0,0,0,16" KeyDown="OnPasswordInputKeyDown" />
                             <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
                                 <Button Content="取消" Margin="0,0,8,0" Padding="14,5" Click="OnPasswordCancelClick" />
                                 <Button Style="{StaticResource FluentPrimaryButtonStyle}" Content="确定" Click="OnPasswordSubmitClick" />

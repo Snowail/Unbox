@@ -96,9 +96,70 @@ public:
         return false;
     }
 
+    // 生产级安全验证：确保相对路径在规范化后严格驻留在受控暂存根目录之内，拦截任何穿越、重解析点与流注入
+    static bool ResolveAndValidateDestination(const std::wstring& stagingRoot, const std::wstring& relPath, std::wstring& outFullPath) {
+        if (stagingRoot.empty() || relPath.empty()) return false;
+
+        // 1. 规范化暂存根目录为绝对路径
+        wchar_t canonRootBuf[MAX_PATH * 2] = {0};
+        DWORD rootLen = GetFullPathNameW(stagingRoot.c_str(), _countof(canonRootBuf), canonRootBuf, nullptr);
+        if (rootLen == 0 || rootLen >= _countof(canonRootBuf)) return false;
+        std::wstring canonRoot(canonRootBuf, rootLen);
+        if (canonRoot.back() != L'\\') canonRoot.push_back(L'\\');
+
+        // 2. 清洗相对路径：去除盘符 (C:)、去除开头斜杠与 UNC 标记
+        std::wstring clean = relPath;
+        std::replace(clean.begin(), clean.end(), L'/', L'\\');
+        
+        // 剥离盘符 (如 "C:" 或 "D:")
+        if (clean.size() >= 2 && iswalpha(clean[0]) && clean[1] == L':') {
+            clean = clean.substr(2);
+        }
+        // 剥离所有前置反斜杠
+        size_t firstValid = clean.find_first_not_of(L"\\");
+        if (firstValid == std::wstring::npos) return false;
+        clean = clean.substr(firstValid);
+
+        // 3. 逐段检验：拦截 ".."、空段和包含 ":" 的 ADS 附加数据流注入
+        std::wstring safeRel;
+        size_t start = 0;
+        while (start < clean.size()) {
+            size_t end = clean.find(L'\\', start);
+            if (end == std::wstring::npos) end = clean.size();
+            std::wstring seg = clean.substr(start, end - start);
+            if (seg == L".." || seg.find(L':') != std::wstring::npos) {
+                // 存在父路径穿越或 ADS 流注入，坚决拒绝！
+                return false;
+            }
+            if (!seg.empty() && seg != L".") {
+                if (!safeRel.empty()) safeRel.push_back(L'\\');
+                safeRel += seg;
+            }
+            start = end + 1;
+        }
+
+        if (safeRel.empty()) return false;
+
+        // 4. 解析目标绝对路径
+        std::wstring targetComb = canonRoot + safeRel;
+        wchar_t canonTargetBuf[MAX_PATH * 2] = {0};
+        DWORD targetLen = GetFullPathNameW(targetComb.c_str(), _countof(canonTargetBuf), canonTargetBuf, nullptr);
+        if (targetLen == 0 || targetLen >= _countof(canonTargetBuf)) return false;
+        std::wstring canonTarget(canonTargetBuf, targetLen);
+
+        // 5. 严格前缀断言：canonTarget 必须以 canonRoot 为前缀
+        if (canonTarget.size() < canonRoot.size()) return false;
+        if (_wcsnicmp(canonTarget.c_str(), canonRoot.c_str(), canonRoot.size()) != 0) {
+            // 逃逸出受控根目录，拒绝！
+            return false;
+        }
+
+        outFullPath = canonTarget;
+        return true;
+    }
+
     // 批量重命名清洗（D6 默认策略：非法字符替换为 '-'）
     static std::wstring SanitizeSegment(const std::wstring& seg) {
-        if (seg.empty()) return seg;
         std::wstring res;
         res.reserve(seg.size());
 
@@ -204,6 +265,16 @@ public:
     // D5: 智能修复跨系统或代码页导致的文件名乱码 (7z PUA 或 未标记 bit 11 的 UTF-8 误按 GBK 解码)
     static bool FixMojibake(std::wstring& path, uint32_t fallbackCodePage = 936) {
         if (path.empty()) return false;
+
+        // 快速检测：若全为 ASCII 字符（< 0x80），绝不可能为乱码，直接零开销返回
+        bool hasNonAscii = false;
+        for (wchar_t c : path) {
+            if (c >= 0x80) {
+                hasNonAscii = true;
+                break;
+            }
+        }
+        if (!hasNonAscii) return false;
 
         // 1. 检查是否存在 7-Zip 私有区字符 (0xEF80 - 0xEFFF)
         // 当 7-Zip 试图以 UTF-8 解码非 UTF-8 字节失败时，会将 0x80..0xFF 映射到 0xEF80..0xEFFF

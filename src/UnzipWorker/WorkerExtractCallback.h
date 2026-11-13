@@ -6,7 +6,6 @@
 #include <windows.h>
 #include <string>
 #include <vector>
-#include <unordered_map>
 #include <atomic>
 #include <mutex>
 #include <condition_variable>
@@ -22,7 +21,6 @@ struct ExtractedItemInfo {
     bool isDir;
     uint64_t size;
     uint32_t crc;
-    std::string sha256;
     bool skipped;
     int opResult;
 };
@@ -36,10 +34,10 @@ public:
     WorkerExtractCallback(
         IInArchive* archive,
         const std::wstring& stagingDir,
-        const std::unordered_map<uint32_t, std::wstring>& itemTargetPaths,
+        const std::vector<std::wstring>& itemTargetPaths,
         const std::vector<bool>& itemToExtract,
         std::function<void(const std::wstring&, uint64_t, uint64_t)> onProgress,
-        std::function<std::wstring()> onPasswordRequest,
+        std::function<std::wstring(bool* outCanceled)> onPasswordRequest,
         std::function<bool()> checkPauseOrCancel)
         : m_refCount(1),
           m_archive(archive),
@@ -53,6 +51,9 @@ public:
           m_completedBytes(0),
           m_hasError(false),
           m_hasSkipped(false),
+          m_hasCrcError(false),
+          m_hasDataError(false),
+          m_hasUnsupportedMethod(false),
           m_currentOutStream(nullptr),
           m_currentIndex(0)
     {
@@ -104,9 +105,6 @@ public:
         if (m_checkPauseOrCancel && !m_checkPauseOrCancel()) {
             return E_ABORT;
         }
-        if (completeValue) {
-            m_completedBytes = *completeValue;
-        }
         return S_OK;
     }
 
@@ -122,15 +120,14 @@ public:
 
         // 如果该项被过滤（如 macOS 辅助文件）或被跳过
         if (index >= m_itemToExtract.size() || !m_itemToExtract[index] || askExtractMode != NExtract::NAskMode::kExtract) {
-            return S_OK; // 返回空流即可跳过该项提取
-        }
-
-        auto it = m_itemTargetPaths.find(index);
-        if (it == m_itemTargetPaths.end()) {
             return S_OK;
         }
 
-        std::wstring relPath = it->second;
+        if (index >= m_itemTargetPaths.size()) {
+            return S_OK;
+        }
+
+        const std::wstring& relPath = m_itemTargetPaths[index];
 
         // 获取该项是否为目录
         PROPVARIANT propIsDir;
@@ -143,41 +140,52 @@ public:
             PropVariantClear(&propIsDir);
         }
 
-        fs::path fullPath = fs::path(m_stagingDir) / relPath;
+        // 严格安全边界检验：确保解析路径落在 stagingDir 之内，拦截 Zip Slip、重解析点与流注入
+        std::wstring safeFullPath;
+        if (!PathSanitizer::ResolveAndValidateDestination(m_stagingDir, relPath, safeFullPath)) {
+            m_hasSkipped = true;
+            return S_OK; // 越界条目安全跳过，绝不写盘！
+        }
 
         if (isDir) {
             std::error_code ec;
-            fs::create_directories(fullPath, ec);
+            fs::create_directories(safeFullPath, ec);
             return S_OK;
         }
 
-        // 确保父目录存在
-        std::error_code ec;
-        fs::create_directories(fullPath.parent_path(), ec);
+        // 确保父目录存在（缓存上一目录状态，避免 1200 个同级文件重复 1200 次系统调用）
+        fs::path targetPath(safeFullPath);
+        std::wstring parentDir = targetPath.parent_path().wstring();
+        if (parentDir != m_lastCreatedParentDir) {
+            std::error_code ec;
+            fs::create_directories(parentDir, ec);
+            m_lastCreatedParentDir = parentDir;
+        }
 
-        // 创建输出文件流
+        std::wstring actualDiskPath = safeFullPath;
+
+        // 创建输出文件流 (CREATE_NEW 独占新建，同名自动 "(2)" 序号递增，拦截父目录重解析点)
         COutFileStream* stream = COutFileStream::CreateOutputFile(
-            fullPath.c_str(),
+            safeFullPath.c_str(),
             [this, relPath](uint64_t bytesWritten) {
                 m_completedBytes += bytesWritten;
                 if (m_onProgress) {
                     m_onProgress(relPath, m_completedBytes, m_totalBytes);
                 }
             },
-            m_checkPauseOrCancel
+            m_checkPauseOrCancel,
+            &actualDiskPath
         );
 
         if (!stream) {
+            m_hasError = true;
             return HRESULT_FROM_WIN32(GetLastError());
         }
 
         m_currentOutStream = stream;
+        m_currentDiskPath = actualDiskPath;
         m_currentOutStream->AddRef();
         *outStream = stream;
-
-        if (m_onProgress) {
-            m_onProgress(relPath, m_completedBytes, m_totalBytes);
-        }
 
         return S_OK;
     }
@@ -188,19 +196,17 @@ public:
 
     HRESULT STDMETHODCALLTYPE SetOperationResult(int32_t resultEOperationResult) override {
         if (m_currentOutStream) {
-            // 记录该条目的结果与哈希
+            // 记录该条目的结果与校验
             ExtractedItemInfo info{};
             info.index = m_currentIndex;
             info.opResult = resultEOperationResult;
             info.crc = m_currentOutStream->GetCRC();
-            info.sha256 = m_currentOutStream->GetSHA256();
             info.size = m_currentOutStream->GetTotalWritten();
             info.skipped = false;
 
-            auto it = m_itemTargetPaths.find(m_currentIndex);
-            if (it != m_itemTargetPaths.end()) {
-                info.relPath = it->second;
-                info.diskPath = (fs::path(m_stagingDir) / it->second).wstring();
+            if (m_currentIndex < m_itemTargetPaths.size()) {
+                info.relPath = m_itemTargetPaths[m_currentIndex];
+                info.diskPath = m_currentDiskPath;
             }
 
             m_extractedItems.push_back(info);
@@ -211,6 +217,13 @@ public:
 
         if (resultEOperationResult != NExtract::NOperationResult::kOK) {
             m_hasError = true;
+            if (resultEOperationResult == NExtract::NOperationResult::kCRCError) {
+                m_hasCrcError = true;
+            } else if (resultEOperationResult == NExtract::NOperationResult::kDataError) {
+                m_hasDataError = true;
+            } else if (resultEOperationResult == NExtract::NOperationResult::kUnsupportedMethod) {
+                m_hasUnsupportedMethod = true;
+            }
         }
 
         return S_OK;
@@ -219,8 +232,11 @@ public:
     // ICryptoGetTextPassword
     HRESULT STDMETHODCALLTYPE CryptoGetTextPassword(BSTR *password) override {
         if (!password) return E_POINTER;
+        *password = nullptr;
         if (m_onPasswordRequest) {
-            std::wstring pwd = m_onPasswordRequest();
+            bool canceled = false;
+            std::wstring pwd = m_onPasswordRequest(&canceled);
+            if (canceled) return E_ABORT;
             *password = SysAllocString(pwd.c_str());
             return S_OK;
         }
@@ -230,8 +246,14 @@ public:
     // ICryptoGetTextPassword2
     HRESULT STDMETHODCALLTYPE CryptoGetTextPassword2(int32_t *passwordIsDefined, BSTR *password) override {
         if (!passwordIsDefined || !password) return E_POINTER;
+        *password = nullptr;
         if (m_onPasswordRequest) {
-            std::wstring pwd = m_onPasswordRequest();
+            bool canceled = false;
+            std::wstring pwd = m_onPasswordRequest(&canceled);
+            if (canceled) {
+                *passwordIsDefined = 0;
+                return E_ABORT;
+            }
             *password = SysAllocString(pwd.c_str());
             *passwordIsDefined = 1;
             return S_OK;
@@ -242,6 +264,10 @@ public:
 
     const std::vector<ExtractedItemInfo>& GetExtractedItems() const { return m_extractedItems; }
     bool HasError() const { return m_hasError; }
+    bool HasSkipped() const { return m_hasSkipped; }
+    bool HasCrcError() const { return m_hasCrcError; }
+    bool HasDataError() const { return m_hasDataError; }
+    bool HasUnsupportedMethod() const { return m_hasUnsupportedMethod; }
     uint64_t GetTotalBytes() const { return m_totalBytes; }
     uint64_t GetCompletedBytes() const { return m_completedBytes; }
 
@@ -249,18 +275,23 @@ private:
     LONG m_refCount;
     IInArchive* m_archive;
     std::wstring m_stagingDir;
-    std::unordered_map<uint32_t, std::wstring> m_itemTargetPaths;
+    std::vector<std::wstring> m_itemTargetPaths;
     std::vector<bool> m_itemToExtract;
     std::function<void(const std::wstring&, uint64_t, uint64_t)> m_onProgress;
-    std::function<std::wstring()> m_onPasswordRequest;
+    std::function<std::wstring(bool* outCanceled)> m_onPasswordRequest;
     std::function<bool()> m_checkPauseOrCancel;
 
     uint64_t m_totalBytes;
     std::atomic<uint64_t> m_completedBytes;
     bool m_hasError;
     bool m_hasSkipped;
+    bool m_hasCrcError;
+    bool m_hasDataError;
+    bool m_hasUnsupportedMethod;
 
     COutFileStream* m_currentOutStream;
+    std::wstring m_currentDiskPath;
+    std::wstring m_lastCreatedParentDir;
     uint32_t m_currentIndex;
     std::vector<ExtractedItemInfo> m_extractedItems;
 };

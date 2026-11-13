@@ -1,0 +1,12 @@
+<Configuration>
+  <MappedFolders>
+    <MappedFolder>
+      <HostFolder>C:\WorkSpace\unzip\dist</HostFolder>
+      <SandboxFolder>C:\Users\WDAGUtilityAccount\Desktop\UnboxRelease</SandboxFolder>
+      <ReadOnly>true</ReadOnly>
+    </MappedFolder>
+  </MappedFolders>
+  <LogonCommand>
+    <Command>explorer.exe C:\Users\WDAGUtilityAccount\Desktop\UnboxRelease</Command>
+  </LogonCommand>
+</Configuration>

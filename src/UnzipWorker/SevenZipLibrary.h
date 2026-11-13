@@ -169,8 +169,8 @@ public:
         return 936;
     }
 
-    // 智能探测归档格式：先按扩展名，再按签名
-    bool DetectAndCreateArchive(IInStream* inStream, const std::wstring& extHint, IInArchive** outArchive, uint32_t codePage = 0) {
+    // 智能探测归档格式：先按扩展名，再按签名。严格检查 hr == S_OK，支持 OpenCallback 传入
+    bool DetectAndCreateArchive(IInStream* inStream, const std::wstring& extHint, IInArchive** outArchive, IArchiveOpenCallback* openCallback = nullptr, uint32_t codePage = 0) {
         if (!inStream || !outArchive) return false;
         *outArchive = nullptr;
 
@@ -200,7 +200,9 @@ public:
                 uint64_t maxStartPos = 1 << 20; // 1MB 探测
                 uint64_t newPos = 0;
                 inStream->Seek(0, 0, &newPos);
-                if (SUCCEEDED(archive->Open(inStream, &maxStartPos, nullptr))) {
+                // 必须严格判定 hr == S_OK，S_FALSE 属于未识别，绝对不能接受！
+                HRESULT hr = archive->Open(inStream, &maxStartPos, openCallback);
+                if (hr == S_OK) {
                     *outArchive = archive;
                     return true;
                 }
@@ -222,7 +224,8 @@ public:
                             applyCodePage(archive);
                             inStream->Seek(0, 0, &newPos);
                             uint64_t maxStartPos = 1 << 20;
-                            if (SUCCEEDED(archive->Open(inStream, &maxStartPos, nullptr))) {
+                            HRESULT hr = archive->Open(inStream, &maxStartPos, openCallback);
+                            if (hr == S_OK) {
                                 *outArchive = archive;
                                 return true;
                             }
@@ -243,7 +246,8 @@ public:
                         applyCodePage(archive);
                         inStream->Seek(0, 0, &newPos);
                         uint64_t maxStartPos = 1 << 20;
-                        if (SUCCEEDED(archive->Open(inStream, &maxStartPos, nullptr))) {
+                        HRESULT hr = archive->Open(inStream, &maxStartPos, openCallback);
+                        if (hr == S_OK) {
                             *outArchive = archive;
                             return true;
                         }

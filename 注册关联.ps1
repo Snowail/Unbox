@@ -85,10 +85,10 @@ $assocMap = [ordered]@{
     # 非 Explorer 原生挂载的磁盘/虚拟机镜像
     ".dmg"      = @{ Name = "Apple 磁盘映像";      Icon = "dmg.ico" }
     ".squashfs" = @{ Name = "SquashFS 文件系统映像"; Icon = "sq.ico" }
-    ".vmdk"     = @{ Name = "VMware 虚拟磁盘映像"; Icon = "origin.ico" }
-    ".vdi"      = @{ Name = "VirtualBox 磁盘映像"; Icon = "origin.ico" }
-    ".qcow"     = @{ Name = "QEMU 磁盘映像";       Icon = "origin.ico" }
-    ".qcow2"    = @{ Name = "QEMU 磁盘映像 v2";    Icon = "origin.ico" }
+    ".vmdk"     = @{ Name = "VMware 虚拟磁盘映像"; Icon = "vhd(x).ico" }
+    ".vdi"      = @{ Name = "VirtualBox 磁盘映像"; Icon = "vhd(x).ico" }
+    ".qcow"     = @{ Name = "QEMU 磁盘映像";       Icon = "vhd(x).ico" }
+    ".qcow2"    = @{ Name = "QEMU 磁盘映像 v2";    Icon = "vhd(x).ico" }
     ".fat"      = @{ Name = "FAT 分区映像";        Icon = "fat.ico" }
     ".ntfs"     = @{ Name = "NTFS 分区映像";       Icon = "ntfs.ico" }
 }

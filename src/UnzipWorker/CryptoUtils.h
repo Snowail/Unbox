@@ -61,21 +61,52 @@ private:
     uint32_t m_crc;
 };
 
+// 全局复用 CNG 算法提供程序，杜绝小文件重复装卸驱动的严重性能劣化
+class Sha256Algorithm {
+public:
+    static Sha256Algorithm& Instance() {
+        static Sha256Algorithm s_inst;
+        return s_inst;
+    }
+
+    BCRYPT_ALG_HANDLE Handle() const { return m_hAlg; }
+    DWORD ObjectLength() const { return m_hashObjSize; }
+
+private:
+    Sha256Algorithm() : m_hAlg(nullptr), m_hashObjSize(0) {
+        if (BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&m_hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0))) {
+            DWORD cbResult = 0;
+            BCryptGetProperty(m_hAlg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&m_hashObjSize, sizeof(DWORD), &cbResult, 0);
+        }
+    }
+
+    ~Sha256Algorithm() {
+        if (m_hAlg) {
+            BCryptCloseAlgorithmProvider(m_hAlg, 0);
+            m_hAlg = nullptr;
+        }
+    }
+
+    BCRYPT_ALG_HANDLE m_hAlg;
+    DWORD m_hashObjSize;
+};
+
 class Sha256Hasher {
 public:
-    Sha256Hasher() : m_hAlg(nullptr), m_hHash(nullptr) {
-        if (BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&m_hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0))) {
-            DWORD hashObjSize = 0, cbResult = 0;
-            if (BCRYPT_SUCCESS(BCryptGetProperty(m_hAlg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&hashObjSize, sizeof(DWORD), &cbResult, 0))) {
-                m_hashObj.resize(hashObjSize);
-                BCryptCreateHash(m_hAlg, &m_hHash, m_hashObj.data(), hashObjSize, nullptr, 0, 0);
-            }
+    Sha256Hasher() : m_hHash(nullptr) {
+        BCRYPT_ALG_HANDLE alg = Sha256Algorithm::Instance().Handle();
+        DWORD objLen = Sha256Algorithm::Instance().ObjectLength();
+        if (alg && objLen > 0) {
+            m_hashObj.resize(objLen);
+            BCryptCreateHash(alg, &m_hHash, m_hashObj.data(), objLen, nullptr, 0, 0);
         }
     }
 
     ~Sha256Hasher() {
-        if (m_hHash) BCryptDestroyHash(m_hHash);
-        if (m_hAlg) BCryptCloseAlgorithmProvider(m_hAlg, 0);
+        if (m_hHash) {
+            BCryptDestroyHash(m_hHash);
+            m_hHash = nullptr;
+        }
     }
 
     void Update(const void* data, size_t size) {
@@ -101,7 +132,6 @@ public:
     }
 
 private:
-    BCRYPT_ALG_HANDLE m_hAlg;
     BCRYPT_HASH_HANDLE m_hHash;
     std::vector<uint8_t> m_hashObj;
 };
