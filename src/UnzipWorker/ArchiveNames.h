@@ -302,7 +302,12 @@ private:
     }
 
     // 按 PAX 记录边界解析扩展头：<长度> <关键字>=<值>\n
+    // 尊重 hdrcharset=BINARY：此时 path 值为原始字节（按归档/用户代码页解码），
+    // 不能像缺省 UTF-8 那样直接标成 Unicode，否则二进制名称会绕过用户的显式编码选择。
     static void ParsePaxRecords(const std::string& data, std::string& outPath, bool& outPathIsUtf8) {
+        std::string path;
+        std::string hdrcharset;
+        bool sawPath = false;
         size_t offset = 0;
         while (offset + 2 <= data.size()) {
             size_t space = data.find(' ', offset);
@@ -321,11 +326,19 @@ private:
                 if (valueLen > 0 && record.back() == '\n') valueLen -= 1;
                 std::string value = record.substr(eq + 1, valueLen);
                 if (key == "path") {
-                    outPath = value;
-                    outPathIsUtf8 = true; // POSIX pax：path 记录值恒为 UTF-8
+                    path = value;
+                    sawPath = true;
+                } else if (key == "hdrcharset") {
+                    hdrcharset = value;
                 }
             }
             offset += recordLen;
+        }
+
+        if (sawPath) {
+            outPath = path;
+            // 仅当 hdrcharset=BINARY 时 path 才是二进制原始字节；缺省/UTF-8 时 path 恒为 UTF-8。
+            outPathIsUtf8 = (hdrcharset != "BINARY");
         }
     }
 };

@@ -187,8 +187,11 @@ public:
     }
 
     // 创建目录（逐级），并对每一级（含已存在目录）做句柄级归属验证。
-    // 关键：已有目录也必须验证真实最终路径；创建每一级之前先确认父目录真实对象在根内，
-    // 避免先沿字符串路径创建、再验证导致根外副作用（联接点/符号链接逃逸）。
+    // 关键：已有目录也必须验证真实最终路径；创建每一级之前先确认父目录真实对象在根内。
+    // 为避免“验证后父目录被替换成指向根外的联接点”这一 TOCTOU 窗口：
+    //   - 验证与创建都不再授予 FILE_SHARE_DELETE，持有句柄期间父目录无法被改名/替换；
+    //   - 父目录句柄在整个创建过程中保持打开；
+    //   - 创建后若句柄级归属验证失败，通过句柄删除刚创建的空目录，绝不留下根外副作用。
     static bool EnsureDirectory(const std::wstring& canonicalRoot, const std::wstring& fullPath, DWORD& outError) {
         outError = ERROR_SUCCESS;
         std::error_code ec;
@@ -202,7 +205,7 @@ public:
             return VerifyDirectoryUnderRoot(canonicalRoot, fullPath, outError);
         }
 
-        // 2. 找到第一个已存在的祖先，并先验证它（确认父目录真实对象与归属后，才允许在其下创建）
+        // 2. 找到第一个已存在的祖先
         fs::path p(fullPath);
         std::vector<fs::path> missing;
         fs::path cur = p;
@@ -212,28 +215,58 @@ public:
             if (parent == cur) break;
             cur = parent;
         }
+
+        // 3. 打开首个已存在祖先的句柄（不授予 FILE_SHARE_DELETE，杜绝验证后父目录被替换），
+        //    并验证其真实最终路径位于受控根内；该句柄在后续创建过程中一直保持打开。
+        HANDLE hParent = INVALID_HANDLE_VALUE;
         if (!cur.empty() && fs::exists(cur, ec)) {
-            if (!VerifyDirectoryUnderRoot(canonicalRoot, cur.wstring(), outError)) {
+            if (!OpenVerifiedDirectoryNoDelete(canonicalRoot, cur.wstring(), hParent, outError)) {
                 return false;
             }
         }
 
-        // 3. 逐级创建，并在每级创建后立即验证（缩小替换窗口，失败时不留下根外副作用）
+        // 4. 逐级创建：持有父目录句柄（父目录不可被替换），创建后立即打开子目录句柄验证归属；
+        //    验证失败且本层由本次调用创建时，通过句柄删除刚创建的空目录，绝不留下根外副作用。
         for (auto it = missing.rbegin(); it != missing.rend(); ++it) {
+            bool created = false;
             if (!CreateDirectoryW(it->c_str(), nullptr)) {
                 DWORD err = GetLastError();
                 if (err != ERROR_ALREADY_EXISTS) {
                     outError = err;
+                    if (hParent != INVALID_HANDLE_VALUE) CloseHandle(hParent);
                     return false;
                 }
+            } else {
+                created = true;
             }
-            if (!VerifyDirectoryUnderRoot(canonicalRoot, it->wstring(), outError)) {
+
+            HANDLE hChild = CreateFileW(it->c_str(), FILE_READ_ATTRIBUTES | FILE_TRAVERSE | DELETE,
+                                        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                                        FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+            if (hChild == INVALID_HANDLE_VALUE) {
+                outError = GetLastError();
+                if (created) RemoveDirectoryW(it->c_str()); // 打开失败（罕见），按路径清理刚创建的空目录
+                if (hParent != INVALID_HANDLE_VALUE) CloseHandle(hParent);
                 return false;
             }
+            if (!VerifyObjectUnderRoot(hChild, canonicalRoot)) {
+                outError = ERROR_ACCESS_DENIED;
+                if (created) DeleteEmptyDirectoryByHandle(hChild);
+                else CloseHandle(hChild);
+                if (hParent != INVALID_HANDLE_VALUE) CloseHandle(hParent);
+                return false;
+            }
+
+            if (hParent != INVALID_HANDLE_VALUE) CloseHandle(hParent);
+            hParent = hChild;
         }
 
-        // 4. 最终完整路径再做一次句柄级验证
-        return VerifyDirectoryUnderRoot(canonicalRoot, fullPath, outError);
+        // 5. 最后一层已打开并验证的句柄就是最终目录本身，直接关闭即可
+        if (hParent == INVALID_HANDLE_VALUE) {
+            return VerifyDirectoryUnderRoot(canonicalRoot, fullPath, outError);
+        }
+        CloseHandle(hParent);
+        return true;
     }
 
     // 批量重命名清洗（D6 默认策略：非法字符替换为 '-'）
@@ -317,10 +350,38 @@ public:
     }
 
 private:
+    // 打开目录句柄（不授予 FILE_SHARE_DELETE），验证其真实最终路径位于受控根内；成功时通过 hOut 返回句柄。
+    static bool OpenVerifiedDirectoryNoDelete(const std::wstring& canonicalRoot, const std::wstring& dirPath,
+                                              HANDLE& hOut, DWORD& outError) {
+        hOut = CreateFileW(dirPath.c_str(), FILE_READ_ATTRIBUTES | FILE_TRAVERSE | DELETE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                           FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        if (hOut == INVALID_HANDLE_VALUE) {
+            outError = GetLastError();
+            return false;
+        }
+        if (!VerifyObjectUnderRoot(hOut, canonicalRoot)) {
+            CloseHandle(hOut);
+            hOut = INVALID_HANDLE_VALUE;
+            outError = ERROR_ACCESS_DENIED;
+            return false;
+        }
+        return true;
+    }
+
+    // 通过句柄删除刚创建的空目录（不按路径重解析，避免再次被联接点劫持）
+    static void DeleteEmptyDirectoryByHandle(HANDLE h) {
+        if (h == INVALID_HANDLE_VALUE) return;
+        FILE_DISPOSITION_INFO disp{};
+        disp.DeleteFile = TRUE;
+        SetFileInformationByHandle(h, FileDispositionInfo, &disp, sizeof(disp));
+        CloseHandle(h);
+    }
+
     // 打开目录句柄并验证其真实最终路径位于受控根目录之内（打开时不解引用重解析点前先取其真实去向）
     static bool VerifyDirectoryUnderRoot(const std::wstring& canonicalRoot, const std::wstring& dirPath, DWORD& outError) {
         HANDLE h = CreateFileW(dirPath.c_str(), FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
-                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                                OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
         if (h == INVALID_HANDLE_VALUE) {
             outError = GetLastError();

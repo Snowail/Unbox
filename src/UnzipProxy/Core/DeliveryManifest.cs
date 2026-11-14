@@ -118,6 +118,14 @@ namespace UnzipProxy.Core
                 report.Problems.Add("交付根目录不存在");
                 return report;
             }
+            // 交付根目录本身（或其在交付树之外的祖先）若被替换为联接点/符号链接，
+            // 仅检查根下条目无法拦截：必须先把入口路径本身的 reparse point 拒之门外，
+            // 否则摘要校验会顺着联接点读到暂存区之外。
+            if (PathContainsReparsePoint(deliveryRootAbsolute))
+            {
+                report.Problems.Add("交付根目录或其祖先包含联接点/符号链接");
+                return report;
+            }
             if (manifest.Items.Count > MaxItems)
             {
                 report.Problems.Add($"交付条目数量超出上限（{manifest.Items.Count}）");
@@ -257,6 +265,47 @@ namespace UnzipProxy.Core
                 log($"校验通过：{report.Files} 个文件 / {report.Directories} 个目录 / {report.TotalBytes} 字节");
             }
             return report;
+        }
+
+        /// <summary>
+        /// 判断完整路径本身或任意一级祖先是否为联接点/符号链接（reparse point）。
+        /// 用于在枚举交付树之前，先把“交付根本身被替换为指向根外的联接点”这一类
+        /// 越界场景整体拒绝，避免顺着联接点对账或写盘到暂存区之外。
+        /// </summary>
+        public static bool PathContainsReparsePoint(string fullPath)
+        {
+            try
+            {
+                string current = Path.GetFullPath(fullPath);
+                while (!string.IsNullOrEmpty(current))
+                {
+                    FileAttributes attributes;
+                    try
+                    {
+                        attributes = File.GetAttributes(current);
+                    }
+                    catch (Exception)
+                    {
+                        // 任一级无法读取属性即按存在越界风险处理（fail-closed）。
+                        return true;
+                    }
+                    if ((attributes & FileAttributes.ReparsePoint) != 0)
+                    {
+                        return true;
+                    }
+                    string? parent = Path.GetDirectoryName(current);
+                    if (parent == null || string.Equals(parent, current, StringComparison.OrdinalIgnoreCase))
+                    {
+                        break;
+                    }
+                    current = parent;
+                }
+                return false;
+            }
+            catch
+            {
+                return true;
+            }
         }
 
         public static string NormalizeRelative(string relative)

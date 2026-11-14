@@ -262,6 +262,13 @@ namespace UnzipProxy.Core
                 byte[] zoneData = File.ReadAllBytes(zonePath);
                 if (zoneData.Length == 0) return 0;
 
+                // 入口目录本身（或其祖先）为联接点/符号链接时直接放弃，
+                // 否则 EnumerateFilesNoReparse 只拒绝“根下条目”，仍会顺着联接点写穿到暂存区之外。
+                if (DeliveryVerifier.PathContainsReparsePoint(targetRoot))
+                {
+                    return 0;
+                }
+
                 // 遍历最终树时拒绝 reparse point，绝不通过联接点/符号链接把来源标记写到暂存区之外。
                 var files = new List<string>();
                 EnumerateFilesNoReparse(targetRoot, files);

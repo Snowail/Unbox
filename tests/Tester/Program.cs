@@ -399,6 +399,101 @@ namespace Tester
             }
         }
 
+        // 构造单个 PAX 扩展头记录：<十进制长度> <key>=<value>\n（长度含自身数字、空格、换行）
+        static byte[] BuildPaxRecord(string key, byte[] value)
+        {
+            int baseLen = 1 + key.Length + 1 + value.Length + 1; // 空格 + key + '=' + value + '\n'
+            int digits = 1;
+            int total;
+            while (true)
+            {
+                total = digits + baseLen;
+                if (total.ToString().Length == digits) break;
+                digits++;
+            }
+            var rec = new List<byte>();
+            rec.AddRange(Encoding.ASCII.GetBytes(total.ToString()));
+            rec.Add((byte)' ');
+            rec.AddRange(Encoding.ASCII.GetBytes(key));
+            rec.Add((byte)'=');
+            rec.AddRange(value);
+            rec.Add((byte)'\n');
+            return rec.ToArray();
+        }
+
+        static void WriteOctalField(byte[] hdr, int offset, int length, long value)
+        {
+            string s = Convert.ToString(value, 8);
+            if (s.Length > length - 1) s = s.Substring(s.Length - (length - 1));
+            s = s.PadLeft(length - 1, '0');
+            byte[] bytes = Encoding.ASCII.GetBytes(s);
+            Array.Copy(bytes, 0, hdr, offset, bytes.Length);
+            hdr[offset + length - 1] = 0;
+        }
+
+        static void WriteTarChecksum(byte[] hdr)
+        {
+            long sum = 0;
+            for (int i = 0; i < 512; i++)
+            {
+                sum += (i >= 148 && i < 156) ? (byte)' ' : hdr[i];
+            }
+            string s = Convert.ToString(sum, 8).PadLeft(6, '0');
+            byte[] bytes = Encoding.ASCII.GetBytes(s);
+            for (int i = 0; i < 6; i++) hdr[148 + i] = bytes[i];
+            hdr[154] = 0;
+            hdr[155] = (byte)' ';
+        }
+
+        static byte[] BuildTarHeader(string name, long size, char typeflag)
+        {
+            byte[] hdr = new byte[512];
+            byte[] nameBytes = Encoding.UTF8.GetBytes(name);
+            Array.Copy(nameBytes, 0, hdr, 0, Math.Min(nameBytes.Length, 100));
+            WriteOctalField(hdr, 100, 8, 420); // mode 0644
+            WriteOctalField(hdr, 108, 8, 0);   // uid
+            WriteOctalField(hdr, 116, 8, 0);   // gid
+            WriteOctalField(hdr, 124, 12, size);
+            WriteOctalField(hdr, 136, 12, 0);  // mtime
+            for (int i = 148; i < 156; i++) hdr[i] = (byte)' ';
+            hdr[156] = (byte)typeflag;
+            byte[] magic = Encoding.ASCII.GetBytes("ustar");
+            Array.Copy(magic, 0, hdr, 257, magic.Length);
+            hdr[262] = 0;
+            hdr[263] = (byte)'0';
+            hdr[264] = (byte)'0';
+            WriteTarChecksum(hdr);
+            return hdr;
+        }
+
+        // 写入一个 PAX TAR：扩展头声明 hdrcharset=BINARY，path 使用原始字节（GBK），正文为 UTF-8 内容
+        static void CreatePaxBinaryTar(string tarPath, byte[] pathBytes, string content)
+        {
+            if (File.Exists(tarPath)) File.Delete(tarPath);
+            using var fs = File.Create(tarPath);
+            using var w = new BinaryWriter(fs);
+
+            byte[] paxData;
+            using (var ms = new MemoryStream())
+            {
+                ms.Write(BuildPaxRecord("hdrcharset", Encoding.ASCII.GetBytes("BINARY")));
+                ms.Write(BuildPaxRecord("path", pathBytes));
+                paxData = ms.ToArray();
+            }
+            w.Write(BuildTarHeader("PaxHeaders/p", paxData.Length, 'x'));
+            w.Write(paxData);
+            int pad = (512 - (paxData.Length % 512)) % 512;
+            if (pad > 0) w.Write(new byte[pad]);
+
+            byte[] contentBytes = Encoding.UTF8.GetBytes(content);
+            w.Write(BuildTarHeader("placeholder", contentBytes.Length, '0'));
+            w.Write(contentBytes);
+            pad = (512 - (contentBytes.Length % 512)) % 512;
+            if (pad > 0) w.Write(new byte[pad]);
+
+            w.Write(new byte[1024]); // 两个 512 零块结束
+        }
+
         // 从 Worker finished 消息解析逐卷身份（与 MainWindow 一致：优先 16 字节 file_id 规范表示）
         static List<VolumeIdentity> ParseWorkerVolumes(WorkerRun run)
         {
@@ -623,6 +718,7 @@ namespace Tester
             Assert("编码: 未声明编码的 UTF-8 名称在自动模式下仍能正确解码",
                 noFlagResult.Delivered && File.Exists(Path.Combine(noFlagResult.FinalDirectory, "图纸", "设计说明.txt")),
                 noFlagResult.FailureReason);
+            Assert("编码: 未声明 UTF-8 在自动模式下不弹编码选择框（UI 未显式传 --cp）", !noFlagRun.EncodingOptionsOffered);
 
             // -------------------------------------------------------------
             Console.WriteLine("\n>>> [测试 9] P1 修复：复合 TAR 与内嵌归档");
@@ -946,6 +1042,7 @@ namespace Tester
                     xaml.Contains("ModalEncodingPanel") && xaml.Contains("EncodingOptionsPanel"));
                 Assert("界面契约: 不再引用未定义资源 AccentOrangeBrush", !codeBehind.Contains("AccentOrangeBrush"));
                 Assert("界面契约: 界面不再做第二套文件名纠偏", !codeBehind.Contains("FixPotentialMojibake"));
+                Assert("界面契约: 未设置编码时不再把系统 ACP 冒充为显式 --cp", !codeBehind.Contains("GetACP"));
             }
             else
             {
@@ -1149,6 +1246,78 @@ namespace Tester
             bool outsideChildCreated = Directory.Exists(Path.Combine(juncChildExternal, "child"));
             Assert("联接点: 根外不得创建 child 目录", !outsideChildCreated,
                 $"exit={juncChildRun.ExitCode} outsideChildCreated={outsideChildCreated}");
+
+            // -------------------------------------------------------------
+            Console.WriteLine("\n>>> [测试 26] P1：PAX hdrcharset=BINARY 必须尊重用户显式编码");
+            var gbkForPax = Encoding.GetEncoding(936);
+            byte[] maoPathBytes = gbkForPax.GetBytes("茅.txt"); // GBK: C3 A9 2E 74 78 74
+            string paxBinaryTar = Path.Combine(_testDir, "pax_binary.tar");
+            CreatePaxBinaryTar(paxBinaryTar, maoPathBytes, "pax-binary-content");
+            string paxBinaryStaging = NewStaging("paxbinary");
+            string paxBinaryManifest = Path.Combine(_testDir, "manifest_paxbinary.json");
+            var paxBinaryRun = RunWorker(paxBinaryTar, paxBinaryStaging, paxBinaryManifest, cp: "936");
+            Assert("PAX BINARY: 指定 --cp 936 时按 GBK 解码为 茅.txt（不再绕过显式编码）",
+                paxBinaryRun.Status == "ok" && File.Exists(Path.Combine(paxBinaryStaging, "茅.txt")),
+                $"status={paxBinaryRun.Status} exit={paxBinaryRun.ExitCode} err={paxBinaryRun.ErrorReason}");
+            Assert("PAX BINARY: 不再落盘 é.txt 乱码名", !File.Exists(Path.Combine(paxBinaryStaging, "é.txt")));
+            Assert("PAX BINARY: 显式编码已定，不弹编码选择框", !paxBinaryRun.EncodingOptionsOffered);
+            var paxBinaryResult = CompleteViaProduction(paxBinaryTar, paxBinaryStaging, paxBinaryManifest, paxBinaryRun.DeliveryRoot);
+            Assert("PAX BINARY: 生产路径交付 茅.txt",
+                paxBinaryResult.Delivered && File.Exists(Path.Combine(paxBinaryResult.FinalDirectory, "茅.txt")),
+                paxBinaryResult.FailureReason);
+
+            // -------------------------------------------------------------
+            Console.WriteLine("\n>>> [测试 27] P1：交付根/祖先为联接点时，Verify 与来源标记必须拒绝");
+            string repBase = Path.Combine(_testDir, "reparse_verify");
+            Directory.CreateDirectory(repBase);
+            string repOutside = Path.Combine(repBase, "outside");
+            Directory.CreateDirectory(repOutside);
+            File.WriteAllText(Path.Combine(repOutside, "payload.txt"), "outside-payload");
+            uint repCrc = Crc32.Compute(Encoding.UTF8.GetBytes("outside-payload"));
+            string repStaging = Path.Combine(repBase, "staging");
+            Directory.CreateDirectory(repStaging);
+            string repRoot = Path.Combine(repStaging, "deliver");
+            bool repLinkOk = CreateJunction(repRoot, repOutside);
+            Assert("交付根联接点: 创建 junction 成功", repLinkOk);
+            var repManifest = new DeliveryManifest
+            {
+                DeliveryRootRelative = "deliver",
+                ItemCount = 1,
+                Items = new List<ManifestItem>
+                {
+                    new ManifestItem
+                    {
+                        Path = "payload.txt",
+                        IsDirectory = false,
+                        Size = Encoding.UTF8.GetByteCount("outside-payload"),
+                        Crc = repCrc
+                    }
+                }
+            };
+            var repReport = DeliveryVerifier.Verify(repRoot, repManifest, VerifyMode.StructureAndDigest);
+            Assert("交付根联接点: Verify 必须拒绝（不再顺着联接点越界对账）", !repReport.Ok, repReport.Describe());
+
+            // 祖先联接点：交付根本身是普通目录，但其父目录被替换为指向根外的联接点
+            string repAncestorOutside = Path.Combine(repBase, "ancestor_outside");
+            Directory.CreateDirectory(Path.Combine(repAncestorOutside, "deliver"));
+            File.WriteAllText(Path.Combine(repAncestorOutside, "deliver", "payload.txt"), "ancestor-outside");
+            string repAncestorStaging = Path.Combine(repBase, "ancestor_staging");
+            Directory.CreateDirectory(repAncestorStaging);
+            string repAncestorLink = Path.Combine(repAncestorStaging, "parent");
+            bool repAncestorLinkOk = CreateJunction(repAncestorLink, repAncestorOutside);
+            Assert("祖先联接点: 创建 junction 成功", repAncestorLinkOk);
+            var repAncestorReport = DeliveryVerifier.Verify(
+                Path.Combine(repAncestorLink, "deliver"), repManifest, VerifyMode.StructureAndDigest);
+            Assert("祖先联接点: Verify 必须拒绝（祖先被替换为联接点）", !repAncestorReport.Ok, repAncestorReport.Describe());
+
+            // 来源标记：入口目录为联接点时不得把 Zone.Identifier 写到根外
+            string repZip = Path.Combine(repBase, "web.zip");
+            File.WriteAllText(repZip, "dummy");
+            File.WriteAllText(repZip + ":Zone.Identifier", "[ZoneTransfer]\r\nZoneId=3\r\n");
+            int repMarked = ZoneIdentifier.Propagate(repZip, repRoot);
+            bool repOutsideMarked = File.Exists(Path.Combine(repOutside, "payload.txt") + ":Zone.Identifier");
+            Assert("来源标记: 入口目录为联接点时不得写根外 Zone.Identifier",
+                repMarked == 0 && !repOutsideMarked, $"marked={repMarked} outsideMarked={repOutsideMarked}");
 
             // -------------------------------------------------------------
             Console.WriteLine("\n==================================================");

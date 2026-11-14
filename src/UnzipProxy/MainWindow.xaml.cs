@@ -22,9 +22,6 @@ namespace UnzipProxy
         [DllImport("dwmapi.dll")]
         private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
 
-        [DllImport("kernel32.dll")]
-        private static extern uint GetACP();
-
         private const int DWMWA_WINDOW_CORNER_PREFERENCE = 33;
         private const int DWMWCP_ROUND = 2;
 
@@ -237,10 +234,12 @@ namespace UnzipProxy
                     // 交付清单放在暂存目录之外，避免进入最终交付树
                     _manifestPath = Path.Combine(_plan.DestinationParentDir, $".unbox_manifest_{Guid.NewGuid():N}.json");
 
-                    uint codePage = _settings.ArchiveCodePage != 0
-                        ? (uint)_settings.ArchiveCodePage
-                        : GetACP();
-                    string cpArg = (codePage != 0) ? $" --cp {codePage}" : "";
+                    // 仅当用户显式选择/记忆了归档代码页时才把 --cp 传给 Worker；
+                    // 未设置时保持 Worker 的自动识别（默认代码页 + 声明/启发式解码），
+                    // 绝不能把系统 ACP 冒充为显式选择，导致正常入口无法使用自动识别。
+                    string cpArg = _settings.ArchiveCodePage != 0
+                        ? $" --cp {(uint)_settings.ArchiveCodePage}"
+                        : "";
 
                     var psi = new ProcessStartInfo
                     {
