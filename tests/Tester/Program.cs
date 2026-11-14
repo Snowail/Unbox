@@ -494,6 +494,35 @@ namespace Tester
             w.Write(new byte[1024]); // 两个 512 零块结束
         }
 
+        // 写入一个 PAX TAR：全局头声明 hdrcharset=BINARY（对后续文件生效），
+        // 局部头只含 path 原始字节（GBK），正文为 UTF-8 内容。
+        static void CreatePaxGlobalBinaryTar(string tarPath, byte[] pathBytes, string content)
+        {
+            if (File.Exists(tarPath)) File.Delete(tarPath);
+            using var fs = File.Create(tarPath);
+            using var w = new BinaryWriter(fs);
+
+            byte[] globalData = BuildPaxRecord("hdrcharset", Encoding.ASCII.GetBytes("BINARY"));
+            w.Write(BuildTarHeader("GlobalHead", globalData.Length, 'g'));
+            w.Write(globalData);
+            int gpad = (512 - (globalData.Length % 512)) % 512;
+            if (gpad > 0) w.Write(new byte[gpad]);
+
+            byte[] localData = BuildPaxRecord("path", pathBytes);
+            w.Write(BuildTarHeader("PaxHeaders/p", localData.Length, 'x'));
+            w.Write(localData);
+            int lpad = (512 - (localData.Length % 512)) % 512;
+            if (lpad > 0) w.Write(new byte[lpad]);
+
+            byte[] contentBytes = Encoding.UTF8.GetBytes(content);
+            w.Write(BuildTarHeader("placeholder", contentBytes.Length, '0'));
+            w.Write(contentBytes);
+            int cpad = (512 - (contentBytes.Length % 512)) % 512;
+            if (cpad > 0) w.Write(new byte[cpad]);
+
+            w.Write(new byte[1024]); // 两个 512 零块结束
+        }
+
         // 从 Worker finished 消息解析逐卷身份（与 MainWindow 一致：优先 16 字节 file_id 规范表示）
         static List<VolumeIdentity> ParseWorkerVolumes(WorkerRun run)
         {
@@ -1266,6 +1295,24 @@ namespace Tester
                 paxBinaryResult.Delivered && File.Exists(Path.Combine(paxBinaryResult.FinalDirectory, "茅.txt")),
                 paxBinaryResult.FailureReason);
 
+            // 全局 pax 头声明 hdrcharset=BINARY，局部头只含 path 字节：全局声明必须对后续文件生效
+            var gbkForPaxGlobal = Encoding.GetEncoding(936);
+            byte[] maoPathBytesGlobal = gbkForPaxGlobal.GetBytes("茅.txt"); // GBK: C3 A9 2E 74 78 74
+            string paxGlobalTar = Path.Combine(_testDir, "pax_global_binary.tar");
+            CreatePaxGlobalBinaryTar(paxGlobalTar, maoPathBytesGlobal, "pax-global-content");
+            string paxGlobalStaging = NewStaging("paxglobalbinary");
+            string paxGlobalManifest = Path.Combine(_testDir, "manifest_paxglobalbinary.json");
+            var paxGlobalRun = RunWorker(paxGlobalTar, paxGlobalStaging, paxGlobalManifest, cp: "936");
+            Assert("PAX GLOBAL BINARY: 全局 hdrcharset=BINARY 对后续文件生效，--cp 936 解码为 茅.txt",
+                paxGlobalRun.Status == "ok" && File.Exists(Path.Combine(paxGlobalStaging, "茅.txt")),
+                $"status={paxGlobalRun.Status} exit={paxGlobalRun.ExitCode} err={paxGlobalRun.ErrorReason}");
+            Assert("PAX GLOBAL BINARY: 不再落盘 é.txt 乱码名", !File.Exists(Path.Combine(paxGlobalStaging, "é.txt")));
+            Assert("PAX GLOBAL BINARY: 显式编码已定，不弹编码选择框", !paxGlobalRun.EncodingOptionsOffered);
+            var paxGlobalResult = CompleteViaProduction(paxGlobalTar, paxGlobalStaging, paxGlobalManifest, paxGlobalRun.DeliveryRoot);
+            Assert("PAX GLOBAL BINARY: 生产路径交付 茅.txt",
+                paxGlobalResult.Delivered && File.Exists(Path.Combine(paxGlobalResult.FinalDirectory, "茅.txt")),
+                paxGlobalResult.FailureReason);
+
             // -------------------------------------------------------------
             Console.WriteLine("\n>>> [测试 27] P1：交付根/祖先为联接点时，Verify 与来源标记必须拒绝");
             string repBase = Path.Combine(_testDir, "reparse_verify");
@@ -1318,6 +1365,37 @@ namespace Tester
             bool repOutsideMarked = File.Exists(Path.Combine(repOutside, "payload.txt") + ":Zone.Identifier");
             Assert("来源标记: 入口目录为联接点时不得写根外 Zone.Identifier",
                 repMarked == 0 && !repOutsideMarked, $"marked={repMarked} outsideMarked={repOutsideMarked}");
+
+            // 回归：交付树内部的子目录为联接点时，Verify 的逐项句柄级最终路径核对必须拒绝
+            // （不仅限于交付根/祖先），从而覆盖“根目录被并发替换成联接点后越界对账”的同类路径。
+            string subRepBase = Path.Combine(_testDir, "reparse_subdir");
+            Directory.CreateDirectory(subRepBase);
+            string subRepOutside = Path.Combine(subRepBase, "outside");
+            Directory.CreateDirectory(subRepOutside);
+            File.WriteAllText(Path.Combine(subRepOutside, "inner.txt"), "sub-outside");
+            uint subRepInnerCrc = Crc32.Compute(Encoding.UTF8.GetBytes("sub-outside"));
+            string subRepRoot = Path.Combine(subRepBase, "deliver");
+            Directory.CreateDirectory(subRepRoot);
+            bool subRepLinkOk = CreateJunction(Path.Combine(subRepRoot, "linked"), subRepOutside);
+            Assert("交付树子目录联接点: 创建 junction 成功", subRepLinkOk);
+            var subRepManifest = new DeliveryManifest
+            {
+                DeliveryRootRelative = "deliver",
+                ItemCount = 1,
+                Items = new List<ManifestItem>
+                {
+                    new ManifestItem
+                    {
+                        Path = @"linked\inner.txt",
+                        IsDirectory = false,
+                        Size = Encoding.UTF8.GetByteCount("sub-outside"),
+                        Crc = subRepInnerCrc
+                    }
+                }
+            };
+            var subRepReport = DeliveryVerifier.Verify(subRepRoot, subRepManifest, VerifyMode.StructureAndDigest);
+            Assert("交付树子目录联接点: Verify 必须拒绝（逐项句柄核对，不得顺着联接点越界对账）",
+                !subRepReport.Ok, subRepReport.Describe());
 
             // -------------------------------------------------------------
             Console.WriteLine("\n==================================================");

@@ -142,6 +142,7 @@ public:
 
         std::string pendingLongName;
         bool pendingNameIsUtf8 = false;   // 长名是否来自 PAX path（PAX path 按 POSIX 恒为 UTF-8）
+        std::string globalHdrCharset;      // 全局 pax 头声明的字符集，对后续文件持续生效
         int zeroBlocks = 0;
 
         for (int guard = 0; guard < 1000000; ++guard) {
@@ -171,11 +172,13 @@ public:
             }
             if (type == 'x' || type == 'X') { // pax 扩展头：按记录边界解析 path= 与字符集声明
                 std::string data = ReadBlocks(f, size);
-                ParsePaxRecords(data, pendingLongName, pendingNameIsUtf8);
+                ParsePaxRecords(data, globalHdrCharset, pendingLongName, pendingNameIsUtf8);
                 continue;
             }
-            if (type == 'g') { // 全局 pax 头，忽略内容
-                ReadBlocks(f, size);
+            if (type == 'g') { // 全局 pax 头：解析字符集声明并持续生效（hdrcharset=BINARY 必须影响后续文件）
+                std::string data = ReadBlocks(f, size);
+                std::string declared = ExtractPaxHdrCharset(data);
+                if (!declared.empty()) globalHdrCharset = declared;
                 continue;
             }
 
@@ -304,10 +307,32 @@ private:
     // 按 PAX 记录边界解析扩展头：<长度> <关键字>=<值>\n
     // 尊重 hdrcharset=BINARY：此时 path 值为原始字节（按归档/用户代码页解码），
     // 不能像缺省 UTF-8 那样直接标成 Unicode，否则二进制名称会绕过用户的显式编码选择。
-    static void ParsePaxRecords(const std::string& data, std::string& outPath, bool& outPathIsUtf8) {
+    // inheritedHdrCharset 为全局 pax 头遗留的字符集声明；局部头未再声明时继承该值。
+    static void ParsePaxRecords(const std::string& data, const std::string& inheritedHdrCharset,
+                                std::string& outPath, bool& outPathIsUtf8) {
+        std::string path;
+        std::string hdrcharset = inheritedHdrCharset;
+        bool sawPath = false;
+        ScanPaxRecords(data, path, sawPath, hdrcharset);
+
+        if (sawPath) {
+            outPath = path;
+            // 仅当 hdrcharset=BINARY 时 path 才是二进制原始字节；缺省/UTF-8 时 path 恒为 UTF-8。
+            outPathIsUtf8 = (hdrcharset != "BINARY");
+        }
+    }
+
+    // 仅提取全局/局部 pax 头中声明的 hdrcharset（未声明时返回空串）。
+    static std::string ExtractPaxHdrCharset(const std::string& data) {
         std::string path;
         std::string hdrcharset;
         bool sawPath = false;
+        ScanPaxRecords(data, path, sawPath, hdrcharset);
+        return hdrcharset;
+    }
+
+    // 遍历 PAX 记录并提取 path 与 hdrcharset（保留同一头内最后一次声明）。
+    static void ScanPaxRecords(const std::string& data, std::string& path, bool& sawPath, std::string& hdrcharset) {
         size_t offset = 0;
         while (offset + 2 <= data.size()) {
             size_t space = data.find(' ', offset);
@@ -333,12 +358,6 @@ private:
                 }
             }
             offset += recordLen;
-        }
-
-        if (sawPath) {
-            outPath = path;
-            // 仅当 hdrcharset=BINARY 时 path 才是二进制原始字节；缺省/UTF-8 时 path 恒为 UTF-8。
-            outPathIsUtf8 = (hdrcharset != "BINARY");
         }
     }
 };

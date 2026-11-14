@@ -262,16 +262,26 @@ namespace UnzipProxy.Core
                 byte[] zoneData = File.ReadAllBytes(zonePath);
                 if (zoneData.Length == 0) return 0;
 
-                // 入口目录本身（或其祖先）为联接点/符号链接时直接放弃，
-                // 否则 EnumerateFilesNoReparse 只拒绝“根下条目”，仍会顺着联接点写穿到暂存区之外。
-                if (DeliveryVerifier.PathContainsReparsePoint(targetRoot))
+                // 先以句柄核对入口目录的真实最终路径，再对整棵树逐项做句柄级最终路径核对：
+                // 任何联接点/符号链接（或在校验后被并发替换的对象）都会因“解析路径 ≠ 预期物理路径”
+                // 而被拒绝，从而杜绝把 Zone.Identifier 写到暂存区之外。
+                string expectedCanonical = Path.GetFullPath(targetRoot).TrimEnd('\\');
+                using var rootHandle = DeliveryVerifier.OpenPinnedObject(targetRoot);
+                if (rootHandle == null) return 0;
+                string? rootFinal = DeliveryVerifier.GetFinalPathName(rootHandle);
+                if (rootFinal == null ||
+                    !string.Equals(rootFinal.TrimEnd('\\'), expectedCanonical, StringComparison.OrdinalIgnoreCase))
                 {
                     return 0;
                 }
 
-                // 遍历最终树时拒绝 reparse point，绝不通过联接点/符号链接把来源标记写到暂存区之外。
+                // 遍历最终树时逐项钉住句柄并核对真实最终路径，拒绝 reparse point，
+                // 绝不通过联接点/符号链接把来源标记写到暂存区之外。
                 var files = new List<string>();
-                EnumerateFilesNoReparse(targetRoot, files);
+                DeliveryVerifier.WalkVerifiedTree(rootHandle, rootFinal,
+                    onDirectory: _ => { },
+                    onFile: (fullPath, _) => files.Add(fullPath),
+                    onProblem: _ => { });
                 foreach (string file in files)
                 {
                     try
@@ -290,30 +300,6 @@ namespace UnzipProxy.Core
                 // 来源标记传递失败不影响主流程
             }
             return marked;
-        }
-
-        private static void EnumerateFilesNoReparse(string dir, List<string> files)
-        {
-            try
-            {
-                foreach (string entry in Directory.EnumerateFileSystemEntries(dir))
-                {
-                    var attributes = File.GetAttributes(entry);
-                    if ((attributes & FileAttributes.ReparsePoint) != 0) continue;
-                    if ((attributes & FileAttributes.Directory) != 0)
-                    {
-                        EnumerateFilesNoReparse(entry, files);
-                    }
-                    else
-                    {
-                        files.Add(entry);
-                    }
-                }
-            }
-            catch
-            {
-                // 单个目录枚举失败不阻断来源标记
-            }
         }
     }
 }

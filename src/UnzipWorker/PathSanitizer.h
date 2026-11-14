@@ -242,10 +242,19 @@ public:
 
             HANDLE hChild = CreateFileW(it->c_str(), FILE_READ_ATTRIBUTES | FILE_TRAVERSE | DELETE,
                                         FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
-                                        FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+                                        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
             if (hChild == INVALID_HANDLE_VALUE) {
                 outError = GetLastError();
                 if (created) RemoveDirectoryW(it->c_str()); // 打开失败（罕见），按路径清理刚创建的空目录
+                if (hParent != INVALID_HANDLE_VALUE) CloseHandle(hParent);
+                return false;
+            }
+            if (HasReparsePointAttribute(hChild)) {
+                // 刚创建的路径被并发换成了联接点/符号链接：按句柄删除该重解析点对象，
+                // 绝不留下指向根外的目录副作用。
+                outError = ERROR_ACCESS_DENIED;
+                if (created) DeleteEmptyDirectoryByHandle(hChild);
+                else CloseHandle(hChild);
                 if (hParent != INVALID_HANDLE_VALUE) CloseHandle(hParent);
                 return false;
             }
@@ -350,14 +359,30 @@ public:
     }
 
 private:
-    // 打开目录句柄（不授予 FILE_SHARE_DELETE），验证其真实最终路径位于受控根内；成功时通过 hOut 返回句柄。
+    // 通过句柄读取真实属性；无法读取时按“存在重解析点”处理（fail-closed）。
+    // 打开时若带 FILE_FLAG_OPEN_REPARSE_POINT，句柄绑定到联接点/符号链接对象本身，
+    // 从而能在此处识别出重解析点，而不是被内核静默解引用到目标目录。
+    static bool HasReparsePointAttribute(HANDLE h) {
+        BY_HANDLE_FILE_INFORMATION info{};
+        if (!GetFileInformationByHandle(h, &info)) return true;
+        return (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+    }
+
+    // 打开目录句柄（不授予 FILE_SHARE_DELETE，且不解引用重解析点），
+    // 拒绝任何联接点/符号链接并验证其真实最终路径位于受控根内；成功时通过 hOut 返回句柄。
     static bool OpenVerifiedDirectoryNoDelete(const std::wstring& canonicalRoot, const std::wstring& dirPath,
                                               HANDLE& hOut, DWORD& outError) {
         hOut = CreateFileW(dirPath.c_str(), FILE_READ_ATTRIBUTES | FILE_TRAVERSE | DELETE,
                            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
-                           FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+                           FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
         if (hOut == INVALID_HANDLE_VALUE) {
             outError = GetLastError();
+            return false;
+        }
+        if (HasReparsePointAttribute(hOut)) {
+            CloseHandle(hOut);
+            hOut = INVALID_HANDLE_VALUE;
+            outError = ERROR_ACCESS_DENIED;
             return false;
         }
         if (!VerifyObjectUnderRoot(hOut, canonicalRoot)) {
@@ -378,13 +403,18 @@ private:
         CloseHandle(h);
     }
 
-    // 打开目录句柄并验证其真实最终路径位于受控根目录之内（打开时不解引用重解析点前先取其真实去向）
+    // 打开目录句柄并验证其真实最终路径位于受控根目录之内（打开时不解引用重解析点，先识别再拒绝）
     static bool VerifyDirectoryUnderRoot(const std::wstring& canonicalRoot, const std::wstring& dirPath, DWORD& outError) {
         HANDLE h = CreateFileW(dirPath.c_str(), FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
                                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                               OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+                               OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
         if (h == INVALID_HANDLE_VALUE) {
             outError = GetLastError();
+            return false;
+        }
+        if (HasReparsePointAttribute(h)) {
+            CloseHandle(h);
+            outError = ERROR_ACCESS_DENIED;
             return false;
         }
         bool ok = VerifyObjectUnderRoot(h, canonicalRoot);

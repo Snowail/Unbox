@@ -2,7 +2,10 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Text.Json;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
 
 namespace UnzipProxy.Core
 {
@@ -109,6 +112,13 @@ namespace UnzipProxy.Core
     {
         private const int MaxItems = 5_000_000;
 
+        private const uint FILE_READ_ATTRIBUTES = 0x00000080;
+        private const uint FILE_SHARE_READ = 0x00000001;
+        private const uint FILE_SHARE_WRITE = 0x00000002;
+        private const uint OPEN_EXISTING = 3;
+        private const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+        private const uint FILE_ATTRIBUTE_DIRECTORY = 0x00000010;
+
         public static VerifyReport Verify(string deliveryRootAbsolute, DeliveryManifest manifest, VerifyMode mode,
                                           Action<string>? log = null)
         {
@@ -116,14 +126,6 @@ namespace UnzipProxy.Core
             if (!Directory.Exists(deliveryRootAbsolute))
             {
                 report.Problems.Add("交付根目录不存在");
-                return report;
-            }
-            // 交付根目录本身（或其在交付树之外的祖先）若被替换为联接点/符号链接，
-            // 仅检查根下条目无法拦截：必须先把入口路径本身的 reparse point 拒之门外，
-            // 否则摘要校验会顺着联接点读到暂存区之外。
-            if (PathContainsReparsePoint(deliveryRootAbsolute))
-            {
-                report.Problems.Add("交付根目录或其祖先包含联接点/符号链接");
                 return report;
             }
             if (manifest.Items.Count > MaxItems)
@@ -168,82 +170,74 @@ namespace UnzipProxy.Core
             }
             if (report.Problems.Count > 0) return report;
 
+            // 先以句柄取回入口目录的真实最终路径：若入口路径本身或其任意祖先被替换为
+            // 联接点/符号链接，内核解析出的最终路径会与字面规范路径不一致，从而在此处整体拒绝；
+            // 后续遍历对每个条目再做一次同样的句柄级最终路径核对，因此即使根目录在校验后
+            // 被并发换成联接点，枚举/读取也会因为“解析路径 ≠ 预期物理路径”而失败，而不是
+            // 顺着联接点越界对账或写盘。
+            string expectedCanonical = Path.GetFullPath(deliveryRootAbsolute).TrimEnd('\\');
+            using SafeFileHandle? rootHandle = OpenPinnedObject(deliveryRootAbsolute);
+            if (rootHandle == null)
+            {
+                report.Problems.Add("无法打开交付根目录（可能已被替换为联接点/符号链接）");
+                return report;
+            }
+            string? rootFinal = GetFinalPathName(rootHandle);
+            if (rootFinal == null ||
+                !string.Equals(rootFinal.TrimEnd('\\'), expectedCanonical, StringComparison.OrdinalIgnoreCase))
+            {
+                report.Problems.Add("交付根目录或其祖先包含联接点/符号链接");
+                return report;
+            }
+
             var seenFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var seenDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-            var pending = new Stack<string>();
-            pending.Push(deliveryRootAbsolute);
-            while (pending.Count > 0)
-            {
-                string dir = pending.Pop();
-                IEnumerable<string> entries;
-                try
+            WalkVerifiedTree(rootHandle, rootFinal,
+                onDirectory: rel =>
                 {
-                    entries = Directory.EnumerateFileSystemEntries(dir).ToList();
-                }
-                catch (Exception ex)
-                {
-                    report.Problems.Add($"无法枚举目录 {Rel(deliveryRootAbsolute, dir)}：{ex.Message}");
-                    continue;
-                }
-
-                foreach (string entry in entries)
-                {
-                    string rel = Rel(deliveryRootAbsolute, entry);
-                    var attributes = File.GetAttributes(entry);
-                    // 交付树不允许出现任何非预期 reparse point（联接点/符号链接），
-                    // 防止通过联接点把最终目录指向暂存区之外。
-                    if ((attributes & FileAttributes.ReparsePoint) != 0)
+                    if (!expectedDirs.Contains(rel))
                     {
-                        report.Problems.Add($"交付树包含非预期的联接点/符号链接：{rel}");
-                        continue;
+                        report.Problems.Add($"交付树包含清单外的目录：{rel}");
                     }
-                    bool isDir = (attributes & FileAttributes.Directory) != 0;
-                    if (isDir)
-                    {
-                        if (!expectedDirs.Contains(rel))
-                        {
-                            report.Problems.Add($"交付树包含清单外的目录：{rel}");
-                        }
-                        seenDirs.Add(rel);
-                        pending.Push(entry);
-                        continue;
-                    }
-
+                    seenDirs.Add(rel);
+                },
+                onFile: (fullPath, rel) =>
+                {
                     if (!expected.TryGetValue(rel, out var expectedItem) || expectedItem.IsDirectory)
                     {
                         report.Problems.Add($"交付树包含清单外的文件：{rel}");
-                        continue;
+                        return;
                     }
-                    var info = new FileInfo(entry);
+                    var info = new FileInfo(fullPath);
                     if (info.Length != expectedItem.Size)
                     {
                         report.Problems.Add($"文件长度不一致：{rel}（期望 {expectedItem.Size}，实际 {info.Length}）");
-                        continue;
+                        return;
                     }
                     if (mode == VerifyMode.StructureAndDigest)
                     {
                         uint actualCrc;
                         try
                         {
-                            actualCrc = Crc32.ComputeFile(entry);
+                            actualCrc = Crc32.ComputeFile(fullPath);
                         }
                         catch (Exception ex)
                         {
                             report.Problems.Add($"无法读取文件做摘要校验：{rel}（{ex.Message}）");
-                            continue;
+                            return;
                         }
                         if (actualCrc != expectedItem.Crc)
                         {
                             report.Problems.Add($"文件摘要不一致：{rel}（期望 {expectedItem.Crc:X8}，实际 {actualCrc:X8}）");
-                            continue;
+                            return;
                         }
                         report.DigestsChecked++;
                     }
                     seenFiles.Add(rel);
                     report.TotalBytes += expectedItem.Size;
-                }
-            }
+                },
+                onProblem: msg => report.Problems.Add(msg));
 
             foreach (var item in manifest.Items)
             {
@@ -268,9 +262,127 @@ namespace UnzipProxy.Core
         }
 
         /// <summary>
+        /// 打开一个目录（或文件）对象的句柄（不带 FILE_FLAG_OPEN_REPARSE_POINT，以便通过句柄的
+        /// 最终路径识别入口本身或其祖先是否为联接点/符号链接：真实最终路径会与字面规范路径不一致）。
+        /// 返回的句柄用于 <see cref="GetFinalPathName"/> 做归属核对；对文件而言，不授予
+        /// FILE_SHARE_DELETE 还能阻止其在校验期间被改名/替换。
+        /// </summary>
+        public static SafeFileHandle? OpenPinnedObject(string path)
+        {
+            SafeFileHandle handle = CreateFileW(path, FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS, IntPtr.Zero);
+            return handle.IsInvalid ? null : handle;
+        }
+
+        /// <summary>取回句柄指向对象的真实最终路径（已解析全部重解析点，无尾反斜杠、无 \\?\ 前缀）。</summary>
+        public static string? GetFinalPathName(SafeFileHandle handle)
+        {
+            if (handle == null || handle.IsInvalid) return null;
+            uint capacity = 512;
+            for (int attempt = 0; attempt < 4; attempt++)
+            {
+                var sb = new StringBuilder((int)capacity);
+                uint len = GetFinalPathNameByHandleW(handle, sb, capacity, 0 /* FILE_NAME_NORMALIZED | VOLUME_NAME_DOS */);
+                if (len == 0) return null;
+                if (len < capacity)
+                {
+                    string path = sb.ToString(0, (int)len).TrimEnd('\\');
+                    // GetFinalPathNameByHandleW 以 FILE_NAME_NORMALIZED 返回时带 \\?\ 前缀，剥掉后再做归属比较。
+                    if (path.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return @"\\" + path.Substring(8);
+                    }
+                    if (path.StartsWith(@"\\?\", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return path.Substring(4);
+                    }
+                    return path;
+                }
+                capacity = len + 1;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// 从已核对过真实最终路径的根目录句柄出发，安全遍历整棵交付树。
+        /// 每个条目都以句柄取回真实最终路径并与其预期物理路径比对，任何联接点/符号链接
+        /// （或被替换的对象）都会触发 onProblem 而不是被静默跟随；即使遍历期间父路径被
+        /// 并发换成联接点，句柄解析出的真实路径也会与预期不一致而被拒绝。
+        /// onFile 收到的物理路径已通过身份核对，可安全用于后续读取/写入。
+        /// </summary>
+        public static void WalkVerifiedTree(SafeFileHandle rootHandle, string rootPhysicalPath,
+                                            Action<string> onDirectory,
+                                            Action<string, string> onFile,
+                                            Action<string> onProblem)
+        {
+            var stack = new Stack<(string Physical, SafeFileHandle Handle, bool OwnHandle)>();
+            stack.Push((rootPhysicalPath.TrimEnd('\\'), rootHandle, false));
+
+            while (stack.Count > 0)
+            {
+                (string dirPhysical, SafeFileHandle dirHandle, bool ownHandle) = stack.Pop();
+                try
+                {
+                    List<string> entries;
+                    try
+                    {
+                        entries = Directory.EnumerateFileSystemEntries(dirPhysical).ToList();
+                    }
+                    catch (Exception ex)
+                    {
+                        onProblem($"无法枚举目录 {RelFrom(rootPhysicalPath, dirPhysical)}：{ex.Message}");
+                        continue;
+                    }
+
+                    foreach (string entry in entries)
+                    {
+                        string name = Path.GetFileName(entry);
+                        string full = Path.Combine(dirPhysical, name);
+                        string rel = RelFrom(rootPhysicalPath, full);
+
+                        SafeFileHandle? entryHandle = OpenPinnedObject(full);
+                        if (entryHandle == null)
+                        {
+                            onProblem($"无法打开条目 {rel}");
+                            continue;
+                        }
+
+                        string? finalEntry = GetFinalPathName(entryHandle);
+                        uint attributes = 0;
+                        bool attributesOk = finalEntry != null && TryGetAttributes(entryHandle, out attributes);
+                        if (!attributesOk ||
+                            !string.Equals(finalEntry!.TrimEnd('\\'), full.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase))
+                        {
+                            entryHandle.Dispose();
+                            onProblem($"交付树包含非预期的联接点/符号链接：{rel}");
+                            continue;
+                        }
+
+                        if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+                        {
+                            onDirectory(rel);
+                            // 保留句柄交由栈处理，子目录在其句柄仍打开（不可被替换）的情况下继续遍历。
+                            stack.Push((full, entryHandle, true));
+                        }
+                        else
+                        {
+                            onFile(full, rel);
+                            entryHandle.Dispose();
+                        }
+                    }
+                }
+                finally
+                {
+                    if (ownHandle) dirHandle.Dispose();
+                }
+            }
+        }
+
+        /// <summary>
         /// 判断完整路径本身或任意一级祖先是否为联接点/符号链接（reparse point）。
-        /// 用于在枚举交付树之前，先把“交付根本身被替换为指向根外的联接点”这一类
-        /// 越界场景整体拒绝，避免顺着联接点对账或写盘到暂存区之外。
+        /// 该轻量预检仅供诊断使用；Verify / ZoneIdentifier 的权威边界校验以句柄钉住
+        /// （<see cref="OpenPinnedObject"/>）与真实最终路径比对为准，不再依赖本方法。
         /// </summary>
         public static bool PathContainsReparsePoint(string fullPath)
         {
@@ -328,14 +440,56 @@ namespace UnzipProxy.Core
             return false;
         }
 
-        private static string Rel(string root, string fullPath)
+        private static string RelFrom(string rootPhysical, string fullPath)
         {
-            string normalizedRoot = root.TrimEnd('\\') + "\\";
-            if (fullPath.StartsWith(normalizedRoot, StringComparison.OrdinalIgnoreCase))
+            string normalizedRoot = rootPhysical.TrimEnd('\\');
+            if (fullPath.StartsWith(normalizedRoot + "\\", StringComparison.OrdinalIgnoreCase))
             {
-                return fullPath.Substring(normalizedRoot.Length);
+                return fullPath.Substring(normalizedRoot.Length + 1);
             }
             return Path.GetFileName(fullPath);
         }
+
+        private static bool TryGetAttributes(SafeFileHandle handle, out uint attributes)
+        {
+            attributes = 0;
+            if (GetFileInformationByHandle(handle, out BY_HANDLE_FILE_INFORMATION info))
+            {
+                attributes = info.dwFileAttributes;
+                return true;
+            }
+            return false;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct BY_HANDLE_FILE_INFORMATION
+        {
+            public uint dwFileAttributes;
+            public uint ftCreationTimeLow;
+            public uint ftCreationTimeHigh;
+            public uint ftLastAccessTimeLow;
+            public uint ftLastAccessTimeHigh;
+            public uint ftLastWriteTimeLow;
+            public uint ftLastWriteTimeHigh;
+            public uint dwVolumeSerialNumber;
+            public uint nFileSizeHigh;
+            public uint nFileSizeLow;
+            public uint nNumberOfLinks;
+            public uint nFileIndexHigh;
+            public uint nFileIndexLow;
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern SafeFileHandle CreateFileW(string lpFileName, uint dwDesiredAccess, uint dwShareMode,
+                                                         IntPtr lpSecurityAttributes, uint dwCreationDisposition,
+                                                         uint dwFlagsAndAttributes, IntPtr hTemplateFile);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern uint GetFinalPathNameByHandleW(SafeFileHandle hFile, StringBuilder lpszFilePath,
+                                                             uint cchFilePath, uint dwFlags);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetFileInformationByHandle(SafeFileHandle hFile,
+                                                              out BY_HANDLE_FILE_INFORMATION lpFileInformation);
     }
 }
