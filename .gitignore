@@ -26,6 +26,13 @@ tests/output/
 tests/staging*/
 tests/test_staging*/
 
+# Local agent review artifacts
+/.agent-tmp/
+/Review History/
+/HANDOFF.md
+/Issue列表与必查清单.txt
+/Issus列表与必查清单.txt
+
 # OS generated files
 Thumbs.db
 [Dd]esktop.ini
