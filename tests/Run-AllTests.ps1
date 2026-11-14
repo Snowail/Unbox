@@ -15,7 +15,7 @@ if ($env:DOTNET_ROOT -and (Test-Path (Join-Path $env:DOTNET_ROOT "dotnet.exe")))
 }
 
 # 2. 缺 Worker 时先构建（需要 MSVC x64 工具链）
-if (-not (Test-Path $workerExe)) {
+if (-not (Test-Path $workerExe) -or -not (Test-Path (Join-Path $rootDir "bin\PathSanitizerTests.exe"))) {
     Write-Host ">>> 未找到 UnzipWorker.exe，先执行原生构建..." -ForegroundColor Yellow
     & (Join-Path $rootDir "scripts\build_worker.ps1")
     if ($LASTEXITCODE -ne 0) { throw "UnzipWorker.exe 构建失败" }
@@ -29,6 +29,10 @@ if (-not (Test-Path $dll7z)) {
         Write-Host ">>> 已从 assets 复制 7z.dll" -ForegroundColor Yellow
     }
 }
+
+# 原生句柄相对创建与中间联接点边界回归。
+& (Join-Path $rootDir "bin\PathSanitizerTests.exe")
+if ($LASTEXITCODE -ne 0) { throw "原生边界测试失败" }
 
 # 4. 运行生产路径测试套件
 Write-Host ">>> 运行 tests/Tester（生产完成路径测试套件）..." -ForegroundColor Cyan

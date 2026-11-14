@@ -277,23 +277,19 @@ namespace UnzipProxy.Core
 
                 // 遍历最终树时逐项钉住句柄并核对真实最终路径，拒绝 reparse point，
                 // 绝不通过联接点/符号链接把来源标记写到暂存区之外。
-                var files = new List<string>();
                 DeliveryVerifier.WalkVerifiedTree(rootHandle, rootFinal,
                     onDirectory: _ => { },
-                    onFile: (fullPath, _) => files.Add(fullPath),
+                    onFile: (file, _, handle) =>
+                    {
+                        try
+                        {
+                            // 文件与所有父目录仍钉住时写入，绝不延迟到遍历释放句柄之后。
+                            File.WriteAllBytes(file + StreamSuffix, zoneData);
+                            marked++;
+                        }
+                        catch { /* 单文件来源标记失败不阻断交付。 */ }
+                    },
                     onProblem: _ => { });
-                foreach (string file in files)
-                {
-                    try
-                    {
-                        File.WriteAllBytes(file + StreamSuffix, zoneData);
-                        marked++;
-                    }
-                    catch
-                    {
-                        // 单个文件的非致命属性写入失败不阻断交付
-                    }
-                }
             }
             catch
             {

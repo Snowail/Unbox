@@ -523,6 +523,100 @@ namespace Tester
             w.Write(new byte[1024]); // 两个 512 零块结束
         }
 
+        static void CreatePaxCharsetResetTar(string path, bool reset)
+        {
+            using var writer = new BinaryWriter(File.Create(path));
+            void Record(string name, char type, byte[] data)
+            {
+                writer.Write(BuildTarHeader(name, data.Length, type));
+                writer.Write(data);
+                writer.Write(new byte[(512 - data.Length % 512) % 512]);
+            }
+            Record("global", 'g', BuildPaxRecord("hdrcharset", Encoding.ASCII.GetBytes("BINARY")));
+            Record("local", 'x', BuildPaxRecord("path", Encoding.ASCII.GetBytes("first.txt")));
+            Record("placeholder", '0', Encoding.UTF8.GetBytes("first"));
+            Record("global2", 'g', reset ? BuildPaxRecord("hdrcharset", Array.Empty<byte>()) :
+                BuildPaxRecord("comment", Encoding.ASCII.GetBytes("no charset change")));
+            Record("local2", 'x', BuildPaxRecord("path", Encoding.UTF8.GetBytes("é.txt")));
+            Record("placeholder2", '0', Encoding.UTF8.GetBytes("second"));
+            writer.Write(new byte[1024]);
+        }
+
+        static bool MoveBlocked(string from, string to, bool directory)
+        {
+            try
+            {
+                if (directory) Directory.Move(from, to); else File.Move(from, to);
+                return false;
+            }
+            catch (IOException) { return true; }
+            catch (UnauthorizedAccessException) { return true; }
+        }
+
+        static void TestPinnedTraversal()
+        {
+            string root = NewStaging("r7pins");
+            string child = Path.Combine(root, "child");
+            Directory.CreateDirectory(child);
+            string file = Path.Combine(child, "data.txt");
+            File.WriteAllBytes(file, Encoding.UTF8.GetBytes("pinned-data"));
+            using (var rootHandle = DeliveryVerifier.OpenPinnedObject(root)!)
+            {
+                bool visited = false;
+                DeliveryVerifier.WalkVerifiedTree(rootHandle, root, _ => { }, (full, rel, handle) =>
+                {
+                    visited = true;
+                    Assert("R7: 文件句柄阻止改名", MoveBlocked(full, full + ".moved", false));
+                    Assert("R7: 遍历后代期间父目录仍钉住", MoveBlocked(child, child + ".moved", true));
+                    Assert("R7: 校验期间交付根仍钉住", MoveBlocked(root, root + ".moved", true));
+                    Assert("R7: 使用绑定句柄读取长度与 CRC", RandomAccess.GetLength(handle) == 11 &&
+                        Crc32.ComputeHandle(handle) == Crc32.Compute(Encoding.UTF8.GetBytes("pinned-data")));
+                }, msg => Assert("R7: 安全遍历无错误", false, msg));
+                Assert("R7: 实际进入文件回调", visited);
+            }
+            string source = Path.Combine(_testDir, "r7-web.zip");
+            File.WriteAllText(source, "source");
+            File.WriteAllText(source + ":Zone.Identifier", "[ZoneTransfer]\r\nZoneId=3\r\n");
+            Assert("R7: 钉住期间来源标记正常写入", ZoneIdentifier.Propagate(source, root) == 1 &&
+                File.Exists(file + ":Zone.Identifier"));
+
+            string leaks = NewStaging("r7exceptions");
+            for (int i = 0; i < 100; i++) Directory.CreateDirectory(Path.Combine(leaks, "d" + i));
+            File.WriteAllText(Path.Combine(leaks, "file.txt"), "x");
+            using var leakRoot = DeliveryVerifier.OpenPinnedObject(leaks)!;
+            foreach (string kind in new[] { "file", "directory", "problem" })
+            {
+                string? link = null;
+                if (kind == "problem")
+                {
+                    link = Path.Combine(leaks, "junction");
+                    Assert("R7: 异常测试创建联接点", CreateJunction(link, child));
+                }
+                // 预热运行时路径，避免首次 JIT/系统初始化影响句柄计数。
+                for (int iteration = 0; iteration < 2; iteration++)
+                {
+                    using var process = Process.GetCurrentProcess();
+                    int before = process.HandleCount;
+                    bool threw = false;
+                    try
+                    {
+                        DeliveryVerifier.WalkVerifiedTree(leakRoot, leaks,
+                            _ => { if (kind == "directory") throw new InvalidOperationException("expected"); },
+                            (_, _, _) => { if (kind == "file") throw new InvalidOperationException("expected"); },
+                            _ => { if (kind == "problem") throw new InvalidOperationException("expected"); });
+                    }
+                    catch (InvalidOperationException) { threw = true; }
+                    process.Refresh();
+                    if (iteration == 1)
+                        Assert("R7: " + kind + " 回调异常同步释放全部句柄", threw && process.HandleCount <= before,
+                            $"before={before} after={process.HandleCount}");
+                }
+                if (link != null) Directory.Delete(link);
+            }
+            // 不强制 GC，直接独占打开每个目录，检测是否仍遗留拒绝删除共享的句柄。
+            Assert("R7: 异常后文件立即可改名", !MoveBlocked(Path.Combine(leaks, "file.txt"), Path.Combine(leaks, "renamed.txt"), false));
+        }
+
         // 从 Worker finished 消息解析逐卷身份（与 MainWindow 一致：优先 16 字节 file_id 规范表示）
         static List<VolumeIdentity> ParseWorkerVolumes(WorkerRun run)
         {
@@ -1398,6 +1492,24 @@ namespace Tester
                 !subRepReport.Ok, subRepReport.Describe());
 
             // -------------------------------------------------------------
+            Console.WriteLine("\n>>> [测试 28] R7：全局空字符集删除与缺省继承");
+            foreach (bool reset in new[] { true, false })
+            {
+                string tar = Path.Combine(_testDir, "pax_reset_" + reset + ".tar");
+                CreatePaxCharsetResetTar(tar, reset);
+                string staging = NewStaging("paxreset" + reset);
+                string manifest = Path.Combine(_testDir, "pax_reset_" + reset + ".json");
+                var run = RunWorker(tar, staging, manifest, cp: "936");
+                string wanted = reset ? "é.txt" : "茅.txt";
+                string unwanted = reset ? "茅.txt" : "é.txt";
+                Assert("R7: PAX " + (reset ? "空值恢复 UTF-8" : "无字段仍继承 BINARY"),
+                    run.Status == "ok" && File.Exists(Path.Combine(staging, wanted)) &&
+                    !File.Exists(Path.Combine(staging, unwanted)), $"status={run.Status} error={run.ErrorReason}");
+                var completion = CompleteViaProduction(tar, staging, manifest, run.DeliveryRoot);
+                Assert("R7: PAX 状态变更后可交付", completion.Delivered, completion.FailureReason);
+            }
+            TestPinnedTraversal();
+
             Console.WriteLine("\n==================================================");
             Console.WriteLine($"测试总结: 共 {_pass + _fail} 项测试，通过: {_pass}，失败: {_fail}");
             Console.WriteLine("==================================================");

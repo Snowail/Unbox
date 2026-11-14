@@ -43,4 +43,11 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
+# 原生安全边界回归测试与 Worker 使用同一 MSVC 工具链。
+$testCmd = @"
+`"$vcvars`" && cl.exe /nologo /O2 /utf-8 /std:c++20 /EHsc /DUNICODE /D_UNICODE `"$RootDir\tests\PathSanitizerTests.cpp`" /Fe`"$BinDir\PathSanitizerTests.exe`"
+"@
+cmd.exe /c $testCmd
+if ($LASTEXITCODE -ne 0) { throw "PathSanitizerTests 编译失败" }
+
 Write-Host "[OK] UnzipWorker.exe compiled successfully: $BinDir\UnzipWorker.exe" -ForegroundColor Green

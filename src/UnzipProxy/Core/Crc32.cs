@@ -42,6 +42,20 @@ namespace UnzipProxy.Core
             return ComputeStream(stream);
         }
 
+        public static uint ComputeHandle(Microsoft.Win32.SafeHandles.SafeFileHandle handle)
+        {
+            uint crc = 0;
+            byte[] buffer = new byte[64 * 1024];
+            long offset = 0;
+            int read;
+            while ((read = RandomAccess.Read(handle, buffer, offset)) > 0)
+            {
+                crc = Compute(buffer.AsSpan(0, read), crc);
+                offset += read;
+            }
+            return crc;
+        }
+
         public static uint ComputeStream(Stream stream)
         {
             uint crc = 0xFFFFFFFFu;

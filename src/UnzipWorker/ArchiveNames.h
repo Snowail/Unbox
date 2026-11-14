@@ -177,8 +177,10 @@ public:
             }
             if (type == 'g') { // 全局 pax 头：解析字符集声明并持续生效（hdrcharset=BINARY 必须影响后续文件）
                 std::string data = ReadBlocks(f, size);
-                std::string declared = ExtractPaxHdrCharset(data);
-                if (!declared.empty()) globalHdrCharset = declared;
+                std::string unusedPath;
+                bool sawPath = false;
+                // 缺少字段时保留；空值声明时删除先前全局值，恢复默认 UTF-8。
+                ScanPaxRecords(data, unusedPath, sawPath, globalHdrCharset);
                 continue;
             }
 
@@ -320,15 +322,6 @@ private:
             // 仅当 hdrcharset=BINARY 时 path 才是二进制原始字节；缺省/UTF-8 时 path 恒为 UTF-8。
             outPathIsUtf8 = (hdrcharset != "BINARY");
         }
-    }
-
-    // 仅提取全局/局部 pax 头中声明的 hdrcharset（未声明时返回空串）。
-    static std::string ExtractPaxHdrCharset(const std::string& data) {
-        std::string path;
-        std::string hdrcharset;
-        bool sawPath = false;
-        ScanPaxRecords(data, path, sawPath, hdrcharset);
-        return hdrcharset;
     }
 
     // 遍历 PAX 记录并提取 path 与 hdrcharset（保留同一头内最后一次声明）。

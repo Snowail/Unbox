@@ -112,7 +112,7 @@ namespace UnzipProxy.Core
     {
         private const int MaxItems = 5_000_000;
 
-        private const uint FILE_READ_ATTRIBUTES = 0x00000080;
+        private const uint GENERIC_READ = 0x80000000;
         private const uint FILE_SHARE_READ = 0x00000001;
         private const uint FILE_SHARE_WRITE = 0x00000002;
         private const uint OPEN_EXISTING = 3;
@@ -202,17 +202,17 @@ namespace UnzipProxy.Core
                     }
                     seenDirs.Add(rel);
                 },
-                onFile: (fullPath, rel) =>
+                onFile: (fullPath, rel, handle) =>
                 {
                     if (!expected.TryGetValue(rel, out var expectedItem) || expectedItem.IsDirectory)
                     {
                         report.Problems.Add($"交付树包含清单外的文件：{rel}");
                         return;
                     }
-                    var info = new FileInfo(fullPath);
-                    if (info.Length != expectedItem.Size)
+                    long length = RandomAccess.GetLength(handle);
+                    if (length != expectedItem.Size)
                     {
-                        report.Problems.Add($"文件长度不一致：{rel}（期望 {expectedItem.Size}，实际 {info.Length}）");
+                        report.Problems.Add($"文件长度不一致：{rel}（期望 {expectedItem.Size}，实际 {length}）");
                         return;
                     }
                     if (mode == VerifyMode.StructureAndDigest)
@@ -220,7 +220,7 @@ namespace UnzipProxy.Core
                         uint actualCrc;
                         try
                         {
-                            actualCrc = Crc32.ComputeFile(fullPath);
+                            actualCrc = Crc32.ComputeHandle(handle);
                         }
                         catch (Exception ex)
                         {
@@ -265,14 +265,16 @@ namespace UnzipProxy.Core
         /// 打开一个目录（或文件）对象的句柄（不带 FILE_FLAG_OPEN_REPARSE_POINT，以便通过句柄的
         /// 最终路径识别入口本身或其祖先是否为联接点/符号链接：真实最终路径会与字面规范路径不一致）。
         /// 返回的句柄用于 <see cref="GetFinalPathName"/> 做归属核对；对文件而言，不授予
-        /// FILE_SHARE_DELETE 还能阻止其在校验期间被改名/替换。
+        /// FILE_SHARE_DELETE 且请求 GENERIC_READ 才能阻止其在校验期间被改名/替换。
         /// </summary>
         public static SafeFileHandle? OpenPinnedObject(string path)
         {
-            SafeFileHandle handle = CreateFileW(path, FILE_READ_ATTRIBUTES,
+            SafeFileHandle handle = CreateFileW(path, GENERIC_READ,
                 FILE_SHARE_READ | FILE_SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING,
                 FILE_FLAG_BACKUP_SEMANTICS, IntPtr.Zero);
-            return handle.IsInvalid ? null : handle;
+            if (!handle.IsInvalid) return handle;
+            handle.Dispose();
+            return null;
         }
 
         /// <summary>取回句柄指向对象的真实最终路径（已解析全部重解析点，无尾反斜杠、无 \\?\ 前缀）。</summary>
@@ -309,73 +311,72 @@ namespace UnzipProxy.Core
         /// 每个条目都以句柄取回真实最终路径并与其预期物理路径比对，任何联接点/符号链接
         /// （或被替换的对象）都会触发 onProblem 而不是被静默跟随；即使遍历期间父路径被
         /// 并发换成联接点，句柄解析出的真实路径也会与预期不一致而被拒绝。
-        /// onFile 收到的物理路径已通过身份核对，可安全用于后续读取/写入。
+        /// onFile 回调期间对象与祖先保持钉住；内容读取使用传入句柄，路径不得延迟使用。
         /// </summary>
         public static void WalkVerifiedTree(SafeFileHandle rootHandle, string rootPhysicalPath,
                                             Action<string> onDirectory,
-                                            Action<string, string> onFile,
+                                            Action<string, string, SafeFileHandle> onFile,
                                             Action<string> onProblem)
         {
-            var stack = new Stack<(string Physical, SafeFileHandle Handle, bool OwnHandle)>();
+            var stack = new Stack<(string Physical, SafeFileHandle Handle, bool Exit)>();
+            var owned = new HashSet<SafeFileHandle>();
             stack.Push((rootPhysicalPath.TrimEnd('\\'), rootHandle, false));
-
-            while (stack.Count > 0)
+            try
             {
-                (string dirPhysical, SafeFileHandle dirHandle, bool ownHandle) = stack.Pop();
-                try
+                while (stack.Count > 0)
                 {
-                    List<string> entries;
-                    try
+                    var (dirPhysical, dirHandle, exit) = stack.Pop();
+                    if (exit)
                     {
-                        entries = Directory.EnumerateFileSystemEntries(dirPhysical).ToList();
+                        if (owned.Remove(dirHandle)) dirHandle.Dispose();
+                        continue;
                     }
+                    // 子目录处理完毕后才释放父目录，保持整个祖先链钉住。
+                    stack.Push((dirPhysical, dirHandle, true));
+                    List<string> entries;
+                    try { entries = Directory.EnumerateFileSystemEntries(dirPhysical).ToList(); }
                     catch (Exception ex)
                     {
                         onProblem($"无法枚举目录 {RelFrom(rootPhysicalPath, dirPhysical)}：{ex.Message}");
                         continue;
                     }
-
-                    foreach (string entry in entries)
+                    foreach (string full in entries)
                     {
-                        string name = Path.GetFileName(entry);
-                        string full = Path.Combine(dirPhysical, name);
                         string rel = RelFrom(rootPhysicalPath, full);
-
                         SafeFileHandle? entryHandle = OpenPinnedObject(full);
                         if (entryHandle == null)
                         {
                             onProblem($"无法打开条目 {rel}");
                             continue;
                         }
-
-                        string? finalEntry = GetFinalPathName(entryHandle);
-                        uint attributes = 0;
-                        bool attributesOk = finalEntry != null && TryGetAttributes(entryHandle, out attributes);
-                        if (!attributesOk ||
-                            !string.Equals(finalEntry!.TrimEnd('\\'), full.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase))
+                        bool transferred = false;
+                        try
                         {
-                            entryHandle.Dispose();
-                            onProblem($"交付树包含非预期的联接点/符号链接：{rel}");
-                            continue;
+                            string? finalEntry = GetFinalPathName(entryHandle);
+                            if (finalEntry == null || !TryGetAttributes(entryHandle, out uint attributes) ||
+                                !string.Equals(finalEntry.TrimEnd('\\'), full.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase) ||
+                                (attributes & 0x400 /* FILE_ATTRIBUTE_REPARSE_POINT */) != 0)
+                            {
+                                onProblem($"交付树包含非预期的联接点/符号链接：{rel}");
+                                continue;
+                            }
+                            if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+                            {
+                                onDirectory(rel);
+                                owned.Add(entryHandle);
+                                transferred = true;
+                                stack.Push((full, entryHandle, false));
+                            }
+                            else { onFile(full, rel, entryHandle); }
                         }
-
-                        if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
-                        {
-                            onDirectory(rel);
-                            // 保留句柄交由栈处理，子目录在其句柄仍打开（不可被替换）的情况下继续遍历。
-                            stack.Push((full, entryHandle, true));
-                        }
-                        else
-                        {
-                            onFile(full, rel);
-                            entryHandle.Dispose();
-                        }
+                        finally { if (!transferred) entryHandle.Dispose(); }
                     }
                 }
-                finally
-                {
-                    if (ownHandle) dirHandle.Dispose();
-                }
+            }
+            finally
+            {
+                // 包括任意回调异常时仍在栈中的所有目录，不依赖 GC 回收原生句柄。
+                foreach (var handle in owned) handle.Dispose();
             }
         }
 
