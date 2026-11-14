@@ -1,6 +1,7 @@
 ﻿# scripts/package_release.ps1: 自动化构建便携绿色发布包 (Framework-Dependent .NET 10 LTS)
 [CmdletBinding()]
 param(
+    [ValidatePattern('^\d+\.\d+\.\d+$')]
     [string]$Version = "1.2.0"
 )
 
@@ -14,6 +15,23 @@ $distDir = Join-Path $rootDir "dist"
 $pkgName = "Unbox-v$Version-win-x64"
 $pkgDir = Join-Path $distDir $pkgName
 $zipFile = Join-Path $distDir "$pkgName.zip"
+$publishTemp = Join-Path $distDir ".publish_temp"
+
+# 删除构建缓存前，确认目标均为仓库 dist 下的直接产物。
+foreach ($target in @($pkgDir, $zipFile, $publishTemp)) {
+    $resolved = [System.IO.Path]::GetFullPath($target)
+    if ([System.IO.Path]::GetDirectoryName($resolved) -ne [System.IO.Path]::GetFullPath($distDir)) {
+        throw "构建路径不在预期 dist 目录中：$resolved"
+    }
+    if ((Test-Path -LiteralPath $resolved) -and
+        ((Get-Item -LiteralPath $resolved -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        throw "构建目标不能为重解析点：$resolved"
+    }
+}
+[xml]$project = Get-Content -LiteralPath "$rootDir\src\UnzipProxy\UnzipProxy.csproj" -Raw
+if ($project.Project.PropertyGroup.Version -ne $Version) {
+    throw "发布版本与项目 Version 不一致：$Version"
+}
 
 Write-Host "==========================================" -ForegroundColor Cyan
 Write-Host "   制作 Unbox 便携绿色发布包 (v$Version)" -ForegroundColor Cyan
@@ -22,10 +40,10 @@ Write-Host "==========================================" -ForegroundColor Cyan
 
 # 1. 确保目录纯净
 if (Test-Path $pkgDir) {
-    Remove-Item -Path $pkgDir -Recurse -Force
+    Remove-Item -LiteralPath $pkgDir -Recurse -Force
 }
 if (Test-Path $zipFile) {
-    Remove-Item -Path $zipFile -Force
+    Remove-Item -LiteralPath $zipFile -Force
 }
 New-Item -ItemType Directory -Path $pkgDir -Force | Out-Null
 New-Item -ItemType Directory -Path $distDir -Force | Out-Null
@@ -54,8 +72,7 @@ if ($env:DOTNET_ROOT -and (Test-Path "$env:DOTNET_ROOT\dotnet.exe")) {
     $dotnetExe = "$env:LOCALAPPDATA\Microsoft\dotnet\dotnet.exe"
 }
 
-$publishTemp = Join-Path $distDir ".publish_temp"
-if (Test-Path $publishTemp) { Remove-Item -Path $publishTemp -Recurse -Force }
+if (Test-Path $publishTemp) { Remove-Item -LiteralPath $publishTemp -Recurse -Force }
 New-Item -ItemType Directory -Path $publishTemp -Force | Out-Null
 
 & $dotnetExe restore "$rootDir\src\UnzipProxy\UnzipProxy.csproj" -r win-x64
@@ -75,7 +92,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Copy-Item -Path (Join-Path $publishTemp "Unbox.exe") -Destination (Join-Path $binDir "Unbox.exe") -Force
-Remove-Item -Path $publishTemp -Recurse -Force
+Remove-Item -LiteralPath $publishTemp -Recurse -Force
 
 # 确保 7z.dll 在 bin 目录中
 if (-not (Test-Path (Join-Path $binDir "7z.dll"))) {
@@ -119,6 +136,16 @@ if ($icoCount -lt 25) {
     throw "发布阻断：图标库不完整，仅包含 $icoCount 个 .ico 文件！"
 }
 Write-Host "  [OK] 图标库完整 ($icoCount 个专用格式图标)" -ForegroundColor Green
+
+# 只在本次构建的原生与托管回归通过后生成发布包；保存实际测试结论。
+$testLog = Join-Path $pkgDir "测试结果.txt"
+Push-Location $rootDir
+try {
+    & "$rootDir\tests\Run-AllTests.ps1" *>&1 | Tee-Object -FilePath $testLog
+    if ($LASTEXITCODE -ne 0) { throw "发布回归测试失败" }
+} finally { Pop-Location }
+$testSummary = Get-Content -LiteralPath $testLog | Where-Object { $_ -match '^测试总结:' } | Select-Object -Last 1
+if (-not $testSummary) { throw "未取得本次测试总结，拒绝生成发布包" }
 
 # 6. 生成使用说明与运行库环境提示
 $readmeText = @"
@@ -170,8 +197,8 @@ Git 提交        : $commit
 Unbox.exe       : $(Get-Sha256 (Join-Path $binDir "Unbox.exe"))
 UnzipWorker.exe : $(Get-Sha256 (Join-Path $binDir "UnzipWorker.exe"))
 7z.dll          : $(Get-Sha256 (Join-Path $binDir "7z.dll"))
-测试所用组件    : 与本包同目录的 Unbox.exe / UnzipWorker.exe / 7z.dll
-测试结果        : tests/Tester 113 项用例全部通过
+测试所用组件    : 同次构建的 bin/UnzipWorker.exe、bin/7z.dll 与 Release 项目引用的托管代码
+测试结果        : $testSummary（完整日志见 测试结果.txt）
 ================================================================
 "@
 Set-Content -Path (Join-Path $pkgDir "构建信息.txt") -Value $buildInfo -Encoding utf8
