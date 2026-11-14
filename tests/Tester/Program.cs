@@ -615,6 +615,105 @@ namespace Tester
             }
             // 不强制 GC，直接独占打开每个目录，检测是否仍遗留拒绝删除共享的句柄。
             Assert("R7: 异常后文件立即可改名", !MoveBlocked(Path.Combine(leaks, "file.txt"), Path.Combine(leaks, "renamed.txt"), false));
+            TestDigestWriteExclusion();
+        }
+
+        static void TestDigestWriteExclusion()
+        {
+            const int blockSize = 64 * 1024;
+            byte[] expected = Enumerable.Repeat((byte)'A', blockSize)
+                .Concat(Enumerable.Repeat((byte)'B', blockSize)).ToArray();
+            byte[] initial = Enumerable.Repeat((byte)'A', blockSize)
+                .Concat(Enumerable.Repeat((byte)'X', blockSize)).ToArray();
+            byte[] replacement = Enumerable.Repeat((byte)'X', blockSize)
+                .Concat(Enumerable.Repeat((byte)'B', blockSize)).ToArray();
+            uint expectedCrc = Crc32.Compute(expected);
+            Assert("R8: 混合快照样本改写前后均不匹配清单",
+                Crc32.Compute(initial) != expectedCrc && Crc32.Compute(replacement) != expectedCrc);
+
+            string root = NewStaging("r8digest");
+            string file = Path.Combine(root, "data.bin");
+            File.WriteAllBytes(file, initial);
+            var manifest = new DeliveryManifest
+            {
+                ItemCount = 1,
+                Items = new() { new ManifestItem { Path = "data.bin", Size = expected.Length, Crc = expectedCrc } }
+            };
+            using (var rootHandle = DeliveryVerifier.OpenPinnedObject(root)!)
+            {
+                bool visited = false;
+                DeliveryVerifier.WalkVerifiedTree(rootHandle, root, _ => { }, (full, _, handle) =>
+                {
+                    visited = true;
+                    byte[] first = new byte[blockSize];
+                    Assert("R8: 已通过绑定句柄读完首个 CRC 分块", RandomAccess.Read(handle, first, 0) == blockSize);
+                    // 精确在两个分块之间由另一线程尝试原位改写，无 sleep 或竞速概率。
+                    bool writeBlocked = System.Threading.Tasks.Task.Run(() =>
+                    {
+                        try
+                        {
+                            using var writer = new FileStream(full, FileMode.Open, FileAccess.Write, FileShare.ReadWrite);
+                            writer.Write(replacement);
+                            writer.Flush();
+                            return false;
+                        }
+                        catch (IOException ex) when ((ex.HResult & 0xFFFF) == 32) { return true; }
+                    }).GetAwaiter().GetResult();
+                    Assert("R8: CRC 分块之间的新写入被共享冲突阻止", writeBlocked);
+                    byte[] second = new byte[blockSize];
+                    Assert("R8: 第二分块读取完整", RandomAccess.Read(handle, second, blockSize) == blockSize);
+                    uint mixedCrc = Crc32.Compute(second, Crc32.Compute(first));
+                    Assert("R8: 不会拼出从未存在的 A+B 摘要", mixedCrc != expectedCrc &&
+                        mixedCrc == Crc32.Compute(initial) && Crc32.ComputeHandle(handle) == mixedCrc);
+                    using var reader = new FileStream(full, FileMode.Open, FileAccess.Read, FileShare.Read);
+                    Assert("R8: 摘要期间仍允许其他只读句柄", reader.Length == expected.Length);
+                    Assert("R8: 摘要期间仍阻止文件替换", MoveBlocked(full, full + ".moved", false));
+                }, msg => Assert("R8: 摘要遍历无错误", false, msg), allowWrite: false);
+                Assert("R8: 实际执行分块改写回归", visited);
+            }
+
+            File.WriteAllBytes(file, expected);
+            using (var writer = new FileStream(file, FileMode.Open, FileAccess.Write, FileShare.ReadWrite))
+            {
+                Assert("R8: 结构检查仍支持写共享", DeliveryVerifier.Verify(root, manifest, VerifyMode.Structure).Ok);
+                var denied = DeliveryVerifier.Verify(root, manifest, VerifyMode.StructureAndDigest);
+                Assert("R8: 已有写句柄时摘要检查失败且不计入已校验", !denied.Ok && denied.DigestsChecked == 0 &&
+                    denied.Problems.Any(p => p.Contains("无法打开条目")), denied.Describe());
+            }
+            var good = DeliveryVerifier.Verify(root, manifest, VerifyMode.StructureAndDigest);
+            Assert("R8: 写句柄释放后多分块摘要正常通过", good.Ok && good.DigestsChecked == 1, good.Describe());
+            using (var writer = new FileStream(file, FileMode.Open, FileAccess.Write, FileShare.None))
+                Assert("R8: 校验结束立即释放文件锁", writer.CanWrite);
+
+            // 通过生产完成路径的提交后日志回调，在回收前打开写句柄。
+            // 源包仅为本测试的临时文件，不触碰用户文件。
+            string source = Path.Combine(_testDir, "r8-retain-source.zip");
+            CreateZipStored(source, ("data.bin", "source-content"));
+            var identity = VolumeIdentity.Capture(source)!;
+            Assert("R8: 源包身份有效", identity != null && identity.Valid);
+            var plan = MapPlan(source, root);
+            FileStream? activeWriter = null;
+            try
+            {
+                var result = ExtractionCompleter.Complete(new CompletionRequest
+                {
+                    Plan = plan,
+                    Manifest = manifest,
+                    RecycleRequested = true,
+                    Volumes = new[] { identity! },
+                    PropagateZoneIdentifier = false
+                }, _ =>
+                {
+                    string delivered = Path.Combine(plan.FinalTargetDirectory, "data.bin");
+                    if (activeWriter == null && File.Exists(delivered))
+                        activeWriter = new FileStream(delivered, FileMode.Open, FileAccess.Write, FileShare.ReadWrite);
+                });
+                Assert("R8: 生产路径确实在回收前持有写句柄", activeWriter != null && result.Delivered, result.FailureReason);
+                Assert("R8: 摘要拒绝并发写时不回收源包", result.Recycle != null && !result.Recycle.Success &&
+                    result.Recycle.Message.Contains("摘要复核未通过") && result.Recycle.Items.Count == 0 &&
+                    File.Exists(source), result.Recycle?.Message ?? result.FailureReason);
+            }
+            finally { activeWriter?.Dispose(); }
         }
 
         // 从 Worker finished 消息解析逐卷身份（与 MainWindow 一致：优先 16 字节 file_id 规范表示）

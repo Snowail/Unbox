@@ -237,7 +237,8 @@ namespace UnzipProxy.Core
                     seenFiles.Add(rel);
                     report.TotalBytes += expectedItem.Size;
                 },
-                onProblem: msg => report.Problems.Add(msg));
+                onProblem: msg => report.Problems.Add(msg),
+                allowWrite: mode != VerifyMode.StructureAndDigest);
 
             foreach (var item in manifest.Items)
             {
@@ -266,11 +267,13 @@ namespace UnzipProxy.Core
         /// 最终路径识别入口本身或其祖先是否为联接点/符号链接：真实最终路径会与字面规范路径不一致）。
         /// 返回的句柄用于 <see cref="GetFinalPathName"/> 做归属核对；对文件而言，不授予
         /// FILE_SHARE_DELETE 且请求 GENERIC_READ 才能阻止其在校验期间被改名/替换。
+        /// 摘要校验须将 allowWrite 设为 false：从打开句柄到读完长度与 CRC 均拒绝写共享；
+        /// 已有写句柄时打开失败，新写句柄在释放前也无法打开，避免读到混合快照。
         /// </summary>
-        public static SafeFileHandle? OpenPinnedObject(string path)
+        public static SafeFileHandle? OpenPinnedObject(string path, bool allowWrite = true)
         {
             SafeFileHandle handle = CreateFileW(path, GENERIC_READ,
-                FILE_SHARE_READ | FILE_SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING,
+                FILE_SHARE_READ | (allowWrite ? FILE_SHARE_WRITE : 0), IntPtr.Zero, OPEN_EXISTING,
                 FILE_FLAG_BACKUP_SEMANTICS, IntPtr.Zero);
             if (!handle.IsInvalid) return handle;
             handle.Dispose();
@@ -312,11 +315,12 @@ namespace UnzipProxy.Core
         /// （或被替换的对象）都会触发 onProblem 而不是被静默跟随；即使遍历期间父路径被
         /// 并发换成联接点，句柄解析出的真实路径也会与预期不一致而被拒绝。
         /// onFile 回调期间对象与祖先保持钉住；内容读取使用传入句柄，路径不得延迟使用。
+        /// allowWrite=false 使遍历打开的条目拒绝写共享；默认允许写入以支持来源标记。
         /// </summary>
         public static void WalkVerifiedTree(SafeFileHandle rootHandle, string rootPhysicalPath,
                                             Action<string> onDirectory,
                                             Action<string, string, SafeFileHandle> onFile,
-                                            Action<string> onProblem)
+                                            Action<string> onProblem, bool allowWrite = true)
         {
             var stack = new Stack<(string Physical, SafeFileHandle Handle, bool Exit)>();
             var owned = new HashSet<SafeFileHandle>();
@@ -343,7 +347,7 @@ namespace UnzipProxy.Core
                     foreach (string full in entries)
                     {
                         string rel = RelFrom(rootPhysicalPath, full);
-                        SafeFileHandle? entryHandle = OpenPinnedObject(full);
+                        SafeFileHandle? entryHandle = OpenPinnedObject(full, allowWrite);
                         if (entryHandle == null)
                         {
                             onProblem($"无法打开条目 {rel}");
