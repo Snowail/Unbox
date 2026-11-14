@@ -1,4 +1,4 @@
-# scripts/package_release.ps1: 自动化构建便携绿色发布包 (Framework-Dependent .NET 10 LTS)
+﻿# scripts/package_release.ps1: 自动化构建便携绿色发布包 (Framework-Dependent .NET 10 LTS)
 [CmdletBinding()]
 param(
     [string]$Version = "1.2.0"
