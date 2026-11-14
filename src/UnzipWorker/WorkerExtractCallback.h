@@ -62,6 +62,7 @@ public:
           m_currentIndex(0),
           m_currentIsDir(false)
     {
+        m_disposition.assign(itemToExtract.size(), ItemDisposition::Unseen);
     }
 
     virtual ~WorkerExtractCallback() {
@@ -139,9 +140,11 @@ public:
 
         // 被策略过滤（macOS 辅助文件）或用户主动跳过的条目：不写盘，也不计为失败
         if (index >= m_itemToExtract.size() || !m_itemToExtract[index] || askExtractMode != NExtract::NAskMode::kExtract) {
+            if (index < m_disposition.size()) m_disposition[index] = ItemDisposition::SkippedOrFiltered;
             return S_OK;
         }
         if (index >= m_itemTargetPaths.size()) {
+            if (index < m_disposition.size()) m_disposition[index] = ItemDisposition::SkippedOrFiltered;
             return S_OK;
         }
 
@@ -162,6 +165,7 @@ public:
         if (!PathSanitizer::ResolveAndValidateDestination(m_extractionRoot, relPath, safeFullPath)) {
             // 越界/注入路径：安全跳过并单独计数（不得伪装成“全部已恢复”）
             m_unsafeCount++;
+            if (index < m_disposition.size()) m_disposition[index] = ItemDisposition::UnsafeRejected;
             return S_OK;
         }
 
@@ -170,6 +174,7 @@ public:
             if (!PathSanitizer::EnsureDirectory(m_canonicalRoot, safeFullPath, err)) {
                 m_hasError = true;
                 m_unsafeCount++;
+                if (index < m_disposition.size()) m_disposition[index] = ItemDisposition::UnsafeRejected;
                 return HRESULT_FROM_WIN32(err != ERROR_SUCCESS ? err : ERROR_ACCESS_DENIED);
             }
             m_currentIsDir = true;
@@ -186,6 +191,7 @@ public:
             if (!PathSanitizer::EnsureDirectory(m_canonicalRoot, parentDir, err)) {
                 m_hasError = true;
                 m_unsafeCount++;
+                if (index < m_disposition.size()) m_disposition[index] = ItemDisposition::UnsafeRejected;
                 return HRESULT_FROM_WIN32(err != ERROR_SUCCESS ? err : ERROR_ACCESS_DENIED);
             }
             m_lastCreatedParentDir = parentDir;
@@ -210,6 +216,7 @@ public:
 
         if (!stream) {
             m_hasError = true;
+            if (index < m_disposition.size()) m_disposition[index] = ItemDisposition::Failed;
             return HRESULT_FROM_WIN32(createError != ERROR_SUCCESS ? createError : ERROR_ACCESS_DENIED);
         }
 
@@ -258,6 +265,14 @@ public:
 
         m_currentDiskPath.clear();
         m_currentIsDir = false;
+
+        // 仅当本条目确实被处理（已写出文件或已建目录）时才记录终态；
+        // 跳过/过滤/安全拒绝的条目其终态已在 GetStream 中标记，不得被覆盖。
+        if (hasRecord && m_currentIndex < m_disposition.size()) {
+            m_disposition[m_currentIndex] = (resultEOperationResult == NExtract::NOperationResult::kOK)
+                ? ItemDisposition::Delivered
+                : ItemDisposition::Failed;
+        }
 
         if (resultEOperationResult != NExtract::NOperationResult::kOK) {
             m_hasError = true;
@@ -314,6 +329,23 @@ public:
     uint64_t GetTotalBytes() const { return m_totalBytes; }
     uint64_t GetCompletedBytes() const { return m_completedBytes; }
 
+    // 计划内“应交付但既未落盘、也未计入 unsafe/failed”的条目数量。
+    // 少一项也必须成为 partial/failed 并禁止回收——清单与磁盘一致不足以证明全部计划条目已交付。
+    uint32_t CountMissing() const {
+        uint32_t missing = 0;
+        for (size_t i = 0; i < m_disposition.size(); ++i) {
+            if (i < m_itemToExtract.size() && m_itemToExtract[i]) {
+                ItemDisposition d = m_disposition[i];
+                if (d != ItemDisposition::Delivered &&
+                    d != ItemDisposition::UnsafeRejected &&
+                    d != ItemDisposition::Failed) {
+                    ++missing;
+                }
+            }
+        }
+        return missing;
+    }
+
 private:
     static std::wstring MakeRelativeToRoot(const std::wstring& fullPath, const std::wstring& root) {
         std::wstring normalRoot = root;
@@ -327,6 +359,15 @@ private:
 
     LONG m_refCount;
     IInArchive* m_archive;
+
+    enum class ItemDisposition : uint8_t {
+        Unseen = 0,         // 引擎从未请求该条目的落盘
+        Delivered,          // 已写出（文件）或已建目录
+        UnsafeRejected,     // 路径越界/联接点逃逸等安全拒绝
+        SkippedOrFiltered,  // 策略过滤或用户跳过
+        Failed              // 提取失败（CRC/数据/写盘等）
+    };
+    std::vector<ItemDisposition> m_disposition;
     std::wstring m_extractionRoot;
     std::wstring m_canonicalRoot;
     std::vector<std::wstring> m_itemTargetPaths;

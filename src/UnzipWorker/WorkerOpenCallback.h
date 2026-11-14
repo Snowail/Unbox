@@ -19,6 +19,7 @@ struct VolumeIdentityInfo {
     uint64_t volumeSerial = 0;
     uint64_t fileIdHigh = 0;
     uint64_t fileIdLow = 0;
+    std::string fileIdHex;   // 128 位文件 ID 的原始 16 字节规范表示（Identifier[0..15] 顺序拼接的 hex）
     uint64_t size = 0;
     uint64_t lastWriteTime = 0;
     bool valid = false;
@@ -190,6 +191,14 @@ public:
                              ((uint64_t)idInfo.FileId.Identifier[5] << 40) |
                              ((uint64_t)idInfo.FileId.Identifier[6] << 48) |
                              ((uint64_t)idInfo.FileId.Identifier[7] << 56);
+            // 原始 16 字节规范表示（与 C# 端 FileIdentity 的字节序一致，避免高低 64 位定义相反）
+            static const char hex[] = "0123456789abcdef";
+            out.fileIdHex.reserve(32);
+            for (int i = 0; i < 16; ++i) {
+                uint8_t b = idInfo.FileId.Identifier[i];
+                out.fileIdHex.push_back(hex[b >> 4]);
+                out.fileIdHex.push_back(hex[b & 0xF]);
+            }
         } else {
             ok = false;
         }

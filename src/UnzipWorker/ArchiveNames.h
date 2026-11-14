@@ -7,9 +7,12 @@
 #include <windows.h>
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <string>
 #include <vector>
+
+#include "CryptoUtils.h"
 
 class ArchiveNames {
 public:
@@ -36,7 +39,9 @@ public:
         for (int i = 0; i < 512; ++i) {
             if (hdr[i] != 0) { allZero = false; break; }
         }
-        return allZero;
+        if (allZero) return true;
+        // V7 与早期 TAR 没有 ustar magic：按头校验和判定，不能把一种 magic 当作全部 TAR
+        return TarHeaderChecksumValid(hdr);
     }
 
     // ZIP：解析 EOCD -> 中央目录，逐条读取原始名称与 bit 11 标志
@@ -109,6 +114,17 @@ public:
             e.raw.assign(reinterpret_cast<const char*>(&cd[pos + 46]), nameLen);
             e.declaredUtf8 = (flags & 0x0800) != 0;
             e.isDir = !e.raw.empty() && (e.raw.back() == '/' || e.raw.back() == '\\');
+
+            // 未设置 bit 11 时，检查 0x7075 Unicode Path 扩展字段（PKWARE APPNOTE §4.6.9）：
+            // 名称字段可能只是回退字节，真正的 UTF-8 名称在 extra 字段里，且带原始名称 CRC 校验。
+            if (!e.declaredUtf8 && extraLen > 0 && pos + 46 + nameLen + extraLen <= cd.size()) {
+                uint32_t nameCrc = Crc32Bytes(e.raw.data(), e.raw.size());
+                std::string unicodeName;
+                if (ReadZipUnicodePath(&cd[pos + 46 + nameLen], extraLen, nameCrc, unicodeName)) {
+                    e.raw = unicodeName;
+                    e.declaredUtf8 = true;
+                }
+            }
             out.push_back(e);
 
             pos += 46ull + nameLen + extraLen + commentLen;
@@ -125,6 +141,7 @@ public:
         if (!f) return false;
 
         std::string pendingLongName;
+        bool pendingNameIsUtf8 = false;   // 长名是否来自 PAX path（PAX path 按 POSIX 恒为 UTF-8）
         int zeroBlocks = 0;
 
         for (int guard = 0; guard < 1000000; ++guard) {
@@ -145,21 +162,16 @@ public:
             char type = (char)hdr[156];
             uint64_t size = ParseOctal(hdr + 124, 12);
 
-            if (type == 'L') { // GNU 长名：数据块即完整名称
+            if (type == 'L') { // GNU 长名：数据块即完整名称（原始字节，无字符集声明）
                 std::string name = ReadBlocks(f, size);
                 TrimTrailingNul(name);
                 pendingLongName = name;
+                pendingNameIsUtf8 = false;
                 continue;
             }
-            if (type == 'x' || type == 'X') { // pax 扩展头：寻找 path=
+            if (type == 'x' || type == 'X') { // pax 扩展头：按记录边界解析 path= 与字符集声明
                 std::string data = ReadBlocks(f, size);
-                size_t p = data.find("path=");
-                if (p != std::string::npos) {
-                    size_t begin = p + 5;
-                    size_t end = data.find('\n', begin);
-                    if (end == std::string::npos) end = data.size();
-                    pendingLongName = data.substr(begin, end - begin);
-                }
+                ParsePaxRecords(data, pendingLongName, pendingNameIsUtf8);
                 continue;
             }
             if (type == 'g') { // 全局 pax 头，忽略内容
@@ -168,9 +180,12 @@ public:
             }
 
             std::string name;
+            bool nameIsUtf8 = false;
             if (!pendingLongName.empty()) {
                 name = pendingLongName;
+                nameIsUtf8 = pendingNameIsUtf8;
                 pendingLongName.clear();
+                pendingNameIsUtf8 = false;
             } else {
                 name.assign(reinterpret_cast<const char*>(hdr), 100);
                 TrimTrailingNul(name);
@@ -179,10 +194,10 @@ public:
                 if (!prefix.empty()) name = prefix + "/" + name;
             }
 
-            // TAR 名称按约定使用 UTF-8；此处只记录原始字节，解码在 NameDecoder 中完成
+            // TAR 头部自带的名称无 UTF-8 声明；PAX path 声明为 UTF-8
             RawEntry e;
             e.raw = name;
-            e.declaredUtf8 = false;
+            e.declaredUtf8 = nameIsUtf8;
             e.isDir = (type == '5');
             if (!name.empty()) out.push_back(e);
 
@@ -243,5 +258,74 @@ private:
 
     static void TrimTrailingNul(std::string& s) {
         while (!s.empty() && s.back() == '\0') s.pop_back();
+    }
+
+    static uint32_t Crc32Bytes(const char* data, size_t size) {
+        Crc32Hasher hasher;
+        hasher.Update(data, size);
+        return hasher.GetDigest();
+    }
+
+    // 校验 TAR 头部校验和（offset 148..155，计算时视为 8 个空格），用于识别无 ustar magic 的 V7 TAR
+    static bool TarHeaderChecksumValid(const unsigned char* hdr) {
+        long long stored = (long long)ParseOctal(hdr + 148, 8);
+        long long sum = 0;
+        for (int i = 0; i < 512; ++i) {
+            unsigned char c = (i >= 148 && i < 156) ? (unsigned char)' ' : hdr[i];
+            sum += c;
+        }
+        return sum == stored;
+    }
+
+    // 解析 ZIP 0x7075 Unicode Path 扩展字段（PKWARE APPNOTE §4.6.9）：
+    //   HeaderID(2) + DataSize(2) + Version(1) + NameCRC32(4) + UnicodeName(UTF-8, 以 NUL 结尾)
+    static bool ReadZipUnicodePath(const unsigned char* extra, size_t extraLen, uint32_t nameCrc, std::string& outUtf8) {
+        size_t off = 0;
+        while (off + 4 <= extraLen) {
+            uint16_t id = Le16(extra + off);
+            uint16_t size = Le16(extra + off + 2);
+            off += 4;
+            if (off + size > extraLen) return false;
+            if (id == 0x7075 && size >= 5) {
+                uint8_t version = extra[off];
+                uint32_t crc = Le32(extra + off + 1);
+                std::string name(reinterpret_cast<const char*>(extra + off + 5), (size_t)(size - 5));
+                while (!name.empty() && name.back() == '\0') name.pop_back();
+                if (version == 1 && crc == nameCrc && !name.empty()) {
+                    outUtf8 = name;
+                    return true;
+                }
+            }
+            off += size;
+        }
+        return false;
+    }
+
+    // 按 PAX 记录边界解析扩展头：<长度> <关键字>=<值>\n
+    static void ParsePaxRecords(const std::string& data, std::string& outPath, bool& outPathIsUtf8) {
+        size_t offset = 0;
+        while (offset + 2 <= data.size()) {
+            size_t space = data.find(' ', offset);
+            if (space == std::string::npos) break;
+            std::string lenStr = data.substr(offset, space - offset);
+            char* end = nullptr;
+            unsigned long recordLen = (unsigned long)std::strtoul(lenStr.c_str(), &end, 10);
+            if (end == lenStr.c_str() || recordLen == 0 || offset + recordLen > data.size()) break;
+            const std::string record = data.substr(offset, recordLen);
+            size_t eq = record.find('=');
+            if (eq != std::string::npos && eq > space + 1 - offset) {
+                size_t keyStart = space - offset + 1;
+                std::string key = record.substr(keyStart, eq - keyStart);
+                // 值以 '\n' 结尾，去掉末尾换行
+                size_t valueLen = record.size() - (eq + 1);
+                if (valueLen > 0 && record.back() == '\n') valueLen -= 1;
+                std::string value = record.substr(eq + 1, valueLen);
+                if (key == "path") {
+                    outPath = value;
+                    outPathIsUtf8 = true; // POSIX pax：path 记录值恒为 UTF-8
+                }
+            }
+            offset += recordLen;
+        }
     }
 };

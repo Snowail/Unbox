@@ -262,7 +262,10 @@ namespace UnzipProxy.Core
                 byte[] zoneData = File.ReadAllBytes(zonePath);
                 if (zoneData.Length == 0) return 0;
 
-                foreach (string file in Directory.EnumerateFiles(targetRoot, "*", SearchOption.AllDirectories))
+                // 遍历最终树时拒绝 reparse point，绝不通过联接点/符号链接把来源标记写到暂存区之外。
+                var files = new List<string>();
+                EnumerateFilesNoReparse(targetRoot, files);
+                foreach (string file in files)
                 {
                     try
                     {
@@ -280,6 +283,30 @@ namespace UnzipProxy.Core
                 // 来源标记传递失败不影响主流程
             }
             return marked;
+        }
+
+        private static void EnumerateFilesNoReparse(string dir, List<string> files)
+        {
+            try
+            {
+                foreach (string entry in Directory.EnumerateFileSystemEntries(dir))
+                {
+                    var attributes = File.GetAttributes(entry);
+                    if ((attributes & FileAttributes.ReparsePoint) != 0) continue;
+                    if ((attributes & FileAttributes.Directory) != 0)
+                    {
+                        EnumerateFilesNoReparse(entry, files);
+                    }
+                    else
+                    {
+                        files.Add(entry);
+                    }
+                }
+            }
+            catch
+            {
+                // 单个目录枚举失败不阻断来源标记
+            }
         }
     }
 }

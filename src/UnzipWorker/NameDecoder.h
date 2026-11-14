@@ -100,7 +100,9 @@ public:
 
     // 解码一条归档名称。
     // declaredUtf8=true 表示格式已声明这是 Unicode/UTF-8 名称，必须原样尊重。
-    static Decoded DecodeOne(const std::string& bytes, bool declaredUtf8, uint32_t preferredCp) {
+    // strictCodePage=true 表示用户已显式选择代码页（--cp / 编码选择框 / 记忆偏好），
+    //   对未声明编码的名称严格按该值解码，绝不套用启发式改写。
+    static Decoded DecodeOne(const std::string& bytes, bool declaredUtf8, uint32_t preferredCp, bool strictCodePage = false) {
         Decoded result;
         if (bytes.empty()) return result;
 
@@ -121,20 +123,22 @@ public:
             return result;
         }
 
+        // 用户显式选择：严格按所选代码页解码，预览与落盘共用同一路径
+        if (strictCodePage) {
+            result.name = primary;
+            result.undecodable = !primaryClean;
+            result.ambiguous = !primaryClean;
+            return result;
+        }
+
+        // 自动模式：仅对 3/4 字节 UTF-8 序列（真实 CJK 的最强特征）判定为 UTF-8；
+        // 两字节歧义（GBK 与 UTF-8 互相误判）保持首选代码页，不再猜测。
         if (utf8Valid && hasNonAscii) {
             std::wstring asUtf8 = DecodeBytes(bytes, kUtf8);
-            // 规则 1：存在 3/4 字节 UTF-8 序列，说明这是真实的 UTF-8 名称
             if (HasMultiByteUtf8(bytes)) {
                 result.name = asUtf8;
                 return result;
             }
-            // 规则 2：解出的字符全部落在拉丁扩展区（如 café），基本可判定为 UTF-8
-            if (OnlyLatinSupplement(asUtf8)) {
-                result.name = asUtf8;
-                return result;
-            }
-            // 规则 3：两字节歧义（GBK 与 UTF-8 互相误判都会得到这种形态），
-            // 保持系统首选代码页（与 7-Zip/WinRAR 行为一致），不做启发式改写。
             result.name = primary;
             if (!primaryClean) {
                 result.name = asUtf8;
@@ -180,16 +184,5 @@ public:
             case 437:   return "DOS 英文 (CP437)";
             default:    return "代码页 " + std::to_string(cp);
         }
-    }
-
-private:
-    static bool OnlyLatinSupplement(const std::wstring& s) {
-        bool sawLatin = false;
-        for (wchar_t c : s) {
-            if (c < 0x80) continue;
-            if (c >= 0x00C0 && c <= 0x024F) { sawLatin = true; continue; }
-            return false;
-        }
-        return sawLatin;
     }
 };

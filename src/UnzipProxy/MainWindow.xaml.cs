@@ -240,7 +240,7 @@ namespace UnzipProxy
                     uint codePage = _settings.ArchiveCodePage != 0
                         ? (uint)_settings.ArchiveCodePage
                         : GetACP();
-                    string cpArg = (codePage != 0 && codePage != 65001) ? $" --cp {codePage}" : "";
+                    string cpArg = (codePage != 0) ? $" --cp {codePage}" : "";
 
                     var psi = new ProcessStartInfo
                     {
@@ -840,6 +840,7 @@ namespace UnzipProxy
             int policyFiltered = root.TryGetProperty("policy_filtered_items", out var pf) ? pf.GetInt32() : 0;
             int skippedItems = root.GetProperty("skipped_items").GetInt32();
             int unsafeItems = root.TryGetProperty("unsafe_items", out var ui) ? ui.GetInt32() : 0;
+            int missingItems = root.TryGetProperty("missing_items", out var mi) ? mi.GetInt32() : 0;
             string errorReason = root.TryGetProperty("error_reason", out var er) ? (er.GetString() ?? "") : "";
             bool emptyArchive = root.TryGetProperty("empty_archive", out var ea) && ea.ValueKind == JsonValueKind.True;
             bool manifestOk = !root.TryGetProperty("manifest_ok", out var mo) || mo.ValueKind == JsonValueKind.True;
@@ -939,10 +940,11 @@ namespace UnzipProxy
             if (policyFiltered > 0) notes += $"；已按产品规则过滤 {policyFiltered} 个 macOS 元数据项";
             if (skippedItems > 0) notes += $"；{skippedItems} 项被跳过";
             if (unsafeItems > 0) notes += $"；{unsafeItems} 项因路径不安全被拒绝";
+            if (missingItems > 0) notes += $"；{missingItems} 项未交付（计划条目缺失）";
             if (emptyArchive) notes = "归档为空，已创建空目标目录";
             if (result.ZoneMarked > 0) notes += $"；已为 {result.ZoneMarked} 个文件保留下载来源标记";
 
-            bool partial = status == "partial" || skippedItems > 0 || unsafeItems > 0;
+            bool partial = status == "partial" || skippedItems > 0 || unsafeItems > 0 || missingItems > 0;
             bool recycleProblem = result.Recycle != null && !result.Recycle.Success;
 
             if (partial)
@@ -1007,16 +1009,49 @@ namespace UnzipProxy
             {
                 try
                 {
-                    list.Add(new VolumeIdentity
+                    var identity = new VolumeIdentity
                     {
                         Path = element.TryGetProperty("path", out var p) ? (p.GetString() ?? "") : "",
                         VolumeSerial = element.TryGetProperty("volume", out var v) ? v.GetUInt64() : 0,
-                        FileIdHigh = element.TryGetProperty("file_id_high", out var fh) ? fh.GetUInt64() : 0,
-                        FileIdLow = element.TryGetProperty("file_id_low", out var fl) ? fl.GetUInt64() : 0,
                         Size = element.TryGetProperty("size", out var s) ? s.GetInt64() : 0,
                         LastWriteTime = element.TryGetProperty("mtime", out var m) ? m.GetInt64() : 0,
                         Valid = element.TryGetProperty("valid", out var va) && va.ValueKind == JsonValueKind.True
-                    });
+                    };
+
+                    // 128 位文件 ID 优先使用原始 16 字节的规范表示（Worker 端 file_id 十六进制），
+                    // 避免高低 64 位定义相反；缺少该字段时退回 file_id_high / file_id_low（旧协议兼容）。
+                    if (element.TryGetProperty("file_id", out var fid) && fid.ValueKind == JsonValueKind.String)
+                    {
+                        string hex = fid.GetString() ?? "";
+                        if (hex.Length == 32)
+                        {
+                            try
+                            {
+                                var fileId = Convert.FromHexString(hex);
+                                identity.FileId = fileId;
+                                identity.FileIdHigh = ReadUInt64LittleEndian(fileId, 0);
+                                identity.FileIdLow = ReadUInt64LittleEndian(fileId, 8);
+                            }
+                            catch
+                            {
+                                identity.Valid = false;
+                            }
+                        }
+                        else
+                        {
+                            identity.Valid = false;
+                        }
+                    }
+                    else
+                    {
+                        identity.FileIdHigh = element.TryGetProperty("file_id_high", out var fh) ? fh.GetUInt64() : 0;
+                        identity.FileIdLow = element.TryGetProperty("file_id_low", out var fl) ? fl.GetUInt64() : 0;
+                        var fileId = new byte[16];
+                        WriteUInt64LittleEndian(fileId, 0, identity.FileIdHigh);
+                        WriteUInt64LittleEndian(fileId, 8, identity.FileIdLow);
+                        identity.FileId = fileId;
+                    }
+                    list.Add(identity);
                 }
                 catch
                 {
@@ -1024,6 +1059,18 @@ namespace UnzipProxy
                 }
             }
             return list;
+        }
+
+        private static ulong ReadUInt64LittleEndian(byte[] bytes, int offset)
+        {
+            ulong value = 0;
+            for (int i = 7; i >= 0; i--) value = (value << 8) | bytes[offset + i];
+            return value;
+        }
+
+        private static void WriteUInt64LittleEndian(byte[] bytes, int offset, ulong value)
+        {
+            for (int i = 0; i < 8; i++) bytes[offset + i] = (byte)(value >> (8 * i));
         }
 
         private static bool TryReadRequired(JsonElement root, string name, out string value)

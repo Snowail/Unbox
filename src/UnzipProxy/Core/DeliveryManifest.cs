@@ -135,10 +135,20 @@ namespace UnzipProxy.Core
                     report.Problems.Add($"交付清单包含非法路径：{item.Path}");
                     continue;
                 }
-                if (!expected.TryAdd(normalized, item))
+                if (expected.TryGetValue(normalized, out var existing))
                 {
+                    // 区分“源归档条目”与“最终文件系统节点”：同一实际目录可能因归档内
+                    // 重复声明（如 folder/ 出现两次）而重复出现在清单中，此时应合并；
+                    // 文件重名、大小写冲突、文件/目录类型冲突仍严格拒绝，不能删除重复项检查。
+                    if (existing.IsDirectory && item.IsDirectory &&
+                        string.Equals(existing.Path, item.Path, StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
                     report.Problems.Add($"交付清单包含重复路径：{normalized}");
+                    continue;
                 }
+                expected.Add(normalized, item);
                 // 登记隐式父目录
                 int slash = normalized.LastIndexOf('\\');
                 while (slash > 0)
@@ -172,7 +182,15 @@ namespace UnzipProxy.Core
                 foreach (string entry in entries)
                 {
                     string rel = Rel(deliveryRootAbsolute, entry);
-                    bool isDir = (File.GetAttributes(entry) & FileAttributes.Directory) != 0;
+                    var attributes = File.GetAttributes(entry);
+                    // 交付树不允许出现任何非预期 reparse point（联接点/符号链接），
+                    // 防止通过联接点把最终目录指向暂存区之外。
+                    if ((attributes & FileAttributes.ReparsePoint) != 0)
+                    {
+                        report.Problems.Add($"交付树包含非预期的联接点/符号链接：{rel}");
+                        continue;
+                    }
+                    bool isDir = (attributes & FileAttributes.Directory) != 0;
                     if (isDir)
                     {
                         if (!expectedDirs.Contains(rel))
@@ -243,7 +261,9 @@ namespace UnzipProxy.Core
 
         public static string NormalizeRelative(string relative)
         {
-            string norm = (relative ?? "").Replace('/', '\\').Trim();
+            // 只归一化路径分隔符与目录尾分隔符，绝不删除名称中的有效字符
+            // （合法前导/尾随空格必须逐字保留，例如 " leading.txt"）。
+            string norm = (relative ?? "").Replace('/', '\\');
             while (norm.EndsWith("\\", StringComparison.Ordinal)) norm = norm.Substring(0, norm.Length - 1);
             return norm;
         }

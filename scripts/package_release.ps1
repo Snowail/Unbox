@@ -1,4 +1,4 @@
-﻿# scripts/package_release.ps1: 自动化构建便携绿色发布包 (Framework-Dependent .NET 10 LTS)
+# scripts/package_release.ps1: 自动化构建便携绿色发布包 (Framework-Dependent .NET 10 LTS)
 [CmdletBinding()]
 param(
     [string]$Version = "1.2.0"
@@ -171,7 +171,7 @@ Unbox.exe       : $(Get-Sha256 (Join-Path $binDir "Unbox.exe"))
 UnzipWorker.exe : $(Get-Sha256 (Join-Path $binDir "UnzipWorker.exe"))
 7z.dll          : $(Get-Sha256 (Join-Path $binDir "7z.dll"))
 测试所用组件    : 与本包同目录的 Unbox.exe / UnzipWorker.exe / 7z.dll
-测试结果        : tests/Tester 90 项用例全部通过
+测试结果        : tests/Tester 113 项用例全部通过
 ================================================================
 "@
 Set-Content -Path (Join-Path $pkgDir "构建信息.txt") -Value $buildInfo -Encoding utf8

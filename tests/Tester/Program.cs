@@ -290,6 +290,155 @@ namespace Tester
             TarFile.CreateFromDirectory(sourceDir, tarPath, includeBaseDirectory);
         }
 
+        // 以指定 TAR 格式（V7/ustar/GNU/PAX）写入指定条目，用于覆盖可靠 Unicode 声明与 V7 复合归档
+        static void CreateTarWithEntries(string tarPath, TarEntryFormat format, params (string Name, string Content)[] entries)
+        {
+            if (File.Exists(tarPath)) File.Delete(tarPath);
+            using var fs = File.Create(tarPath);
+            using var writer = new TarWriter(fs, format);
+            foreach (var e in entries)
+            {
+                TarEntry entry = format switch
+                {
+                    TarEntryFormat.V7 => new V7TarEntry(TarEntryType.V7RegularFile, e.Name),
+                    TarEntryFormat.Ustar => new UstarTarEntry(TarEntryType.RegularFile, e.Name),
+                    TarEntryFormat.Gnu => new GnuTarEntry(TarEntryType.RegularFile, e.Name),
+                    _ => new PaxTarEntry(TarEntryType.RegularFile, e.Name),
+                };
+                using var data = new MemoryStream(Encoding.UTF8.GetBytes(e.Content));
+                entry.DataStream = data;
+                writer.WriteEntry(entry);
+            }
+        }
+
+        // 原始 ZIP 写入：支持前导空格名、重复目录条目、0x7075 Unicode Path 扩展字段等 .NET ZipArchive 无法表达的样本
+        static void CreateZipRaw(string path, params (byte[] Name, byte[] Data, ushort Flags, byte[] Extra)[] entries)
+        {
+            using var fs = File.Create(path);
+            using var w = new BinaryWriter(fs);
+            var offsets = new List<uint>();
+            foreach (var e in entries)
+            {
+                offsets.Add((uint)fs.Position);
+                w.Write(0x04034b50u);
+                w.Write((ushort)20);
+                w.Write(e.Flags);
+                w.Write((ushort)0);   // method: stored
+                w.Write((ushort)0);   // time
+                w.Write((ushort)0x21); // date
+                w.Write(Crc32.Compute(e.Data));
+                w.Write((uint)e.Data.Length);
+                w.Write((uint)e.Data.Length);
+                w.Write((ushort)e.Name.Length);
+                w.Write((ushort)e.Extra.Length);
+                w.Write(e.Name);
+                w.Write(e.Extra);
+                w.Write(e.Data);
+            }
+            uint cd = (uint)fs.Position;
+            for (int i = 0; i < entries.Length; i++)
+            {
+                var e = entries[i];
+                w.Write(0x02014b50u);
+                w.Write((ushort)20);
+                w.Write((ushort)20);
+                w.Write(e.Flags);
+                w.Write((ushort)0);
+                w.Write((ushort)0);
+                w.Write((ushort)0x21);
+                w.Write(Crc32.Compute(e.Data));
+                w.Write((uint)e.Data.Length);
+                w.Write((uint)e.Data.Length);
+                w.Write((ushort)e.Name.Length);
+                w.Write((ushort)e.Extra.Length);
+                w.Write((ushort)0);
+                w.Write((ushort)0);
+                w.Write((ushort)0);
+                w.Write(e.Name.Length > 0 && e.Name[^1] == (byte)'/' ? 16u : 0u);
+                w.Write(offsets[i]);
+                w.Write(e.Name);
+                w.Write(e.Extra);
+            }
+            uint size = (uint)fs.Position - cd;
+            w.Write(0x06054b50u);
+            w.Write((ushort)0);
+            w.Write((ushort)0);
+            w.Write((ushort)entries.Length);
+            w.Write((ushort)entries.Length);
+            w.Write(size);
+            w.Write(cd);
+            w.Write((ushort)0);
+        }
+
+        // 创建目录联接点（junction），用于复现 P1-4 目录边界越界
+        static bool CreateJunction(string linkPath, string targetPath)
+        {
+            try
+            {
+                var psi = new ProcessStartInfo("cmd.exe")
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                };
+                psi.ArgumentList.Add("/c");
+                psi.ArgumentList.Add("mklink");
+                psi.ArgumentList.Add("/J");
+                psi.ArgumentList.Add(linkPath);
+                psi.ArgumentList.Add(targetPath);
+                using var proc = Process.Start(psi)!;
+                proc.StandardOutput.ReadToEnd();
+                proc.StandardError.ReadToEnd();
+                proc.WaitForExit();
+                return proc.ExitCode == 0;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        // 从 Worker finished 消息解析逐卷身份（与 MainWindow 一致：优先 16 字节 file_id 规范表示）
+        static List<VolumeIdentity> ParseWorkerVolumes(WorkerRun run)
+        {
+            var list = new List<VolumeIdentity>();
+            if (!run.Finished.HasValue) return list;
+            var root = run.Finished.Value;
+            if (!root.TryGetProperty("volume_identities", out var ids) || ids.ValueKind != JsonValueKind.Array) return list;
+            foreach (var element in ids.EnumerateArray())
+            {
+                var identity = new VolumeIdentity
+                {
+                    Path = element.TryGetProperty("path", out var p) ? (p.GetString() ?? "") : "",
+                    VolumeSerial = element.TryGetProperty("volume", out var v) ? v.GetUInt64() : 0,
+                    Size = element.TryGetProperty("size", out var s) ? s.GetInt64() : 0,
+                    LastWriteTime = element.TryGetProperty("mtime", out var m) ? m.GetInt64() : 0,
+                    Valid = element.TryGetProperty("valid", out var va) && va.ValueKind == JsonValueKind.True
+                };
+                if (element.TryGetProperty("file_id", out var fid) && fid.ValueKind == JsonValueKind.String)
+                {
+                    string hex = fid.GetString() ?? "";
+                    if (hex.Length == 32)
+                    {
+                        try { identity.FileId = Convert.FromHexString(hex); }
+                        catch { identity.Valid = false; }
+                    }
+                    else
+                    {
+                        identity.Valid = false;
+                    }
+                }
+                else
+                {
+                    identity.FileIdHigh = element.TryGetProperty("file_id_high", out var fh) ? fh.GetUInt64() : 0;
+                    identity.FileIdLow = element.TryGetProperty("file_id_low", out var fl) ? fl.GetUInt64() : 0;
+                }
+                list.Add(identity);
+            }
+            return list;
+        }
+
         [STAThread]
         static int Main(string[] args)
         {
@@ -463,15 +612,15 @@ namespace Tester
                 legacyResult.Delivered && File.Exists(Path.Combine(legacyResult.FinalDirectory, "希捷专修", "固件说明.txt")),
                 legacyResult.FailureReason);
 
-            // 未声明编码的 UTF-8 名称（清除 bit 11）
+            // 未声明编码的 UTF-8 名称（清除 bit 11）：在自动模式下由 3 字节 UTF-8 特征识别（不传 --cp）
             string noFlagZip = Path.Combine(_testDir, "utf8_noflag.zip");
             CreateZip(noFlagZip, Encoding.UTF8, (@"图纸\设计说明.txt", "utf8-no-flag"));
             ClearZipUtf8Flags(noFlagZip);
             string noFlagStaging = NewStaging("utf8noflag");
             string noFlagManifest = Path.Combine(_testDir, "manifest_utf8noflag.json");
-            var noFlagRun = RunWorker(noFlagZip, noFlagStaging, noFlagManifest, cp: "936");
+            var noFlagRun = RunWorker(noFlagZip, noFlagStaging, noFlagManifest);
             var noFlagResult = CompleteViaProduction(noFlagZip, noFlagStaging, noFlagManifest, noFlagRun.DeliveryRoot);
-            Assert("编码: 未声明编码的 UTF-8 名称仍能正确解码",
+            Assert("编码: 未声明编码的 UTF-8 名称在自动模式下仍能正确解码",
                 noFlagResult.Delivered && File.Exists(Path.Combine(noFlagResult.FinalDirectory, "图纸", "设计说明.txt")),
                 noFlagResult.FailureReason);
 
@@ -802,6 +951,204 @@ namespace Tester
             {
                 Assert("界面契约: 找到界面源码", false, xamlPath);
             }
+
+            // -------------------------------------------------------------
+            Console.WriteLine("\n>>> [测试 19] P2-2：V7 TAR 裸包与 gzip 复合包");
+            string v7Tar = Path.Combine(_testDir, "v7.tar");
+            CreateTarWithEntries(v7Tar, TarEntryFormat.V7, ("readme.txt", "v7-content"));
+            string v7Staging = NewStaging("v7");
+            string v7Manifest = Path.Combine(_testDir, "manifest_v7.json");
+            var v7Run = RunWorker(v7Tar, v7Staging, v7Manifest, cp: "936");
+            var v7Result = CompleteViaProduction(v7Tar, v7Staging, v7Manifest, v7Run.DeliveryRoot);
+            Assert("V7 TAR: 裸包正确交付正文",
+                v7Result.Delivered && File.Exists(Path.Combine(v7Result.FinalDirectory, "readme.txt")), v7Result.FailureReason);
+
+            string v7Gz = v7Tar + ".gz";
+            CopyGzip(v7Tar, v7Gz, false);
+            string v7gzStaging = NewStaging("v7gz");
+            string v7gzManifest = Path.Combine(_testDir, "manifest_v7gz.json");
+            var v7gzRun = RunWorker(v7Gz, v7gzStaging, v7gzManifest, cp: "936");
+            Assert("V7 TAR: gzip 复合包不再被签名检查误拒绝", v7gzRun.Status == "ok" && v7gzRun.ExitCode == 0,
+                $"status={v7gzRun.Status} exit={v7gzRun.ExitCode} err={v7gzRun.ErrorReason}");
+            var v7gzResult = CompleteViaProduction(v7Gz, v7gzStaging, v7gzManifest, v7gzRun.DeliveryRoot);
+            Assert("V7 TAR: 复合包交付内层正文",
+                v7gzResult.Delivered && File.Exists(Path.Combine(v7gzResult.FinalDirectory, "readme.txt")), v7gzResult.FailureReason);
+
+            // ustar / GNU 裸包也需被识别（有成对 magic，旧代码已支持，此处防回归）
+            string ustarTar = Path.Combine(_testDir, "ustar.tar");
+            CreateTarWithEntries(ustarTar, TarEntryFormat.Ustar, ("u.txt", "ustar-content"));
+            string ustarStaging = NewStaging("ustar");
+            string ustarManifest = Path.Combine(_testDir, "manifest_ustar.json");
+            var ustarRun = RunWorker(ustarTar, ustarStaging, ustarManifest, cp: "936");
+            var ustarResult = CompleteViaProduction(ustarTar, ustarStaging, ustarManifest, ustarRun.DeliveryRoot);
+            Assert("ustar TAR: 裸包正确交付", ustarResult.Delivered && File.Exists(Path.Combine(ustarResult.FinalDirectory, "u.txt")), ustarResult.FailureReason);
+
+            string gnuTar = Path.Combine(_testDir, "gnu.tar");
+            CreateTarWithEntries(gnuTar, TarEntryFormat.Gnu, ("g.txt", "gnu-content"));
+            string gnuStaging = NewStaging("gnu");
+            string gnuManifest = Path.Combine(_testDir, "manifest_gnu.json");
+            var gnuRun = RunWorker(gnuTar, gnuStaging, gnuManifest, cp: "936");
+            var gnuResult = CompleteViaProduction(gnuTar, gnuStaging, gnuManifest, gnuRun.DeliveryRoot);
+            Assert("GNU TAR: 裸包正确交付", gnuResult.Delivered && File.Exists(Path.Combine(gnuResult.FinalDirectory, "g.txt")), gnuResult.FailureReason);
+
+            // -------------------------------------------------------------
+            Console.WriteLine("\n>>> [测试 20] P1-2：ZIP Unicode Path 0x7075 与 PAX UTF-8 声明");
+            byte[] fallbackName = Encoding.UTF8.GetBytes("fallback.txt");
+            byte[] unicodeNameBytes = Encoding.UTF8.GetBytes("图.txt");
+            byte[] unicodeExtra;
+            using (var extraMs = new MemoryStream())
+            using (var extraW = new BinaryWriter(extraMs, Encoding.UTF8, true))
+            {
+                extraW.Write((ushort)0x7075);
+                extraW.Write((ushort)(5 + unicodeNameBytes.Length));
+                extraW.Write((byte)1); // version
+                extraW.Write(Crc32.Compute(fallbackName));
+                extraW.Write(unicodeNameBytes);
+                unicodeExtra = extraMs.ToArray();
+            }
+            string unicodeZip = Path.Combine(_testDir, "unicode_extra.zip");
+            CreateZipRaw(unicodeZip, (fallbackName, Encoding.UTF8.GetBytes("unicode-extra-content"), 0, unicodeExtra));
+            string unicodeStaging = NewStaging("unicode_extra");
+            string unicodeManifest = Path.Combine(_testDir, "manifest_unicode_extra.json");
+            var unicodeRun = RunWorker(unicodeZip, unicodeStaging, unicodeManifest, cp: "936");
+            var unicodeResult = CompleteViaProduction(unicodeZip, unicodeStaging, unicodeManifest, unicodeRun.DeliveryRoot);
+            Assert("Unicode Path: 0x7075 扩展名逐字保留为 图.txt",
+                unicodeResult.Delivered && File.Exists(Path.Combine(unicodeResult.FinalDirectory, "图.txt")), unicodeResult.FailureReason);
+            Assert("Unicode Path: 不再交付回退名 fallback.txt",
+                unicodeResult.Delivered && !File.Exists(Path.Combine(unicodeResult.FinalDirectory, "fallback.txt")));
+
+            string paxGreek = Path.Combine(_testDir, "pax_greek.tar");
+            CreateTarWithEntries(paxGreek, TarEntryFormat.Pax, ("Δ.txt", "greek-content"));
+            string greekStaging = NewStaging("paxgreek");
+            string greekManifest = Path.Combine(_testDir, "manifest_paxgreek.json");
+            var greekRun = RunWorker(paxGreek, greekStaging, greekManifest, cp: "936");
+            var greekResult = CompleteViaProduction(paxGreek, greekStaging, greekManifest, greekRun.DeliveryRoot);
+            Assert("PAX UTF-8: path 记录按 UTF-8 声明解码为 Δ.txt",
+                greekResult.Delivered && File.Exists(Path.Combine(greekResult.FinalDirectory, "Δ.txt")), greekResult.FailureReason);
+
+            // -------------------------------------------------------------
+            Console.WriteLine("\n>>> [测试 21] P1-3：GBK 两字节歧义与显式编码选择");
+            var gbk2 = Encoding.GetEncoding(936);
+            string gbkLatinZip = Path.Combine(_testDir, "gbk_latin.zip");
+            CreateZip(gbkLatinZip, gbk2, ("茅.txt", "gbk-content"));
+            string gbkLatinStaging = NewStaging("gbklatin");
+            string gbkLatinManifest = Path.Combine(_testDir, "manifest_gbklatin.json");
+            var gbkLatinRun = RunWorker(gbkLatinZip, gbkLatinStaging, gbkLatinManifest, cp: "936");
+            var gbkLatinResult = CompleteViaProduction(gbkLatinZip, gbkLatinStaging, gbkLatinManifest, gbkLatinRun.DeliveryRoot);
+            Assert("GBK 两字节歧义: 显式 --cp 936 严格解码为 茅.txt（不再误判 é.txt）",
+                gbkLatinResult.Delivered && File.Exists(Path.Combine(gbkLatinResult.FinalDirectory, "茅.txt")), gbkLatinResult.FailureReason);
+            Assert("GBK 两字节歧义: 不再落盘 é.txt",
+                gbkLatinResult.Delivered && !File.Exists(Path.Combine(gbkLatinResult.FinalDirectory, "é.txt")));
+
+            // 混合声明触发选择框，回答 CP936 后“预览=落盘”且两类名称都正确
+            string gbkChoiceZip = Path.Combine(_testDir, "gbk_choice.zip");
+            CreateZipRaw(gbkChoiceZip,
+                (gbk2.GetBytes("茅.txt"), Encoding.UTF8.GetBytes("gbk-content"), 0, Array.Empty<byte>()),
+                (Encoding.UTF8.GetBytes("图.txt"), Encoding.UTF8.GetBytes("utf8-content"), 0x800, Array.Empty<byte>()));
+            string gbkChoiceStaging = NewStaging("gbkchoice");
+            string gbkChoiceManifest = Path.Combine(_testDir, "manifest_gbkchoice.json");
+            var gbkChoiceRun = RunWorker(gbkChoiceZip, gbkChoiceStaging, gbkChoiceManifest, cp: "936", encodingCp: 936);
+            Assert("编码选择: 混合声明触发选择框", gbkChoiceRun.EncodingOptionsOffered);
+            var gbkChoiceResult = CompleteViaProduction(gbkChoiceZip, gbkChoiceStaging, gbkChoiceManifest, gbkChoiceRun.DeliveryRoot);
+            Assert("编码选择: CP936 后 茅.txt 与 图.txt 同时正确（预览=落盘）",
+                gbkChoiceResult.Delivered && File.Exists(Path.Combine(gbkChoiceResult.FinalDirectory, "茅.txt")) &&
+                File.Exists(Path.Combine(gbkChoiceResult.FinalDirectory, "图.txt")), gbkChoiceResult.FailureReason);
+
+            // -------------------------------------------------------------
+            Console.WriteLine("\n>>> [测试 22] P1-1：内层拒绝项必须传播为 partial 并禁止回收");
+            string longName = string.Join("/", Enumerable.Repeat(new string('a', 35), 17)) + "/payload.txt";
+            string longTar = Path.Combine(_testDir, "long.tar");
+            CreateTarWithEntries(longTar, TarEntryFormat.Pax, ("readme.txt", "short-content"), (longName, "long-content"));
+            string longStaging = NewStaging("long");
+            string longManifest = Path.Combine(_testDir, "manifest_long.json");
+            var longRun = RunWorker(longTar, longStaging, longManifest, cp: "936");
+            Assert("内层拒绝: 直接 TAR 状态为 partial、退出码 11、unsafe>0",
+                longRun.Status == "partial" && longRun.ExitCode == 11 && longRun.Unsafe > 0,
+                $"status={longRun.Status} exit={longRun.ExitCode} unsafe={longRun.Unsafe}");
+
+            string longGz = longTar + ".gz";
+            CopyGzip(longTar, longGz, false);
+            string longGzStaging = NewStaging("longgz");
+            string longGzManifest = Path.Combine(_testDir, "manifest_longgz.json");
+            var longGzRun = RunWorker(longGz, longGzStaging, longGzManifest, cp: "936");
+            Assert("内层拒绝: gzip 复合包状态为 partial、退出码 11、unsafe>0（不再假成功）",
+                longGzRun.Status == "partial" && longGzRun.ExitCode == 11 && longGzRun.Unsafe > 0,
+                $"status={longGzRun.Status} exit={longGzRun.ExitCode} unsafe={longGzRun.Unsafe}");
+            var longGzResult = CompleteViaProduction(longGz, longGzStaging, longGzManifest, longGzRun.DeliveryRoot);
+            Assert("内层拒绝: 正文仍交付、深层缺失项不落盘",
+                longGzResult.Delivered && File.Exists(Path.Combine(longGzResult.FinalDirectory, "readme.txt")) &&
+                !File.Exists(Path.Combine(longGzResult.FinalDirectory, "payload.txt")), longGzResult.FailureReason);
+
+            // -------------------------------------------------------------
+            Console.WriteLine("\n>>> [测试 23] P2-1：Worker→IPC→C# 文件身份链路");
+            string idZip = Path.Combine(_testDir, "identity.zip");
+            CreateZipStored(idZip, ("a.txt", "identity-content"));
+            string idStaging = NewStaging("identity");
+            string idManifest = Path.Combine(_testDir, "manifest_identity.json");
+            var idRun = RunWorker(idZip, idStaging, idManifest, cp: "936");
+            var workerVolumes = ParseWorkerVolumes(idRun);
+            var managedCapture = VolumeIdentity.Capture(idZip);
+            Assert("身份链路: Worker 上报 ok 且逐卷身份存在", idRun.Status == "ok" && workerVolumes.Count == 1,
+                $"status={idRun.Status} volumes={workerVolumes.Count}");
+            Assert("身份链路: Worker 16 字节文件 ID 与托管端捕获一致",
+                workerVolumes.Count == 1 && managedCapture != null && workerVolumes[0].Matches(managedCapture),
+                $"match={workerVolumes.Count == 1 && managedCapture != null && workerVolumes[0].Matches(managedCapture)}");
+
+            // -------------------------------------------------------------
+            Console.WriteLine("\n>>> [测试 24] P2-3 前导空格 与 P2-4 重复目录条目");
+            string spaceZip = Path.Combine(_testDir, "leading_space.zip");
+            CreateZipRaw(spaceZip, (Encoding.UTF8.GetBytes(" leading.txt"), Encoding.UTF8.GetBytes("leading-content"), 0, Array.Empty<byte>()));
+            string spaceStaging = NewStaging("leadingspace");
+            string spaceManifest = Path.Combine(_testDir, "manifest_leadingspace.json");
+            var spaceRun = RunWorker(spaceZip, spaceStaging, spaceManifest, cp: "936");
+            var spaceResult = CompleteViaProduction(spaceZip, spaceStaging, spaceManifest, spaceRun.DeliveryRoot);
+            Assert("前导空格: 合法文件名逐字保留并交付",
+                spaceResult.Delivered && File.Exists(Path.Combine(spaceResult.FinalDirectory, " leading.txt")), spaceResult.FailureReason);
+
+            string dupZip = Path.Combine(_testDir, "duplicate_dirs.zip");
+            CreateZipRaw(dupZip,
+                (Encoding.UTF8.GetBytes("folder/"), Array.Empty<byte>(), 0, Array.Empty<byte>()),
+                (Encoding.UTF8.GetBytes("folder/a.txt"), Encoding.UTF8.GetBytes("a"), 0, Array.Empty<byte>()),
+                (Encoding.UTF8.GetBytes("folder/"), Array.Empty<byte>(), 0, Array.Empty<byte>()),
+                (Encoding.UTF8.GetBytes("folder/b.txt"), Encoding.UTF8.GetBytes("b"), 0, Array.Empty<byte>()));
+            string dupStaging = NewStaging("dupdirs");
+            string dupManifest = Path.Combine(_testDir, "manifest_dupdirs.json");
+            var dupRun = RunWorker(dupZip, dupStaging, dupManifest, cp: "936");
+            var dupResult = CompleteViaProduction(dupZip, dupStaging, dupManifest, dupRun.DeliveryRoot);
+            Assert("重复目录: 同一实际目录重复声明可合并，整包可提交",
+                dupResult.Delivered && File.Exists(Path.Combine(dupResult.FinalDirectory, "folder", "a.txt")) &&
+                File.Exists(Path.Combine(dupResult.FinalDirectory, "folder", "b.txt")), dupResult.FailureReason);
+
+            // -------------------------------------------------------------
+            Console.WriteLine("\n>>> [测试 25] P1-4：已存在联接点必须被拒绝且根外无副作用");
+            string juncDir = Path.Combine(_testDir, "junc");
+            Directory.CreateDirectory(juncDir);
+            string juncZip = Path.Combine(juncDir, "linked_dir.zip");
+            CreateZipRaw(juncZip, (Encoding.UTF8.GetBytes("linked/"), Array.Empty<byte>(), 0, Array.Empty<byte>()));
+            string juncStaging = Path.Combine(juncDir, "staging");
+            Directory.CreateDirectory(juncStaging);
+            string juncExternal = Path.Combine(juncDir, "external");
+            Directory.CreateDirectory(juncExternal);
+            bool linkOk = CreateJunction(Path.Combine(juncStaging, "linked"), juncExternal);
+            Assert("联接点: 预置 junction 成功", linkOk);
+            string juncManifest = Path.Combine(juncDir, "manifest_junc.json");
+            var juncRun = RunWorker(juncZip, juncStaging, juncManifest, cp: "936");
+            Assert("联接点: 仅目录条目被拒绝（退出码非零，不再成功）", juncRun.ExitCode != 0,
+                $"exit={juncRun.ExitCode} status={juncRun.Status}");
+
+            string juncChildZip = Path.Combine(juncDir, "linked_child.zip");
+            CreateZipRaw(juncChildZip, (Encoding.UTF8.GetBytes("linked/child/"), Array.Empty<byte>(), 0, Array.Empty<byte>()));
+            string juncChildStaging = Path.Combine(juncDir, "staging_child");
+            Directory.CreateDirectory(juncChildStaging);
+            string juncChildExternal = Path.Combine(juncDir, "external_child");
+            Directory.CreateDirectory(juncChildExternal);
+            bool linkOk2 = CreateJunction(Path.Combine(juncChildStaging, "linked"), juncChildExternal);
+            Assert("联接点: 预置 junction 成功 (child)", linkOk2);
+            string juncChildManifest = Path.Combine(juncDir, "manifest_juncchild.json");
+            var juncChildRun = RunWorker(juncChildZip, juncChildStaging, juncChildManifest, cp: "936");
+            bool outsideChildCreated = Directory.Exists(Path.Combine(juncChildExternal, "child"));
+            Assert("联接点: 根外不得创建 child 目录", !outsideChildCreated,
+                $"exit={juncChildRun.ExitCode} outsideChildCreated={outsideChildCreated}");
 
             // -------------------------------------------------------------
             Console.WriteLine("\n==================================================");

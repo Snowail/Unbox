@@ -329,7 +329,8 @@ ItemPlan BuildItemPlan(IInArchive* archive,
                        uint32_t numItems,
                        const std::wstring& archivePath,
                        uint32_t codePage,
-                       bool allowAutoSanitize) {
+                       bool allowAutoSanitize,
+                       bool strictCodePage = false) {
     ItemPlan plan;
     plan.targetPaths.assign(numItems, L"");
     plan.toExtract.assign(numItems, false);
@@ -363,7 +364,7 @@ ItemPlan BuildItemPlan(IInArchive* archive,
 
         std::wstring itemPath;
         if (hasRaw && !rawNames[i].raw.empty()) {
-            NameDecoder::Decoded decoded = NameDecoder::DecodeOne(rawNames[i].raw, rawNames[i].declaredUtf8, codePage);
+            NameDecoder::Decoded decoded = NameDecoder::DecodeOne(rawNames[i].raw, rawNames[i].declaredUtf8, codePage, strictCodePage);
             itemPath = decoded.name;
             if (rawNames[i].declaredUtf8) plan.declaredUnicode++;
             else {
@@ -503,6 +504,7 @@ struct InnerExtractResult {
     uint32_t policyFiltered = 0;
     uint32_t skipped = 0;
     uint32_t unsafeItems = 0;
+    uint32_t missingItems = 0;
     uint64_t completedBytes = 0;
 };
 
@@ -529,7 +531,8 @@ InnerExtractResult ExpandInnerArchive(SevenZipLibrary& lib7z,
                                       const std::wstring& stagingDir,
                                       const std::wstring& payloadPath,
                                       uint32_t codePage,
-                                      bool requireTar) {
+                                      bool requireTar,
+                                      bool strictCodePage) {
     InnerExtractResult result;
     std::error_code ec;
 
@@ -610,7 +613,7 @@ InnerExtractResult ExpandInnerArchive(SevenZipLibrary& lib7z,
         return result;
     }
 
-    ItemPlan plan = BuildItemPlan(innerArchive, innerNumItems, payloadPath, codePage, true);
+    ItemPlan plan = BuildItemPlan(innerArchive, innerNumItems, payloadPath, codePage, true, strictCodePage);
     // 内层非法字符直接批量清洗（不再打断用户），并如实计数
     for (uint32_t idx : plan.illegalItems) {
         plan.targetPaths[idx] = PathSanitizer::SanitizeRelativePath(plan.targetPaths[idx]);
@@ -646,7 +649,8 @@ InnerExtractResult ExpandInnerArchive(SevenZipLibrary& lib7z,
 
     result.totalItems = innerNumItems;
     result.policyFiltered = plan.policyFiltered;
-    result.unsafeItems = 0;
+    result.unsafeItems = innerCallback->GetUnsafeCount();
+    result.missingItems = innerCallback->CountMissing();
     result.completedBytes = innerCallback->GetCompletedBytes();
     if (ok) {
         result.items = innerCallback->GetDeliveredItems();
@@ -793,9 +797,10 @@ int wmain(int argc, wchar_t* argv[]) {
     }
 
     uint32_t effectiveCp = userCodePage != 0 ? userCodePage : SevenZipLibrary::GetDefaultArchiveCodePage();
+    bool cpExplicit = (userCodePage != 0);
 
-    // 外层条目计划（尊重归档声明的 Unicode 名称）
-    ItemPlan plan = BuildItemPlan(archive, numItems, archivePath, effectiveCp, true);
+    // 外层条目计划（尊重归档声明的 Unicode 名称；显式编码时严格按该值解码）
+    ItemPlan plan = BuildItemPlan(archive, numItems, archivePath, effectiveCp, true, cpExplicit);
 
     // 名称的编码声明自相矛盾或存在无法解码的名称时，请 Proxy 让用户选择编码
     if (plan.undecodableNames > 0 || (plan.declaredUnicode > 0 && plan.legacyNames > 0)) {
@@ -808,9 +813,12 @@ int wmain(int argc, wchar_t* argv[]) {
             SendIpcMessage("{\"type\":\"canceled\"}");
             return 0;
         }
-        if (chosen != 0 && chosen != effectiveCp) {
+        // 用户一旦显式选择（即使与当前代码页相同）即切换为严格模式并重建计划，
+        // 确保“选择框预览”与“落盘”走同一路径，绝不套用启发式改写覆盖用户选择。
+        if (chosen != 0) {
             effectiveCp = chosen;
-            plan = BuildItemPlan(archive, numItems, archivePath, effectiveCp, true);
+            cpExplicit = true;
+            plan = BuildItemPlan(archive, numItems, archivePath, effectiveCp, true, true);
         }
     }
 
@@ -971,6 +979,7 @@ int wmain(int argc, wchar_t* argv[]) {
     std::vector<DeliveredItemInfo> delivered = callback->GetDeliveredItems();
     uint64_t completedBytes = callback->GetCompletedBytes();
     uint32_t unsafeItems = callback->GetUnsafeCount();
+    uint32_t missingItems = callback->CountMissing();
     bool extractError = callback->HasError();
     bool crcError = callback->HasCrcError();
     bool dataError = callback->HasDataError();
@@ -1001,12 +1010,16 @@ int wmain(int argc, wchar_t* argv[]) {
     if (!hardFailure && outerNeedsInnerCheck) {
         if (delivered.size() == 1 && !delivered[0].isDir) {
             std::wstring payload = delivered[0].diskPath;
-            InnerExtractResult inner = ExpandInnerArchive(lib7z, stagingDir, payload, effectiveCp, outerIsCompoundTar);            if (inner.kind == InnerExtractResult::Kind::Success) {
+            InnerExtractResult inner = ExpandInnerArchive(lib7z, stagingDir, payload, effectiveCp, outerIsCompoundTar, cpExplicit);
+            if (inner.kind == InnerExtractResult::Kind::Success) {
                 delivered = inner.items;
                 totalItems = inner.totalItems;
                 policyFiltered += inner.policyFiltered;
                 completedBytes = inner.completedBytes;
                 deliveryRootName = inner.deliveryRootName;
+                // 内层拒绝/漏项必须累计进外层结果，绝不能被“外层成功”覆盖（P1-1）
+                unsafeItems += inner.unsafeItems;
+                missingItems += inner.missingItems;
                 // 内层完全成功后才删除中间载荷（成功前保留可恢复的中间产物）
                 std::error_code ec;
                 fs::remove(fs::path(payload), ec);
@@ -1051,7 +1064,7 @@ int wmain(int argc, wchar_t* argv[]) {
         manifestOk = WriteDeliveryManifest(manifestPath, deliveryRootName, delivered);
     }
 
-    bool userSkipOrUnsafe = userSkipped || unsafeItems > 0;
+    bool userSkipOrUnsafe = userSkipped || unsafeItems > 0 || missingItems > 0;
     std::string status = hardFailure ? "failed" : (userSkipOrUnsafe ? "partial" : "ok");
 
     uint32_t skippedCount = 0;
@@ -1066,6 +1079,7 @@ int wmain(int argc, wchar_t* argv[]) {
               << ",\"skipped_items\":" << skippedCount
               << ",\"policy_filtered_items\":" << policyFiltered
               << ",\"unsafe_items\":" << unsafeItems
+              << ",\"missing_items\":" << missingItems
               << ",\"failed_items\":" << (hardFailure ? 1 : 0)
               << ",\"completed_bytes\":" << completedBytes
               << ",\"empty_archive\":" << ((delivered.empty() && !hardFailure) ? "true" : "false")
@@ -1085,6 +1099,7 @@ int wmain(int argc, wchar_t* argv[]) {
         if (v > 0) finishMsg << ",";
         finishMsg << "{\"path\":\"" << EscapeJsonString(WideToUtf8(vi.path)) << "\""
                   << ",\"volume\":" << vi.volumeSerial
+                  << ",\"file_id\":\"" << vi.fileIdHex << "\""
                   << ",\"file_id_high\":" << vi.fileIdHigh
                   << ",\"file_id_low\":" << vi.fileIdLow
                   << ",\"size\":" << vi.size

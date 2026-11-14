@@ -165,8 +165,17 @@ public:
     // 校验已打开（或已存在）对象的真实最终路径位于受控根目录之内
     static bool IsUnderCanonicalRoot(const std::wstring& canonicalRoot, const std::wstring& finalPath) {
         if (canonicalRoot.empty() || finalPath.empty()) return false;
-        if (finalPath.size() < canonicalRoot.size()) return false;
-        return _wcsnicmp(finalPath.c_str(), canonicalRoot.c_str(), canonicalRoot.size()) == 0;
+        // 归一化末尾分隔符：GetFinalPathNameByHandleW 返回的目录路径通常不带尾反斜杠，
+        // 而 ResolveCanonicalDirectory 会补上尾反斜杠，两者必须能在“根目录本身”场景下正确比较。
+        std::wstring root = canonicalRoot;
+        while (!root.empty() && root.back() == L'\\') root.pop_back();
+        std::wstring fp = finalPath;
+        while (!fp.empty() && fp.back() == L'\\') fp.pop_back();
+        if (root.empty()) return false;
+        if (fp.size() < root.size()) return false;
+        if (_wcsnicmp(fp.c_str(), root.c_str(), root.size()) != 0) return false;
+        // 边界必须是目录分隔符或完全相等，避免 root 与 root2 这类前缀误判
+        return fp.size() == root.size() || fp[root.size()] == L'\\';
     }
 
     // 打开一个对象并取回其真实最终路径（句柄级绑定，杜绝祖先目录被替换/联接点劫持）
@@ -177,13 +186,23 @@ public:
         return IsUnderCanonicalRoot(canonicalRoot, finalPath);
     }
 
-    // 创建目录（逐级），并对新建出来的目录做句柄级归属验证
+    // 创建目录（逐级），并对每一级（含已存在目录）做句柄级归属验证。
+    // 关键：已有目录也必须验证真实最终路径；创建每一级之前先确认父目录真实对象在根内，
+    // 避免先沿字符串路径创建、再验证导致根外副作用（联接点/符号链接逃逸）。
     static bool EnsureDirectory(const std::wstring& canonicalRoot, const std::wstring& fullPath, DWORD& outError) {
         outError = ERROR_SUCCESS;
         std::error_code ec;
-        if (fs::is_directory(fullPath, ec)) {
-            return true;
+
+        // 1. 最终对象已存在：直接做句柄级验证（这是本轮修复的关键，不再跳过已有目录）
+        if (fs::exists(fullPath, ec)) {
+            if (!fs::is_directory(fullPath, ec)) {
+                outError = ERROR_DIRECTORY;
+                return false;
+            }
+            return VerifyDirectoryUnderRoot(canonicalRoot, fullPath, outError);
         }
+
+        // 2. 找到第一个已存在的祖先，并先验证它（确认父目录真实对象与归属后，才允许在其下创建）
         fs::path p(fullPath);
         std::vector<fs::path> missing;
         fs::path cur = p;
@@ -193,6 +212,13 @@ public:
             if (parent == cur) break;
             cur = parent;
         }
+        if (!cur.empty() && fs::exists(cur, ec)) {
+            if (!VerifyDirectoryUnderRoot(canonicalRoot, cur.wstring(), outError)) {
+                return false;
+            }
+        }
+
+        // 3. 逐级创建，并在每级创建后立即验证（缩小替换窗口，失败时不留下根外副作用）
         for (auto it = missing.rbegin(); it != missing.rend(); ++it) {
             if (!CreateDirectoryW(it->c_str(), nullptr)) {
                 DWORD err = GetLastError();
@@ -201,22 +227,13 @@ public:
                     return false;
                 }
             }
+            if (!VerifyDirectoryUnderRoot(canonicalRoot, it->wstring(), outError)) {
+                return false;
+            }
         }
-        // 句柄级验证：真实最终路径必须落在受控根目录内（拦截联接点/符号链接逃逸）
-        HANDLE h = CreateFileW(fullPath.c_str(), FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
-                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                               OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-        if (h == INVALID_HANDLE_VALUE) {
-            outError = GetLastError();
-            return false;
-        }
-        bool ok = VerifyObjectUnderRoot(h, canonicalRoot);
-        CloseHandle(h);
-        if (!ok) {
-            outError = ERROR_ACCESS_DENIED;
-            return false;
-        }
-        return true;
+
+        // 4. 最终完整路径再做一次句柄级验证
+        return VerifyDirectoryUnderRoot(canonicalRoot, fullPath, outError);
     }
 
     // 批量重命名清洗（D6 默认策略：非法字符替换为 '-'）
@@ -300,6 +317,23 @@ public:
     }
 
 private:
+    // 打开目录句柄并验证其真实最终路径位于受控根目录之内（打开时不解引用重解析点前先取其真实去向）
+    static bool VerifyDirectoryUnderRoot(const std::wstring& canonicalRoot, const std::wstring& dirPath, DWORD& outError) {
+        HANDLE h = CreateFileW(dirPath.c_str(), FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                               OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        if (h == INVALID_HANDLE_VALUE) {
+            outError = GetLastError();
+            return false;
+        }
+        bool ok = VerifyObjectUnderRoot(h, canonicalRoot);
+        CloseHandle(h);
+        if (!ok) {
+            outError = ERROR_ACCESS_DENIED;
+        }
+        return ok;
+    }
+
     static std::wstring FinalPathOfHandle(HANDLE h) {
         std::wstring buffer(MAX_PATH * 4, L'\0');
         for (int attempt = 0; attempt < 4; ++attempt) {
