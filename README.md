@@ -14,7 +14,7 @@
 
 <p>
   <a href="https://github.com/Snowail/Unbox/releases">
-    <img src="https://img.shields.io/badge/Release-v1.2.0-00C853?style=for-the-badge&logo=github&labelColor=000000" alt="Release">
+    <img src="https://img.shields.io/badge/Release-v1.2.1-00C853?style=for-the-badge&logo=github&labelColor=000000" alt="Release">
   </a>
   <a href="https://github.com/Snowail/Unbox">
     <img src="https://img.shields.io/badge/Platform-Windows_11_%7C_10-0078D4?style=for-the-badge&logo=windows&labelColor=000000" alt="Platform">
@@ -223,7 +223,7 @@ Unbox 让解压体验变得像 macOS 的 Archive Utility 一样自然，同时�
 
 ### 1. 下载便携包 (Portable)
 
-直接在 [Releases](https://github.com/Snowail/Unbox/releases) 页面下载最新的 `Unbox-v1.2.0-win-x64.zip`。
+直接在 [Releases](https://github.com/Snowail/Unbox/releases) 页面下载最新的 `Unbox-v1.2.1-win-x64.zip`。
 
 - **免安装**：解压即可使用，支持随身 U 盘便携携带；
 - **现代轻量化部署**：采用 **.NET 10 LTS 框架依赖部署 (Framework-Dependent)**，包体积仅 ~2.6 MB（缩减 95.3%）。系统仅需安装官方 Windows x64 .NET 10 桌面运行时 (Desktop Runtime)。

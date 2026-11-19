@@ -276,7 +276,10 @@ public:
 
         if (resultEOperationResult != NExtract::NOperationResult::kOK) {
             m_hasError = true;
-            if (resultEOperationResult == NExtract::NOperationResult::kCRCError) {
+            if (resultEOperationResult == NExtract::NOperationResult::kWrongPassword) {
+                m_hasWrongPassword = true;
+                return E_ABORT;
+            } else if (resultEOperationResult == NExtract::NOperationResult::kCRCError) {
                 m_hasCrcError = true;
             } else if (resultEOperationResult == NExtract::NOperationResult::kDataError) {
                 m_hasDataError = true;
@@ -322,6 +325,7 @@ public:
 
     const std::vector<DeliveredItemInfo>& GetDeliveredItems() const { return m_deliveredItems; }
     bool HasError() const { return m_hasError; }
+    bool HasWrongPassword() const { return m_hasWrongPassword; }
     bool HasCrcError() const { return m_hasCrcError; }
     bool HasDataError() const { return m_hasDataError; }
     bool HasUnsupportedMethod() const { return m_hasUnsupportedMethod; }
@@ -381,6 +385,7 @@ private:
     std::atomic<uint64_t> m_completedBytes;
     std::atomic<uint32_t> m_unsafeCount;
     bool m_hasError;
+    bool m_hasWrongPassword = false;
     bool m_hasCrcError;
     bool m_hasDataError;
     bool m_hasUnsupportedMethod;

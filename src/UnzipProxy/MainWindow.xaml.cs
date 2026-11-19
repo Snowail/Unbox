@@ -63,8 +63,8 @@ namespace UnzipProxy
         private volatile bool _isUiUpdatePending = false;
         private string _pendingCurrentFile = "";
 
-        // 编码选择状态
-        private uint _pendingPreferredCodePage = 0;
+        private ExtractionPrompt? _activePrompt;
+        private bool _closeRequested;
 
         public MainWindow(string archivePath)
         {
@@ -257,12 +257,14 @@ namespace UnzipProxy
                     };
 
                     _jobManager = new JobObjectManager();
-                    _workerProcess = new Process { StartInfo = psi };
-                    if (!_workerProcess.Start())
+                    var worker = new Process { StartInfo = psi };
+                    if (!worker.Start())
                     {
+                        worker.Dispose();
                         Dispatcher.Invoke(() => TriggerError("启动失败", "无法启动工作进程: " + workerExe));
                         return;
                     }
+                    _workerProcess = worker;
                     if (!_jobManager.AssignProcess(_workerProcess))
                     {
                         Debug.WriteLine("[WARN] Failed to assign worker process to JobObject");
@@ -316,7 +318,8 @@ namespace UnzipProxy
                             Dispatcher.BeginInvoke(DispatcherPriority.Normal, () =>
                             {
                                 _isUiUpdatePending = false;
-                                UpdateProgressUi(_pendingCurrentFile);
+                                if (!_finishedHandled && !_isCompleted)
+                                    UpdateProgressUi(_pendingCurrentFile);
                             });
                         }
                     }
@@ -334,6 +337,8 @@ namespace UnzipProxy
 
         private void HandleWorkerMessage(string type, JsonElement root)
         {
+            if (_finishedHandled || _isCompleted) return;
+
             switch (type)
             {
                 case "init":
@@ -502,28 +507,23 @@ namespace UnzipProxy
                     previewLines.Add($"• 原名: {raw}  ->  建议: {sanitized}");
                 }
             }
-            InvalidItemsListText.Text = string.Join("\n", previewLines);
+            var prompt = CreatePrompt("文件名包含非法字符", "确定应用");
+            prompt.InvalidItemsListText.Text = string.Join("\n", previewLines);
+            prompt.ModalInvalidCharsPanel.Visibility = Visibility.Visible;
+            if (!ShowPrompt(prompt, prompt.RadioBatchRename))
+            {
+                Close();
+                return;
+            }
 
-            ModalTitleText.Text = "文件名包含非法字符";
-            ModalRecycleAlertPanel.Visibility = Visibility.Collapsed;
-            ModalPasswordPanel.Visibility = Visibility.Collapsed;
-            ModalEncodingPanel.Visibility = Visibility.Collapsed;
-            ModalInvalidCharsPanel.Visibility = Visibility.Visible;
-            ModalOverlay.Visibility = Visibility.Visible;
-        }
-
-        private void OnInvalidCharsSubmitClick(object sender, RoutedEventArgs e)
-        {
-            string action = RadioBatchRename.IsChecked == true ? "batch_rename" : "skip";
-
-            if (RememberInvalidCharsCheck.IsChecked == true)
+            string action = prompt.RadioBatchRename.IsChecked == true ? "batch_rename" : "skip";
+            if (prompt.RememberInvalidCharsCheck.IsChecked == true)
             {
                 _settings.InvalidCharsAction = action;
                 _settings.RememberInvalidCharsAction = true;
                 ConfigManager.Save(_settings);
             }
 
-            ModalOverlay.Visibility = Visibility.Collapsed;
             SendWorkerMessage($"{{\"type\":\"invalid_chars_response\",\"action\":\"{action}\"}}");
         }
 
@@ -555,8 +555,6 @@ namespace UnzipProxy
                 return;
             }
 
-            _pendingPreferredCodePage = options[0].CodePage;
-
             // 已有记忆偏好时直接静默回答，不再打断用户
             if (_settings.RememberArchiveCodePage && _settings.ArchiveCodePage != 0)
             {
@@ -564,7 +562,7 @@ namespace UnzipProxy
                 return;
             }
 
-            EncodingOptionsPanel.Children.Clear();
+            var prompt = CreatePrompt("选择文件名编码", "应用并继续");
             bool first = true;
             foreach (var option in options)
             {
@@ -578,8 +576,7 @@ namespace UnzipProxy
                     Margin = new Thickness(0, 0, 0, 4),
                     Foreground = (Brush)Resources["TextForegroundBrush"]
                 };
-                radio.Checked += OnEncodingOptionChecked;
-                EncodingOptionsPanel.Children.Add(radio);
+                prompt.EncodingOptionsPanel.Children.Add(radio);
 
                 if (option.Samples.Count > 0)
                 {
@@ -591,89 +588,67 @@ namespace UnzipProxy
                         TextWrapping = TextWrapping.Wrap,
                         Foreground = (Brush)Resources["SubTextBrush"]
                     };
-                    EncodingOptionsPanel.Children.Add(sampleText);
+                    prompt.EncodingOptionsPanel.Children.Add(sampleText);
                 }
                 first = false;
             }
 
-            RememberEncodingCheck.IsChecked = false;
-            ModalTitleText.Text = "选择文件名编码";
-            ModalRecycleAlertPanel.Visibility = Visibility.Collapsed;
-            ModalPasswordPanel.Visibility = Visibility.Collapsed;
-            ModalInvalidCharsPanel.Visibility = Visibility.Collapsed;
-            ModalEncodingPanel.Visibility = Visibility.Visible;
-            ModalOverlay.Visibility = Visibility.Visible;
-        }
-
-        private void OnEncodingOptionChecked(object sender, RoutedEventArgs e)
-        {
-            if (sender is RadioButton { Tag: uint cp })
+            prompt.ModalEncodingPanel.Visibility = Visibility.Visible;
+            if (!ShowPrompt(prompt, prompt.EncodingOptionsPanel.Children[0]))
             {
-                _pendingPreferredCodePage = cp;
-            }
-        }
-
-        private void OnEncodingSubmitClick(object sender, RoutedEventArgs e)
-        {
-            uint selected = _pendingPreferredCodePage;
-            foreach (var child in EncodingOptionsPanel.Children)
-            {
-                if (child is RadioButton { IsChecked: true, Tag: uint cp })
-                {
-                    selected = cp;
-                    break;
-                }
+                Close();
+                return;
             }
 
-            if (RememberEncodingCheck.IsChecked == true && selected != 0)
+            uint selected = (uint)prompt.EncodingOptionsPanel.Children.OfType<RadioButton>()
+                .First(radio => radio.IsChecked == true).Tag;
+            if (prompt.RememberEncodingCheck.IsChecked == true && selected != 0)
             {
                 _settings.ArchiveCodePage = (int)selected;
                 _settings.RememberArchiveCodePage = true;
                 ConfigManager.Save(_settings);
             }
 
-            ModalOverlay.Visibility = Visibility.Collapsed;
             SendWorkerMessage($"{{\"type\":\"encoding_response\",\"cp\":{selected}}}");
         }
 
-        // 密码弹窗
         private void ShowPasswordDialog()
         {
-            ModalTitleText.Text = "输入密码";
-            ModalRecycleAlertPanel.Visibility = Visibility.Collapsed;
-            ModalInvalidCharsPanel.Visibility = Visibility.Collapsed;
-            ModalEncodingPanel.Visibility = Visibility.Collapsed;
-            ModalPasswordPanel.Visibility = Visibility.Visible;
-            PasswordInputBox.Password = "";
-            ModalOverlay.Visibility = Visibility.Visible;
-            PasswordInputBox.Focus();
-        }
-
-        private void OnPasswordSubmitClick(object sender, RoutedEventArgs e)
-        {
-            string pwd = PasswordInputBox.Password;
-            ModalOverlay.Visibility = Visibility.Collapsed;
-            var payload = new { type = "password_response", password = pwd };
-            SendWorkerMessage(JsonSerializer.Serialize(payload));
-        }
-
-        private void OnPasswordCancelClick(object sender, RoutedEventArgs e)
-        {
-            ModalOverlay.Visibility = Visibility.Collapsed;
-            var payload = new { type = "password_response", canceled = true };
-            SendWorkerMessage(JsonSerializer.Serialize(payload));
-            OnCancelClick(sender, e);
-        }
-
-        private void OnPasswordInputKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
-        {
-            if (e.Key == System.Windows.Input.Key.Enter)
+            var prompt = CreatePrompt("输入密码", "确定");
+            prompt.ModalPasswordPanel.Visibility = Visibility.Visible;
+            if (!ShowPrompt(prompt, prompt.PasswordInputBox))
             {
-                OnPasswordSubmitClick(sender, new RoutedEventArgs());
+                SendWorkerMessage("{\"type\":\"password_response\",\"canceled\":true}");
+                Close();
+                return;
             }
-            else if (e.Key == System.Windows.Input.Key.Escape)
+
+            var payload = new { type = "password_response", password = prompt.PasswordInputBox.Password };
+            prompt.PasswordInputBox.Clear();
+            SendWorkerMessage(JsonSerializer.Serialize(payload));
+        }
+
+        private ExtractionPrompt CreatePrompt(string title, string submit)
+        {
+            var prompt = new ExtractionPrompt { Owner = (Window?)_activePrompt ?? this, Title = title };
+            prompt.Resources.MergedDictionaries.Add(Resources);
+            prompt.Foreground = (Brush)Resources["TextForegroundBrush"];
+            prompt.SubmitButton.Content = submit;
+            return prompt;
+        }
+
+        private bool ShowPrompt(ExtractionPrompt prompt, UIElement initialFocus)
+        {
+            var previous = _activePrompt;
+            _activePrompt = prompt;
+            prompt.ContentRendered += (_, _) => initialFocus.Focus();
+            try
             {
-                OnPasswordCancelClick(sender, new RoutedEventArgs());
+                return prompt.ShowDialog() == true;
+            }
+            finally
+            {
+                _activePrompt = previous;
             }
         }
 
@@ -682,26 +657,19 @@ namespace UnzipProxy
         {
             if (RecycleCheckBox.IsChecked == true)
             {
-                ModalTitleText.Text = "移入回收站提示";
-                ModalInvalidCharsPanel.Visibility = Visibility.Collapsed;
-                ModalPasswordPanel.Visibility = Visibility.Collapsed;
-                ModalEncodingPanel.Visibility = Visibility.Collapsed;
-                ModalRecycleAlertPanel.Visibility = Visibility.Visible;
-                ModalOverlay.Visibility = Visibility.Visible;
+                RecycleCheckBox.IsChecked = false;
+                var prompt = CreatePrompt("移入回收站提示", "我知道了");
+                prompt.ModalRecycleAlertPanel.Visibility = Visibility.Visible;
+                RecycleCheckBox.IsChecked = ShowPrompt(prompt, prompt.SubmitButton);
             }
             _settings.RecycleOnSuccess = RecycleCheckBox.IsChecked == true;
             ConfigManager.Save(_settings);
         }
 
-        private void OnRecycleAlertAckClick(object sender, RoutedEventArgs e)
-        {
-            ModalOverlay.Visibility = Visibility.Collapsed;
-        }
-
         // 暂停 / 继续
         private void OnPauseResumeClick(object sender, RoutedEventArgs e)
         {
-            if (_isCompleted) return;
+            if (_finishedHandled || _isCompleted) return;
 
             if (!_isPaused)
             {
@@ -729,12 +697,6 @@ namespace UnzipProxy
         // 取消 / 关闭
         private void OnCancelClick(object sender, RoutedEventArgs e)
         {
-            if (!_isCompleted)
-            {
-                SendWorkerMessage("{\"type\":\"cancel\"}");
-                StopWorkerAndCleanup();
-                _isCompleted = true;
-            }
             Close();
         }
 
@@ -751,11 +713,11 @@ namespace UnzipProxy
                     if (!_workerProcess.WaitForExit(3000))
                     {
                         _workerProcess.Kill();
-                        _workerProcess.WaitForExit(2000);
+                        if (!_workerProcess.WaitForExit(2000)) return;
                     }
                 }
             }
-            catch { }
+            catch { return; }
 
             if (_plan != null)
             {
@@ -786,7 +748,7 @@ namespace UnzipProxy
             double targetExpandedHeight = _isDetailsExpanded ? ExpandedDetailsHeight : 0.0;
             double targetExpandedOpacity = _isDetailsExpanded ? 1.0 : 0.0;
             double targetCollapsedHeight = _isDetailsExpanded ? 0.0 : 12.0;
-            double targetCollapsedOpacity = _isDetailsExpanded ? 1.0 : 0.0;
+            double targetCollapsedOpacity = _isDetailsExpanded ? 0.0 : 1.0;
 
             if (_isDetailsExpanded)
             {
@@ -820,103 +782,108 @@ namespace UnzipProxy
         {
             if (_finishedHandled) return;
             _finishedHandled = true;
-            _isCompleted = true;
             _speedTimer.Stop();
+            PauseResumeButton.IsEnabled = false;
+            RecycleCheckBox.IsEnabled = false;
+            MainStatusText.Text = "正在校验和交付…";
 
-            // 必需字段一律不得缺省；缺失即视为失败，绝不默认成功
+            bool autoClose = false;
+            try
+            {
+                autoClose = await FinalizeExtractionAsync(root);
+            }
+            catch (Exception ex)
+            {
+                FailWithoutCommit("完成处理异常，已保留源包和可用的暂存内容：" + ex.Message, true);
+            }
+            finally
+            {
+                CleanupManifest();
+                _isCompleted = true;
+            }
+
+            if (_closeRequested)
+            {
+                Close();
+            }
+            else if (autoClose)
+            {
+                await Task.Delay(800);
+                if (IsVisible) Close();
+            }
+        }
+
+        private async Task<bool> FinalizeExtractionAsync(JsonElement root)
+        {
+            var worker = _workerProcess;
+            bool workerExited = worker != null && (worker.HasExited ||
+                await Task.Run(() => worker.WaitForExit(15000)));
+            if (!workerExited && worker != null)
+            {
+                SendWorkerMessage("{\"type\":\"cancel\"}");
+                await Task.Run(StopWorkerAndCleanup);
+            }
+            int exitCode = workerExited ? worker!.ExitCode : -1;
+
+            // 等待 Worker 退出后才验证完成帧，失败路径也不会与 Worker 同时清理暂存区。
             if (!TryReadRequired(root, "status", out string status) ||
                 !TryReadRequired(root, "manifest", out string manifestPath) ||
                 !TryReadRequired(root, "delivery_root", out string deliveryRoot) ||
-                !root.TryGetProperty("total_items", out _) ||
-                !root.TryGetProperty("extracted_items", out _) ||
-                !root.TryGetProperty("skipped_items", out _) ||
-                !root.TryGetProperty("completed_bytes", out _))
+                !TryReadRequired(root, "error_reason", out string errorReason) ||
+                !root.TryGetProperty("total_items", out var total) || !total.TryGetUInt32(out _) ||
+                !root.TryGetProperty("extracted_items", out var extracted) || !extracted.TryGetUInt32(out _) ||
+                !root.TryGetProperty("skipped_items", out var skipped) || !skipped.TryGetUInt32(out uint skippedItems) ||
+                !root.TryGetProperty("completed_bytes", out var bytes) || !bytes.TryGetUInt64(out _))
             {
                 FailWithoutCommit("Worker 完成消息不完整，已中止交付并保留源包。", true);
-                return;
+                return false;
             }
 
-            int policyFiltered = root.TryGetProperty("policy_filtered_items", out var pf) ? pf.GetInt32() : 0;
-            int skippedItems = root.GetProperty("skipped_items").GetInt32();
-            int unsafeItems = root.TryGetProperty("unsafe_items", out var ui) ? ui.GetInt32() : 0;
-            int missingItems = root.TryGetProperty("missing_items", out var mi) ? mi.GetInt32() : 0;
-            string errorReason = root.TryGetProperty("error_reason", out var er) ? (er.GetString() ?? "") : "";
-            bool emptyArchive = root.TryGetProperty("empty_archive", out var ea) && ea.ValueKind == JsonValueKind.True;
-            bool manifestOk = !root.TryGetProperty("manifest_ok", out var mo) || mo.ValueKind == JsonValueKind.True;
-
-            var volumes = ParseVolumeIdentities(root);
-
-            // 等待工作进程彻底退出并获取退出码
-            bool workerExited = false;
-            if (_workerProcess != null)
+            bool manifestOk = root.TryGetProperty("manifest_ok", out var mo) && mo.ValueKind == JsonValueKind.True;
+            bool exitMatches = status switch
             {
-                if (!_workerProcess.HasExited)
-                {
-                    workerExited = await Task.Run(() => _workerProcess.WaitForExit(15000));
-                }
-                else
-                {
-                    workerExited = true;
-                }
-            }
-            if (!workerExited && _workerProcess != null)
-            {
-                try { _workerProcess.Kill(); } catch { }
-            }
-            int exitCode = (workerExited && _workerProcess != null) ? _workerProcess.ExitCode : -1;
-
-            // 硬失败：状态、退出码、错误原因、清单任何一项异常都不得提交
-            bool hardFailure = status == "failed"
-                               || !string.IsNullOrEmpty(errorReason)
-                               || !manifestOk
-                               || !workerExited;
-            if (status == "ok" && exitCode != 0) hardFailure = true;
-            if (status == "partial" && exitCode != 0 && exitCode != 11) hardFailure = true;
-
-            if (hardFailure)
-            {
-                FailWithoutCommit(DescribeFailure(errorReason, exitCode, status), false);
-                CleanupManifest();
-                return;
-            }
-
-            // 读取交付清单并做逐项对账 + 提交（在后台线程执行，避免阻塞 UI）
-            DeliveryManifest manifest;
-            try
-            {
-                manifest = DeliveryManifest.Load(manifestPath);
-            }
-            catch (Exception ex)
-            {
-                FailWithoutCommit("无法读取交付清单，已中止交付并保留源包：" + ex.Message, true);
-                CleanupManifest();
-                return;
-            }
-
-            bool recycleRequested = RecycleCheckBox.IsChecked == true && status == "ok";
-            var request = new CompletionRequest
-            {
-                Plan = _plan!,
-                DeliveryRootRelative = deliveryRoot,
-                Manifest = manifest,
-                RecycleRequested = recycleRequested,
-                Volumes = volumes,
-                PropagateZoneIdentifier = true
+                "ok" => exitCode == 0,
+                "partial" => exitCode is 0 or 11,
+                _ => false
             };
 
-            CompletionResult result;
-            try
+            if (!workerExited || !exitMatches || !manifestOk || errorReason.Length != 0)
             {
-                result = await Task.Run(() => ExtractionCompleter.Complete(request));
-            }
-            catch (Exception ex)
-            {
-                FailWithoutCommit("完成处理异常，已保留暂存目录：" + ex.Message, true);
-                CleanupManifest();
-                return;
+                FailWithoutCommit(DescribeFailure(errorReason, exitCode, status), !workerExited);
+                return false;
             }
 
-            CleanupManifest();
+            if (!string.Equals(manifestPath, _manifestPath, StringComparison.OrdinalIgnoreCase))
+            {
+                FailWithoutCommit("Worker 返回的交付清单路径与本次任务不符，已保留源包。", true);
+                return false;
+            }
+
+            uint policyFiltered = root.TryGetProperty("policy_filtered_items", out var pf) ? pf.GetUInt32() : 0;
+            uint unsafeItems = root.TryGetProperty("unsafe_items", out var ui) ? ui.GetUInt32() : 0;
+            uint missingItems = root.TryGetProperty("missing_items", out var mi) ? mi.GetUInt32() : 0;
+            bool emptyArchive = root.TryGetProperty("empty_archive", out var ea) && ea.ValueKind == JsonValueKind.True;
+            bool partial = status == "partial" || skippedItems > 0 || unsafeItems > 0 || missingItems > 0;
+            bool recycleRequested = RecycleCheckBox.IsChecked == true && !partial;
+            var volumes = ParseVolumeIdentities(root);
+            var plan = _plan!;
+
+            CompletionResult result = await Task.Run(() =>
+            {
+                var manifest = DeliveryManifest.Load(manifestPath);
+                if (!string.Equals(manifest.DeliveryRootRelative, deliveryRoot, StringComparison.Ordinal))
+                    throw new InvalidDataException("交付清单与完成消息的交付根不一致");
+
+                return ExtractionCompleter.Complete(new CompletionRequest
+                {
+                    Plan = plan,
+                    DeliveryRootRelative = deliveryRoot,
+                    Manifest = manifest,
+                    RecycleRequested = recycleRequested,
+                    Volumes = volumes,
+                    PropagateZoneIdentifier = true
+                });
+            });
 
             if (!result.Delivered)
             {
@@ -926,7 +893,7 @@ namespace UnzipProxy
                     detail += $"\n暂存目录已保留以便恢复：{result.KeptStagingDirectory}";
                 }
                 FailWithoutCommit(detail, result.KeptStagingDirectory.Length > 0);
-                return;
+                return false;
             }
 
             // 交付成功
@@ -943,7 +910,6 @@ namespace UnzipProxy
             if (emptyArchive) notes = "归档为空，已创建空目标目录";
             if (result.ZoneMarked > 0) notes += $"；已为 {result.ZoneMarked} 个文件保留下载来源标记";
 
-            bool partial = status == "partial" || skippedItems > 0 || unsafeItems > 0 || missingItems > 0;
             bool recycleProblem = result.Recycle != null && !result.Recycle.Success;
 
             if (partial)
@@ -956,7 +922,7 @@ namespace UnzipProxy
                 RunningActionPanel.Visibility = Visibility.Collapsed;
                 FinishedActionPanel.Visibility = Visibility.Visible;
                 SystemEffects.PlayFinishedSound();
-                return;
+                return false;
             }
 
             if (recycleProblem)
@@ -970,7 +936,7 @@ namespace UnzipProxy
                 RunningActionPanel.Visibility = Visibility.Collapsed;
                 FinishedActionPanel.Visibility = Visibility.Visible;
                 SystemEffects.PlayFinishedSound();
-                return;
+                return false;
             }
 
             TitleText.Text = "已完成 100%";
@@ -986,8 +952,7 @@ namespace UnzipProxy
 
             SystemEffects.PlayFinishedSound();
 
-            await Task.Delay(800);
-            Close();
+            return true;
         }
 
         private static string DescribeRecycleItems(RecycleResult recycle)
@@ -1105,6 +1070,8 @@ namespace UnzipProxy
         {
             switch (errorReason)
             {
+                case "wrong_password":
+                    return "解压失败：归档中至少有一个条目的密码不匹配，源压缩包已保留。";
                 case "crc_error":
                     return "解压失败：文件数据校验 (CRC) 错误，已放弃交付，源压缩包已保留。";
                 case "data_error":
@@ -1174,11 +1141,19 @@ namespace UnzipProxy
 
         private void OnWindowClosing(object? sender, System.ComponentModel.CancelEventArgs e)
         {
+            if (_finishedHandled && !_isCompleted)
+            {
+                _closeRequested = true;
+                e.Cancel = true;
+                return;
+            }
+
             _speedTimer.Stop();
             if (!_isCompleted)
             {
                 SendWorkerMessage("{\"type\":\"cancel\"}");
                 StopWorkerAndCleanup();
+                _isCompleted = true;
             }
             _jobManager?.Dispose();
         }

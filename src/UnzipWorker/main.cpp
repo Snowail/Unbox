@@ -202,6 +202,7 @@ std::condition_variable g_pauseCv;
 std::mutex g_inputMutex;
 std::condition_variable g_inputCv;
 
+bool g_passwordRequestPending = false;
 bool g_hasPasswordResponse = false;
 std::wstring g_receivedPassword;
 
@@ -211,6 +212,16 @@ std::unordered_map<uint32_t, std::wstring> g_customNames;
 
 bool g_hasEncodingResponse = false;
 uint32_t g_chosenCodePage = 0;
+
+void CancelExtraction() {
+    {
+        std::scoped_lock lock(g_pauseMutex, g_inputMutex);
+        g_isCanceled = true;
+        g_isPaused = false;
+    }
+    g_pauseCv.notify_all();
+    g_inputCv.notify_all();
+}
 
 void ProcessIpcInputLine(const std::string& line) {
     if (line.find("\"type\":\"pause\"") != std::string::npos) {
@@ -224,20 +235,16 @@ void ProcessIpcInputLine(const std::string& line) {
         g_pauseCv.notify_all();
         SendIpcMessage("{\"type\":\"resumed_ack\"}");
     } else if (line.find("\"type\":\"cancel\"") != std::string::npos) {
-        g_isCanceled = true;
-        {
-            std::lock_guard<std::mutex> lock(g_pauseMutex);
-            g_isPaused = false;
-        }
-        g_pauseCv.notify_all();
-        g_inputCv.notify_all();
+        CancelExtraction();
     } else if (line.find("\"type\":\"password_response\"") != std::string::npos) {
         if (line.find("\"canceled\":true") != std::string::npos) {
-            g_isCanceled = true;
+            CancelExtraction();
+            return;
         }
         std::string pwd = ExtractJsonStringField(line, "password");
         {
             std::lock_guard<std::mutex> lock(g_inputMutex);
+            if (!g_passwordRequestPending || g_hasPasswordResponse) return;
             g_receivedPassword = Utf8ToWide(pwd);
             g_hasPasswordResponse = true;
         }
@@ -287,22 +294,35 @@ bool CheckPauseOrCancel() {
     return true;
 }
 
-std::wstring RequestPasswordFromProxy(bool* outCanceled = nullptr) {
-    {
-        std::lock_guard<std::mutex> lock(g_inputMutex);
-        g_hasPasswordResponse = false;
-        g_receivedPassword.clear();
+// One credential per archive attempt, shared by the open and extract callbacks.
+class ArchivePassword {
+public:
+    std::wstring Get(bool* outCanceled) {
+        std::lock_guard<std::mutex> passwordLock(m_mutex);
+        if (!g_isCanceled && !m_hasPassword) {
+            std::unique_lock<std::mutex> inputLock(g_inputMutex);
+            if (!g_isCanceled) {
+                g_passwordRequestPending = true;
+                g_hasPasswordResponse = false;
+                SendIpcMessage("{\"type\":\"password_request\"}");
+                g_inputCv.wait(inputLock, []() { return g_hasPasswordResponse || g_isCanceled; });
+                g_passwordRequestPending = false;
+                if (!g_isCanceled) {
+                    m_password.swap(g_receivedPassword);
+                    m_hasPassword = true;
+                }
+                g_receivedPassword.clear();
+            }
+        }
+        *outCanceled = g_isCanceled;
+        return *outCanceled ? L"" : m_password;
     }
-    SendIpcMessage("{\"type\":\"password_request\"}");
-    std::unique_lock<std::mutex> lock(g_inputMutex);
-    g_inputCv.wait(lock, []() { return g_hasPasswordResponse || g_isCanceled; });
-    if (g_isCanceled) {
-        if (outCanceled) *outCanceled = true;
-        return L"";
-    }
-    if (outCanceled) *outCanceled = false;
-    return g_receivedPassword;
-}
+
+private:
+    std::mutex m_mutex;
+    bool m_hasPassword = false;
+    std::wstring m_password;
+};
 
 // ---------------------------------------------------------------------------
 // 条目计划（解码后的名称、过滤与跳过决策）
@@ -562,15 +582,15 @@ InnerExtractResult ExpandInnerArchive(SevenZipLibrary& lib7z,
         return result;
     }
 
-    WorkerOpenCallback* innerOpenCallback = new WorkerOpenCallback(payloadPath, [](bool* outCanceled) {
-        return RequestPasswordFromProxy(outCanceled);
-    });
+    ArchivePassword innerPassword;
+    auto requestPassword = [&innerPassword](bool* outCanceled) { return innerPassword.Get(outCanceled); };
+    WorkerOpenCallback* innerOpenCallback = new WorkerOpenCallback(payloadPath, requestPassword);
 
     IInArchive* innerArchive = nullptr;
     if (!lib7z.DetectAndCreateArchive(innerStream, ext, &innerArchive, innerOpenCallback, codePage) || !innerArchive) {
         innerOpenCallback->Release();
         innerStream->Release();
-        result.kind = InnerExtractResult::Kind::Failed;
+        result.kind = g_isCanceled ? InnerExtractResult::Kind::Canceled : InnerExtractResult::Kind::Failed;
         result.errorReason = "unrecognized_or_corrupted_inner_archive";
         return result;
     }
@@ -631,7 +651,7 @@ InnerExtractResult ExpandInnerArchive(SevenZipLibrary& lib7z,
         plan.targetPaths,
         plan.toExtract,
         MakeProgressCallback("inner"),
-        [](bool* outCanceled) { return RequestPasswordFromProxy(outCanceled); },
+        requestPassword,
         CheckPauseOrCancel,
         &innerBudget
     );
@@ -640,7 +660,8 @@ InnerExtractResult ExpandInnerArchive(SevenZipLibrary& lib7z,
     HRESULT hr = innerArchive->Extract(nullptr, (uint32_t)-1, false, innerCallback);
 
     bool ok = SUCCEEDED(hr) && !innerCallback->HasError() && !innerBudget.Exceeded();
-    if (innerCallback->HasCrcError()) result.errorReason = "crc_error";
+    if (innerCallback->HasWrongPassword()) result.errorReason = "wrong_password";
+    else if (innerCallback->HasCrcError()) result.errorReason = "crc_error";
     else if (innerCallback->HasDataError()) result.errorReason = "data_error";
     else if (innerCallback->HasUnsupportedMethod()) result.errorReason = "unsupported_method";
     else if (innerCallback->HasError()) result.errorReason = "extract_error";
@@ -773,15 +794,19 @@ int wmain(int argc, wchar_t* argv[]) {
         return 3;
     }
 
-    WorkerOpenCallback* openCallback = new WorkerOpenCallback(archivePath, [](bool* outCanceled) {
-        return RequestPasswordFromProxy(outCanceled);
-    });
+    ArchivePassword archivePassword;
+    auto requestPassword = [&archivePassword](bool* outCanceled) { return archivePassword.Get(outCanceled); };
+    WorkerOpenCallback* openCallback = new WorkerOpenCallback(archivePath, requestPassword);
 
     std::wstring ext = fs::path(archivePath).extension().wstring();
     IInArchive* archive = nullptr;
     if (!lib7z.DetectAndCreateArchive(inStream, ext, &archive, openCallback, userCodePage) || !archive) {
         openCallback->Release();
         inStream->Release();
+        if (g_isCanceled) {
+            SendIpcMessage("{\"type\":\"canceled\"}");
+            return 0;
+        }
         SendIpcMessage("{\"type\":\"error\",\"message\":\"Unsupported or unrecognized archive format or incorrect password\"}");
         return 4;
     }
@@ -952,7 +977,7 @@ int wmain(int argc, wchar_t* argv[]) {
         plan.targetPaths,
         plan.toExtract,
         MakeProgressCallback("outer"),
-        [](bool* outCanceled) { return RequestPasswordFromProxy(outCanceled); },
+        requestPassword,
         CheckPauseOrCancel,
         &budget
     );
@@ -960,7 +985,7 @@ int wmain(int argc, wchar_t* argv[]) {
 
     HRESULT hr = archive->Extract(nullptr, (uint32_t)-1, false, callback);
 
-    if (FAILED(hr) || g_isCanceled) {
+    if ((FAILED(hr) && !callback->HasWrongPassword()) || g_isCanceled) {
         uint64_t completedBytes = callback->GetCompletedBytes();
         callback->Release();
         archive->Close();
@@ -981,6 +1006,7 @@ int wmain(int argc, wchar_t* argv[]) {
     uint32_t unsafeItems = callback->GetUnsafeCount();
     uint32_t missingItems = callback->CountMissing();
     bool extractError = callback->HasError();
+    bool wrongPassword = callback->HasWrongPassword();
     bool crcError = callback->HasCrcError();
     bool dataError = callback->HasDataError();
     bool unsupported = callback->HasUnsupportedMethod();
@@ -995,7 +1021,8 @@ int wmain(int argc, wchar_t* argv[]) {
     inStream->Release();
 
     std::string errorReason;
-    if (crcError) errorReason = "crc_error";
+    if (wrongPassword) errorReason = "wrong_password";
+    else if (crcError) errorReason = "crc_error";
     else if (dataError) errorReason = "data_error";
     else if (unsupported) errorReason = "unsupported_method";
     else if (extractError) errorReason = "extract_error";
