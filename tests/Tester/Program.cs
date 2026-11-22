@@ -12,7 +12,7 @@ using UnzipProxy.Core;
 
 namespace Tester
 {
-    class Program
+    partial class Program
     {
         static int _pass = 0;
         static int _fail = 0;
@@ -82,7 +82,7 @@ namespace Tester
             public int Skipped;
             public int Unsafe;
             public int Extracted;
-            public bool PasswordRequested;
+            public int PasswordRequests;
             public bool EncodingOptionsOffered;
             public bool InvalidCharsOffered;
             public int ProgressFrames;
@@ -110,54 +110,62 @@ namespace Tester
             };
 
             using var process = Process.Start(psi)!;
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(60));
             var stderrTask = process.StandardError.ReadToEndAsync();
             string? line;
-            while ((line = process.StandardOutput.ReadLine()) != null)
+            try
             {
-                run.Lines.Add(line);
-                run.StandardOutput += line + "\n";
-                if (line.Contains("\"type\":\"progress\"")) run.ProgressFrames++;
-                if (line.Contains("\"type\":\"password_request\""))
+                while ((line = process.StandardOutput.ReadLineAsync(timeout.Token).AsTask().GetAwaiter().GetResult()) != null)
                 {
-                    run.PasswordRequested = true;
-                    if (password != null)
+                    run.Lines.Add(line);
+                    run.StandardOutput += line + "\n";
+                    if (line.Contains("\"type\":\"progress\"")) run.ProgressFrames++;
+                    if (line.Contains("\"type\":\"password_request\""))
                     {
-                        var payload = new { type = "password_response", password };
-                        process.StandardInput.WriteLine(JsonSerializer.Serialize(payload));
+                        run.PasswordRequests++;
+                        string response = password == null
+                            ? "{\"type\":\"password_response\",\"canceled\":true}"
+                            : JsonSerializer.Serialize(new { type = "password_response", password });
+                        process.StandardInput.WriteLine(response);
                         process.StandardInput.Flush();
                     }
-                }
-                if (line.Contains("\"type\":\"encoding_options\""))
-                {
-                    run.EncodingOptionsOffered = true;
-                    if (encodingCp != null)
+                    if (line.Contains("\"type\":\"encoding_options\""))
                     {
-                        process.StandardInput.WriteLine($"{{\"type\":\"encoding_response\",\"cp\":{encodingCp}}}");
+                        run.EncodingOptionsOffered = true;
+                        if (encodingCp != null)
+                        {
+                            process.StandardInput.WriteLine($"{{\"type\":\"encoding_response\",\"cp\":{encodingCp}}}");
+                            process.StandardInput.Flush();
+                        }
+                    }
+                    if (line.Contains("\"type\":\"invalid_chars_found\""))
+                    {
+                        run.InvalidCharsOffered = true;
+                        string action = invalidAction ?? "batch_rename";
+                        process.StandardInput.WriteLine($"{{\"type\":\"invalid_chars_response\",\"action\":\"{action}\"}}");
                         process.StandardInput.Flush();
                     }
+                    if (line.Contains("\"type\":\"finished\""))
+                    {
+                        using var doc = JsonDocument.Parse(line);
+                        var root = doc.RootElement.Clone();
+                        run.Finished = root;
+                        run.Status = root.TryGetProperty("status", out var s) ? (s.GetString() ?? "") : "";
+                        run.ErrorReason = root.TryGetProperty("error_reason", out var er) ? (er.GetString() ?? "") : "";
+                        run.DeliveryRoot = root.TryGetProperty("delivery_root", out var dr) ? (dr.GetString() ?? "") : "";
+                        run.PolicyFiltered = root.TryGetProperty("policy_filtered_items", out var pf) ? pf.GetInt32() : 0;
+                        run.Skipped = root.TryGetProperty("skipped_items", out var sk) ? sk.GetInt32() : 0;
+                        run.Unsafe = root.TryGetProperty("unsafe_items", out var us) ? us.GetInt32() : 0;
+                        run.Extracted = root.TryGetProperty("extracted_items", out var ex) ? ex.GetInt32() : 0;
+                    }
                 }
-                if (line.Contains("\"type\":\"invalid_chars_found\""))
-                {
-                    run.InvalidCharsOffered = true;
-                    string action = invalidAction ?? "batch_rename";
-                    process.StandardInput.WriteLine($"{{\"type\":\"invalid_chars_response\",\"action\":\"{action}\"}}");
-                    process.StandardInput.Flush();
-                }
-                if (line.Contains("\"type\":\"finished\""))
-                {
-                    using var doc = JsonDocument.Parse(line);
-                    var root = doc.RootElement.Clone();
-                    run.Finished = root;
-                    run.Status = root.TryGetProperty("status", out var s) ? (s.GetString() ?? "") : "";
-                    run.ErrorReason = root.TryGetProperty("error_reason", out var er) ? (er.GetString() ?? "") : "";
-                    run.DeliveryRoot = root.TryGetProperty("delivery_root", out var dr) ? (dr.GetString() ?? "") : "";
-                    run.PolicyFiltered = root.TryGetProperty("policy_filtered_items", out var pf) ? pf.GetInt32() : 0;
-                    run.Skipped = root.TryGetProperty("skipped_items", out var sk) ? sk.GetInt32() : 0;
-                    run.Unsafe = root.TryGetProperty("unsafe_items", out var us) ? us.GetInt32() : 0;
-                    run.Extracted = root.TryGetProperty("extracted_items", out var ex) ? ex.GetInt32() : 0;
-                }
+                process.WaitForExitAsync(timeout.Token).GetAwaiter().GetResult();
             }
-            process.WaitForExit();
+            catch (OperationCanceledException)
+            {
+                if (!process.HasExited) process.Kill(entireProcessTree: true);
+                throw new TimeoutException($"Worker 测试超时：{archive}");
+            }
             run.StandardError = stderrTask.Result;
             run.ExitCode = process.ExitCode;
             return run;
@@ -765,7 +773,9 @@ namespace Tester
             Console.WriteLine("  Unbox · 生产完成路径与全量缺陷修复自动化测试套件");
             Console.WriteLine("==================================================\n");
 
-            _testDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "test_output");
+            bool round10Only = args.Length == 1 && args[0] == "--round10";
+            _testDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory,
+                round10Only ? "test_output_round10" : "test_output");
             if (Directory.Exists(_testDir))
             {
                 try { Directory.Delete(_testDir, true); } catch { }
@@ -774,6 +784,14 @@ namespace Tester
 
             _cli7z = Find7zCli();
             _workerExe = FindWorkerExe();
+
+            if (round10Only)
+            {
+                TestPasswordReuse();
+                TestWindowCompletion();
+                Console.WriteLine($"Round 10: {_pass} 通过，{_fail} 失败");
+                return _fail == 0 ? 0 : 1;
+            }
 
             // -------------------------------------------------------------
             Console.WriteLine(">>> [测试 1] D1 规则：复合扩展名剥离与名称规划");
@@ -1019,16 +1037,19 @@ namespace Tester
             Console.WriteLine("\n>>> [测试 10] 加密头 7z：密码请求与正确解码");
             string secretDir = Path.Combine(_testDir, "raw_enc");
             Directory.CreateDirectory(secretDir);
-            File.WriteAllText(Path.Combine(secretDir, "secret.txt"), "Antigravity-Secret-Data-2026");
+            string encryptedPayload = Guid.NewGuid().ToString("N");
+            string fixturePassword = Guid.NewGuid().ToString("N");
+            File.WriteAllText(Path.Combine(secretDir, "secret.txt"), encryptedPayload);
             string encrypted7z = Path.Combine(_testDir, "test_enc.7z");
-            Run7z($"a \"{encrypted7z}\" * -p\"P@ssw0rd\" -mhe=on", secretDir);
+            Run7z($"a \"{encrypted7z}\" * -p{fixturePassword} -mhe=on", secretDir);
             string encStaging = NewStaging("enc");
             string encManifest = Path.Combine(_testDir, "manifest_enc.json");
-            var encRun = RunWorker(encrypted7z, encStaging, encManifest, cp: "936", password: "P@ssw0rd");
-            Assert("加密头 7z: 触发密码请求", encRun.PasswordRequested);
+            var encRun = RunWorker(encrypted7z, encStaging, encManifest, cp: "936", password: fixturePassword);
+            Assert("加密头 7z: 打开与提取共用一次密码请求", encRun.PasswordRequests == 1);
             Assert("加密头 7z: 正确解出内容",
-                encRun.Status == "ok" && File.ReadAllText(Path.Combine(encStaging, "secret.txt")) == "Antigravity-Secret-Data-2026");
+                encRun.Status == "ok" && File.ReadAllText(Path.Combine(encStaging, "secret.txt")) == encryptedPayload);
             Assert("加密头 7z: 退出码 0", encRun.ExitCode == 0);
+            TestPasswordReuse();
 
             // -------------------------------------------------------------
             Console.WriteLine("\n>>> [测试 11] 完整分卷 7z：跨卷解压与卷身份上报");
@@ -1245,16 +1266,18 @@ namespace Tester
             string sourceRoot = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, @"..\..\..\..\.."));
             string xamlPath = Path.Combine(sourceRoot, "src", "UnzipProxy", "MainWindow.xaml");
             string codeBehindPath = Path.Combine(sourceRoot, "src", "UnzipProxy", "MainWindow.xaml.cs");
-            if (File.Exists(xamlPath) && File.Exists(codeBehindPath))
+            string promptXamlPath = Path.Combine(sourceRoot, "src", "UnzipProxy", "ExtractionPrompt.xaml");
+            if (File.Exists(xamlPath) && File.Exists(codeBehindPath) && File.Exists(promptXamlPath))
             {
                 string xaml = File.ReadAllText(xamlPath);
                 string codeBehind = File.ReadAllText(codeBehindPath);
+                string promptXaml = File.ReadAllText(promptXamlPath);
                 foreach (string key in new[] { "Win11Cyan", "Win11Green", "Win11Yellow", "Win11Amber", "Win11Red" })
                 {
                     Assert($"界面契约: 资源键 {key} 已定义", xaml.Contains($"x:Key=\"{key}\""), key);
                 }
                 Assert("界面契约: 编码选择面板已定义",
-                    xaml.Contains("ModalEncodingPanel") && xaml.Contains("EncodingOptionsPanel"));
+                    promptXaml.Contains("ModalEncodingPanel") && promptXaml.Contains("EncodingOptionsPanel"));
                 Assert("界面契约: 不再引用未定义资源 AccentOrangeBrush", !codeBehind.Contains("AccentOrangeBrush"));
                 Assert("界面契约: 界面不再做第二套文件名纠偏", !codeBehind.Contains("FixPotentialMojibake"));
                 Assert("界面契约: 未设置编码时不再把系统 ACP 冒充为显式 --cp", !codeBehind.Contains("GetACP"));
@@ -1600,6 +1623,7 @@ namespace Tester
                 var completion = CompleteViaProduction(tar, staging, manifest, run.DeliveryRoot);
                 Assert("R7: PAX 状态变更后可交付", completion.Delivered, completion.FailureReason);
             }
+            TestWindowCompletion();
             TestPinnedTraversal();
 
             Console.WriteLine("\n==================================================");
