@@ -36,7 +36,7 @@
 <br>
 
 <!-- Hero Banner Showcase -->
-<img src="assets/hero.png" width="900" alt="Unbox Preview" style="border-radius: 14px; box-shadow: 0 20px 40px rgba(0,0,0,0.45);">
+<img src="assets/banner.png" width="900" alt="Unbox Preview" style="border-radius: 14px; box-shadow: 0 20px 40px rgba(0,0,0,0.45);">
 
 <br><br>
 
