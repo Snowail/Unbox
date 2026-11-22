@@ -29,6 +29,8 @@ tests/staging*/
 tests/test_staging*/
 
 # Local agent review, planning and temporary artifacts
+AGENTS.md
+/AGENTS.md
 .agent-tmp/
 /.agent-tmp/
 Review History/
