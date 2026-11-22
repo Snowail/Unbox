@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <winternl.h>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <algorithm>
 #include <filesystem>
@@ -12,6 +13,14 @@ namespace fs = std::filesystem;
 
 class PathSanitizer {
 public:
+    struct PinnedDirectories {
+        std::vector<HANDLE> values;
+        PinnedDirectories() = default;
+        PinnedDirectories(const PinnedDirectories&) = delete;
+        PinnedDirectories& operator=(const PinnedDirectories&) = delete;
+        ~PinnedDirectories() { for (HANDLE handle : values) CloseHandle(handle); }
+    };
+
     // D5: macOS 辅助文件判断
     static bool IsMacAuxiliary(const std::wstring& relPath) {
         std::wstring norm = relPath;
@@ -97,9 +106,32 @@ public:
         return norm;
     }
 
+    static bool IsSafeRelativeSyntax(const std::wstring& path) {
+        if (path.empty() || path.front() == L'/' || path.front() == L'\\' ||
+            path.find(L':') != std::wstring::npos || path.find(L'\0') != std::wstring::npos) return false;
+        for (size_t start = 0; start < path.size();) {
+            const size_t delimiter = path.find_first_of(L"\\/", start);
+            const size_t end = delimiter == std::wstring::npos ? path.size() : delimiter;
+            std::wstring segment = path.substr(start, end - start);
+            while (!segment.empty() && segment.back() == L' ') segment.pop_back();
+            if (segment == L".." || (segment != L"." && !segment.empty() &&
+                segment.find_first_not_of(L'.') == std::wstring::npos)) return false;
+
+            std::wstring device = segment.substr(0, segment.find(L'.'));
+            while (!device.empty() && device.back() == L' ') device.pop_back();
+            for (auto& ch : device) ch = static_cast<wchar_t>(towupper(ch));
+            if (device == L"CON" || device == L"PRN" || device == L"AUX" || device == L"NUL" ||
+                device == L"CONIN$" || device == L"CONOUT$") return false;
+            if (device.size() == 4 && (device.starts_with(L"COM") || device.starts_with(L"LPT")) &&
+                std::wstring_view(L"123456789¹²³").find(device.back()) != std::wstring_view::npos) return false;
+            start = end + 1;
+        }
+        return true;
+    }
+
     // 生产级安全验证：确保相对路径在规范化后严格驻留在受控暂存根目录之内
     static bool ResolveAndValidateDestination(const std::wstring& stagingRoot, const std::wstring& relPath, std::wstring& outFullPath) {
-        if (stagingRoot.empty() || relPath.empty()) return false;
+        if (stagingRoot.empty() || !IsSafeRelativeSyntax(relPath)) return false;
 
         wchar_t canonRootBuf[MAX_PATH * 2] = {0};
         DWORD rootLen = GetFullPathNameW(stagingRoot.c_str(), _countof(canonRootBuf), canonRootBuf, nullptr);
@@ -109,13 +141,6 @@ public:
 
         std::wstring clean = relPath;
         std::replace(clean.begin(), clean.end(), L'/', L'\\');
-
-        if (clean.size() >= 2 && iswalpha(clean[0]) && clean[1] == L':') {
-            clean = clean.substr(2);
-        }
-        size_t firstValid = clean.find_first_not_of(L"\\");
-        if (firstValid == std::wstring::npos) return false;
-        clean = clean.substr(firstValid);
 
         std::wstring safeRel;
         size_t start = 0;
@@ -150,15 +175,19 @@ public:
         return true;
     }
 
-    // 把受控根目录解析成“真实最终路径”（打开目录句柄后由内核解析全部重解析点）
+    // Require the lexical root and physical root to refer to the same ordinary directory.
     static std::wstring ResolveCanonicalDirectory(const std::wstring& dir) {
         HANDLE h = CreateFileW(dir.c_str(), FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                               OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+                               OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
         if (h == INVALID_HANDLE_VALUE) return L"";
-        std::wstring final_ = FinalPathOfHandle(h);
+        std::wstring final_ = HasReparsePointAttribute(h) ? L"" : FinalPathOfHandle(h);
         CloseHandle(h);
         if (final_.empty()) return L"";
+        std::error_code error;
+        auto lexical = StripExtendedPrefix(fs::absolute(dir, error).lexically_normal().wstring());
+        std::replace(lexical.begin(), lexical.end(), L'/', L'\\');
+        if (error || !IsUnderCanonicalRoot(lexical, final_) || !IsUnderCanonicalRoot(final_, lexical)) return L"";
         if (final_.back() != L'\\') final_.push_back(L'\\');
         return final_;
     }
@@ -189,7 +218,8 @@ public:
 
     // 每次仅将单一名称交给 NtCreateFile，RootDirectory 为已验证父句柄。
     // 不解析中间路径；保留整个目录链，拒绝任何一级重解析点。
-    static bool EnsureDirectory(const std::wstring& canonicalRoot, const std::wstring& fullPath, DWORD& outError) {
+    static bool EnsureDirectory(const std::wstring& canonicalRoot, const std::wstring& fullPath, DWORD& outError,
+        PinnedDirectories* pinned = nullptr) {
         outError = ERROR_SUCCESS;
         std::wstring root = StripExtendedPrefix(canonicalRoot);
         while (!root.empty() && root.back() == L'\\') root.pop_back();
@@ -199,10 +229,8 @@ public:
             outError = ERROR_ACCESS_DENIED;
             return false;
         }
-        struct Handles {
-            std::vector<HANDLE> values;
-            ~Handles() { for (HANDLE h : values) CloseHandle(h); }
-        } handles;
+        PinnedDirectories local;
+        auto& handles = pinned ? *pinned : local;
         HANDLE hRoot = CreateFileW(root.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
                                    nullptr, OPEN_EXISTING,
                                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);

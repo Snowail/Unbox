@@ -15,20 +15,8 @@ namespace UnzipProxy.Core
 
     public static class ArchiveTaskPlanner
     {
-        private static readonly string[] CompoundSuffixes = new[] {
-            ".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".tar.lzma",
-            ".tgz", ".tbz2", ".tbz", ".txz", ".tzst"
-        };
-
-        public static bool IsCompoundTar(string filePath)
-        {
-            string fileName = Path.GetFileName(filePath);
-            foreach (var suf in CompoundSuffixes)
-            {
-                if (fileName.EndsWith(suf, StringComparison.OrdinalIgnoreCase)) return true;
-            }
-            return false;
-        }
+        public static bool IsCompoundTar(string filePath) =>
+            ArchiveFormatCatalog.Match(Path.GetFileName(filePath))?.Kind == ArchiveKind.TarWrapper;
 
         // 剥离归档与分卷后缀，得到纯净的包名（不再从目标展示名反推）
         public static string GetArchiveBaseName(string filePath)
@@ -36,13 +24,8 @@ namespace UnzipProxy.Core
             string fileName = Path.GetFileName(filePath);
 
             // 1. 复合 TAR 后缀
-            foreach (var suf in CompoundSuffixes)
-            {
-                if (fileName.EndsWith(suf, StringComparison.OrdinalIgnoreCase))
-                {
-                    return fileName.Substring(0, fileName.Length - suf.Length);
-                }
-            }
+            if (ArchiveFormatCatalog.Match(fileName) is { Kind: ArchiveKind.TarWrapper } format)
+                return fileName[..^format.Suffix.Length];
 
             // 2. 分卷模式：.part01.rar / .part1.rar
             Match mPart = Regex.Match(fileName, @"^(.*?)\.part\d+\.rar$", RegexOptions.IgnoreCase);

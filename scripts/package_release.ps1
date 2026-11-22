@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param(
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = "1.3.0",
+    [string]$Version = "1.4.0",
     [switch]$SkipTests
 )
 
@@ -16,7 +16,7 @@ $distDir = Join-Path $rootDir "dist"
 $pkgName = "Unbox-v$Version-win-x64"
 $pkgDir = Join-Path $distDir $pkgName
 $zipFile = Join-Path $distDir "$pkgName.zip"
-$publishTemp = Join-Path $distDir ".publish_temp"
+$publishTemp = Join-Path $distDir (".publish_" + [guid]::NewGuid().ToString("N"))
 
 # 删除构建缓存前，确认目标均为仓库 dist 下的直接产物。
 foreach ($target in @($pkgDir, $zipFile, $publishTemp)) {
@@ -95,13 +95,6 @@ if ($LASTEXITCODE -ne 0) {
 Copy-Item -Path (Join-Path $publishTemp "Unbox.exe") -Destination (Join-Path $binDir "Unbox.exe") -Force
 Remove-Item -LiteralPath $publishTemp -Recurse -Force
 
-# 确保 7z.dll 在 bin 目录中
-if (-not (Test-Path (Join-Path $binDir "7z.dll"))) {
-    if (Test-Path (Join-Path $rootDir "assets\7z.dll")) {
-        Copy-Item -Path (Join-Path $rootDir "assets\7z.dll") -Destination (Join-Path $binDir "7z.dll") -Force
-    }
-}
-
 # 5. 严格验证必备组件完整性并复制至发布目录（杜绝任何关键文件缺失）
 Write-Host ">>> [步骤 4/5] 严密核验发布物完整性并复制组件..." -ForegroundColor Yellow
 
@@ -109,8 +102,6 @@ $requiredCoreFiles = @(
     @{ Path = Join-Path $binDir "Unbox.exe";        Name = "Unbox.exe (WPF UI)" },
     @{ Path = Join-Path $binDir "UnzipWorker.exe";  Name = "UnzipWorker.exe (C++20 Engine)" },
     @{ Path = Join-Path $binDir "7z.dll";           Name = "7z.dll (7-Zip Library)" },
-    @{ Path = Join-Path $rootDir "Finished.mp3";    Name = "Finished.mp3 (提示音)" },
-    @{ Path = Join-Path $rootDir "icon.png";        Name = "icon.png (品牌图标)" },
     @{ Path = Join-Path $rootDir "README.md";       Name = "README.md (说明文档)" },
     @{ Path = Join-Path $rootDir "LICENSE";         Name = "LICENSE (开源协议与署名)" },
     @{ Path = Join-Path $rootDir "安装与卸载.cmd";    Name = "安装与卸载.cmd (图形化管理菜单)" },
@@ -126,16 +117,28 @@ foreach ($item in $requiredCoreFiles) {
     Write-Host "  [OK] $($item.Name)" -ForegroundColor Green
 }
 
-# 复制图标库
-$iconsDir = Join-Path $binDir "icons"
-if (-not (Test-Path $iconsDir)) { $iconsDir = Join-Path $rootDir "icons" }
+$catalogPath = Join-Path $rootDir "assets\archive-formats.json"
+$licensePath = Join-Path $rootDir "assets\licenses\7zip-zs\THIRD-PARTY.txt"
+$licenseDir = Join-Path $pkgDir "assets\licenses\7zip-zs"
+New-Item -ItemType Directory -Path $licenseDir -Force | Out-Null
+Copy-Item -LiteralPath $catalogPath -Destination (Join-Path $pkgDir "assets\archive-formats.json")
+Copy-Item -LiteralPath $licensePath -Destination (Join-Path $licenseDir "THIRD-PARTY.txt")
+$formats = Get-Content -LiteralPath $catalogPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$iconKeys = @( (@("origin") + @($formats.formats | ForEach-Object iconKey)) | Sort-Object -Unique )
 $targetIconsDir = Join-Path $pkgDir "icons"
-Copy-Item -Path $iconsDir -Destination $targetIconsDir -Recurse -Force
-$icoCount = (Get-ChildItem -Path $targetIconsDir -Filter "*.ico").Count
-if ($icoCount -lt 25) {
-    throw "发布阻断：图标库不完整，仅包含 $icoCount 个 .ico 文件！"
+New-Item -ItemType Directory -Path $targetIconsDir -Force | Out-Null
+foreach ($key in $iconKeys) {
+    if ($key -cnotmatch '^[a-z0-9]+$') { throw "无效图标键：$key" }
+    Copy-Item -LiteralPath (Join-Path $binDir "icons\$key.ico") -Destination $targetIconsDir
 }
-Write-Host "  [OK] 图标库完整 ($icoCount 个专用格式图标)" -ForegroundColor Green
+
+# Use absolute repository asset links in the portable README.
+$readmePath = Join-Path $pkgDir "README.md"
+$readme = Get-Content -LiteralPath $readmePath -Raw -Encoding UTF8
+$publicAssets = 'https://raw.githubusercontent.com/Snowail/Unbox/main/'
+$readme = $readme.Replace('src="icon.png"', ('src="' + $publicAssets + 'icon.png"'))
+$readme = $readme.Replace('src="assets/banner.png"', ('src="' + $publicAssets + 'assets/banner.png"'))
+Set-Content -LiteralPath $readmePath -Value $readme -Encoding UTF8
 
 # 自动化回归测试（若未跳过，测试日志输出至 dist 外部目录，绝不打包入发布包）
 if (-not $SkipTests) {
@@ -169,8 +172,12 @@ $readmeText = @"
 1. 解压本便携包至常驻安装目录（如 D:\Tools\Unbox 或 C:\Program Files\Unbox 等）；
 2. 双击运行【安装与卸载.cmd】（推荐，提供友好的控制台菜单完成一键安装与管理），
    或右键单击【注册关联.ps1】选择【使用 PowerShell 运行】；
-3. 系统将自动为常见 44 种压缩与镜像格式注册现代 Fluent 图标与双击自动解压能力；
-4. 随后直接双击任意压缩包，即可自动开始流式解压！
+3. 系统为 57 种格式登记打开方式与专用图标；
+4. 在 Windows 默认应用中将所需格式选为 Unbox，随后双击关联的压缩包即可解压。
+
+【格式与解压上限】
+内核为固定的 7-Zip 26.05 ZS v1.5.7 R1。支持新压缩流与显式 TAR 别名，以及五种 ZS 7z 加密方法的读取。
+普通压缩流只解外层。未知大小的流若触及解压上限，可为当前任务输入有限的新上限后重试。
 
 【卸载方法】
 若您不再需要使用本工具，只需双击运行【安装与卸载.cmd】选择卸载选项，
@@ -182,35 +189,13 @@ $readmeText = @"
 "@
 Set-Content -Path (Join-Path $pkgDir "使用说明.txt") -Value $readmeText -Encoding utf8
 
-# 7. 生成纯净的构建元数据
+# 7. 核验发布包内容
 Write-Host ">>> [步骤 5/5] 打包便携绿色压缩包..." -ForegroundColor Yellow
 
-$commit = ""
-try { $commit = (& git -C $rootDir rev-parse HEAD 2>$null) } catch { }
-if (-not $commit) { $commit = "unknown" }
-
-function Get-Sha256([string]$path) {
-    if (-not (Test-Path $path)) { return "missing" }
-    return (Get-FileHash -Path $path -Algorithm SHA256).Hash
-}
-
-$buildInfo = @"
-Unbox v$Version 构建信息
-================================================================
-Git 提交        : $commit
-构建时间        : $(Get-Date -Format "yyyy-MM-dd HH:mm:ss zzz")
-Unbox.exe       : $(Get-Sha256 (Join-Path $binDir "Unbox.exe"))
-UnzipWorker.exe : $(Get-Sha256 (Join-Path $binDir "UnzipWorker.exe"))
-7z.dll          : $(Get-Sha256 (Join-Path $binDir "7z.dll"))
-================================================================
-"@
-Set-Content -Path (Join-Path $pkgDir "构建信息.txt") -Value $buildInfo -Encoding utf8
-
-# 8. 严格安全审计：确保发布包绝不包含任何测试、报告、历史或临时文件
 $disallowedPatterns = @(
     "*test*", "*Test*", "*.cpp", "*.obj", "*.pdb",
     "*plan*", "*review*", "*report*", "*HANDOFF*",
-    "*.log", "*.tmp"
+    "*.log", "*.tmp", "构建信息.txt"
 )
 $leakedFiles = Get-ChildItem -Path $pkgDir -Recurse | Where-Object {
     $item = $_
@@ -224,19 +209,29 @@ if ($leakedFiles) {
 }
 Write-Host "  [OK] 发布包目录纯净审计通过（无测试、报告或历史记录）" -ForegroundColor Green
 
-# 9. 压缩为发布 ZIP
-Compress-Archive -Path "$pkgDir\*" -DestinationPath $zipFile -Force
+# 8. 压缩为发布 ZIP
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+Add-Type -AssemblyName System.IO.Compression
+$zip = [IO.Compression.ZipFile]::Open($zipFile, [IO.Compression.ZipArchiveMode]::Create)
+try {
+    foreach ($file in Get-ChildItem -LiteralPath $pkgDir -Recurse -File) {
+        $name = $file.FullName.Substring($pkgDir.Length + 1).Replace('\', '/')
+        [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $file.FullName, $name,
+            [IO.Compression.CompressionLevel]::Optimal) | Out-Null
+    }
+} finally { $zip.Dispose() }
+& (Join-Path $rootDir 'tests\Test-Distribution.ps1') -ZipPath $zipFile
 
 $zipSize = (Get-Item $zipFile).Length
 $zipSizeMB = [math]::Round($zipSize / 1MB, 2)
 $zipHash = (Get-FileHash -Path $zipFile -Algorithm SHA256).Hash
+Set-Content -LiteralPath (Join-Path $distDir "SHA256SUMS.txt") -Value "$zipHash  $pkgName.zip" -Encoding ASCII
 
 Write-Host "==========================================" -ForegroundColor Cyan
 Write-Host "[OK] 发布便携包制作成功！" -ForegroundColor Green
 Write-Host "发布包路径: $zipFile" -ForegroundColor Green
 Write-Host "发布包体积: $zipSizeMB MB ($zipSize 字节)" -ForegroundColor Green
 Write-Host "SHA-256   : $zipHash" -ForegroundColor Green
-Write-Host "Git 提交  : $commit" -ForegroundColor Green
 Write-Host "发布包内容清单:" -ForegroundColor Yellow
 Get-ChildItem -Path $pkgDir | Select-Object Name, Length | Format-Table -AutoSize | Out-String | Write-Host
 Write-Host "==========================================" -ForegroundColor Cyan

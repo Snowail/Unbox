@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 480" width="100%" height="100%">
+  <!-- 箱体主体 (主色 #FF9800，圆角 18px) -->
+  <rect x="60" y="60" width="360" height="360" rx="18" ry="18" fill="#FF9800"/>
+  <!-- 封箱胶带 (辅色 #FFB74D) -->
+  <rect x="210" y="60" width="60" height="70" fill="#FFB74D"/>
+  <!-- 向上双箭头标示 (深琥珀色 #B86D00) -->
+  <path d="M310 300 L330 330 H320 V360 H300 V330 H290 Z M360 300 L380 330 H370 V360 H350 V330 H340 Z" fill="#B86D00"/>
+  <!-- 底部支撑横线 (深琥珀色 #B86D00) -->
+  <rect x="290" y="370" width="90" height="10" fill="#B86D00"/>
+</svg>

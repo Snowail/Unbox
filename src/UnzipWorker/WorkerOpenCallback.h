@@ -103,17 +103,15 @@ public:
     STDMETHOD(GetStream)(const wchar_t* name, IInStream** inStream) override {
         if (!name || !inStream) return E_POINTER;
         *inStream = nullptr;
+        const std::wstring leaf(name);
+        if (!PathSanitizer::IsSafeRelativeSyntax(leaf) || leaf == L"." ||
+            leaf.find_first_of(L"\\/") != std::wstring::npos) return S_FALSE;
 
         size_t slash = m_firstVolumePath.find_last_of(L"\\/");
         std::wstring dir = (slash != std::wstring::npos) ? m_firstVolumePath.substr(0, slash + 1) : L"";
         std::wstring fullPath = dir + name;
 
-        DWORD attr = GetFileAttributesW(fullPath.c_str());
-        if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY)) {
-            return S_FALSE;
-        }
-
-        CInFileStream* stream = CInFileStream::OpenFile(fullPath.c_str());
+        CInFileStream* stream = CInFileStream::OpenFile(fullPath.c_str(), true);
         if (!stream) {
             return S_FALSE;
         }
@@ -144,8 +142,9 @@ public:
             if (canceled) {
                 return E_ABORT;
             }
-            *password = SysAllocString(pwd.c_str());
-            return S_OK;
+            *password = SysAllocStringLen(pwd.data(), static_cast<UINT>(pwd.size()));
+            SecureZeroMemory(pwd.data(), pwd.size() * sizeof(wchar_t));
+            return *password ? S_OK : E_OUTOFMEMORY;
         }
         return E_ABORT;
     }

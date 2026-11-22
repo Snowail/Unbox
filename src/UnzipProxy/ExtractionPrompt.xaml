@@ -12,6 +12,15 @@
         </Grid.RowDefinitions>
         <ScrollViewer VerticalScrollBarVisibility="Auto">
             <Grid>
+                <StackPanel x:Name="ModalBudgetPanel" Visibility="Collapsed">
+                    <TextBlock x:Name="BudgetDetailText" TextWrapping="Wrap" Margin="0,0,0,12"
+                               Foreground="{DynamicResource TextForegroundBrush}" />
+                    <TextBlock Text="本次解压上限（MiB）" Margin="0,0,0,4"
+                               Foreground="{DynamicResource TextForegroundBrush}" />
+                    <TextBox x:Name="BudgetLimitInput" Height="28" />
+                    <TextBlock x:Name="BudgetValidationText" TextWrapping="Wrap" Margin="0,8,0,0"
+                               Foreground="{DynamicResource Win11Red}" />
+                </StackPanel>
                 <!-- 回收站警示弹窗 (D2) -->
                 <StackPanel x:Name="ModalRecycleAlertPanel" Visibility="Collapsed">
                     <TextBlock Text="分卷压缩包会整组移入回收站；缺少内容校验的格式（如 TAR 等）可能会有风险。"

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">
+  <!-- 24px 微型标准图标版 (适合按钮、侧边栏、Tab 标签) -->
+  <rect x="3" y="3" width="18" height="18" rx="2" fill="#FF9800"/>
+  <rect x="10.5" y="3" width="3" height="3.5" fill="#FFB74D"/>
+  <path d="M15.5 15 L16.5 16.5 H16 V18 H15 V16.5 H14.5 Z M18 15 L19 16.5 H18.5 V18 H17.5 V16.5 H17 Z" fill="#B86D00"/>
+  <rect x="14.5" y="18.5" width="4.5" height="0.6" fill="#B86D00"/>
+</svg>

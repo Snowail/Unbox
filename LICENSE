@@ -24,12 +24,10 @@ SOFTWARE.
 
 ### Third-Party Licenses & Attributions
 
-- **7-Zip (7z.dll)**:
-  Copyright (C) 1999-2026 Igor Pavlov.
-  7-Zip is licensed under the GNU LGPL (Lesser General Public License).
-  The unRAR portion of 7-Zip is covered by the unRAR license restrictions.
-  Full distribution license and terms: https://www.7-zip.org/license.txt
-  Official homepage and source code: https://www.7-zip.org/
+- **7-Zip 26.05 ZS v1.5.7 R1 (x64 7z.dll)**:
+  Copyright (C) 1999-2026 Igor Pavlov and the 7-Zip ZS contributors.
+  The upstream notices and corresponding source link are in
+  assets/licenses/7zip-zs/THIRD-PARTY.txt.
 
 - **Icons**:
   Icon original artwork designed by smalllikeart (Flaticon) and adapted for file type associations.

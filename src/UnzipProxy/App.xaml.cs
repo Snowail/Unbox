@@ -2,6 +2,7 @@
 using System.IO;
 using System.Windows;
 using Microsoft.Win32;
+using UnzipProxy.Core;
 
 namespace UnzipProxy
 {
@@ -36,7 +37,7 @@ namespace UnzipProxy
                 var dlg = new OpenFileDialog
                 {
                     Title = "选择要解压的压缩包",
-                    Filter = "常用压缩文件 (*.zip;*.7z;*.rar;*.tar;*.gz;*.bz2;*.xz;*.001)|*.zip;*.7z;*.rar;*.tar;*.gz;*.bz2;*.xz;*.001|所有文件 (*.*)|*.*"
+                    Filter = ArchiveFormatCatalog.BuildOpenFileFilter()
                 };
                 if (dlg.ShowDialog() == true)
                 {

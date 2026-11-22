@@ -14,7 +14,7 @@
 
 <p>
   <a href="https://github.com/Snowail/Unbox/releases">
-    <img src="https://img.shields.io/badge/Release-v1.3.0-00C853?style=for-the-badge&logo=github&labelColor=000000" alt="Release">
+    <img src="https://img.shields.io/badge/Version-v1.4.0-00C853?style=for-the-badge&logo=github&labelColor=000000" alt="Release">
   </a>
   <a href="https://github.com/Snowail/Unbox">
     <img src="https://img.shields.io/badge/Platform-Windows_11_%7C_10-0078D4?style=for-the-badge&logo=windows&labelColor=000000" alt="Platform">
@@ -26,7 +26,7 @@
     <img src="https://img.shields.io/badge/Core-C%2B%2B20_%7C_WPF_.NET_10-512BD4?style=for-the-badge&logo=dotnet&labelColor=000000" alt="Core">
   </a>
   <a href="https://www.7-zip.org/">
-    <img src="https://img.shields.io/badge/Engine-7--Zip_26.06-FF8C00?style=for-the-badge&labelColor=000000" alt="Engine">
+    <img src="https://img.shields.io/badge/Engine-7--Zip_ZS_26.05-FF8C00?style=for-the-badge&labelColor=000000" alt="Engine">
   </a>
   <a href="LICENSE">
     <img src="https://img.shields.io/badge/License-MIT-blue?style=for-the-badge&logo=opensourceinitiative&color=3DA639&labelColor=000000" alt="License">
@@ -188,7 +188,7 @@ Unbox 让解压体验变得像 macOS 的 Archive Utility 一样自然，同时�
         <sub>专注归档，不破坏原生流</sub>
       </td>
       <td>
-        • <b>全面关联 44+ 种格式</b>：涵盖所有主流归档、压缩流、分卷入口及常用虚拟机镜像；<br>
+        • <b>全面关联 57 种格式</b>：涵盖所有主流归档、压缩流、分卷入口及常用虚拟机镜像；<br>
         • <b>智能排除系统原生容器</b>：严格排除资源管理器能原生挂载的镜像（<code>.iso</code>、<code>.vhd</code>、<code>.vhdx</code>）以及 Office/应用容器（<code>.docx</code>、<code>.apk</code>、<code>.msi</code>、<code>.exe</code>），保留原有启动与编辑入口。
       </td>
     </tr>
@@ -223,7 +223,7 @@ Unbox 让解压体验变得像 macOS 的 Archive Utility 一样自然，同时�
 
 ### 1. 下载便携包 (Portable)
 
-直接在 [Releases](https://github.com/Snowail/Unbox/releases) 页面下载最新的 `Unbox-v1.3.0-win-x64.zip`。
+便携包文件名为 `Unbox-v1.4.0-win-x64.zip`。已发布版本可在 [Releases](https://github.com/Snowail/Unbox/releases) 查看。
 
 - **免安装**：解压即可使用，支持随身 U 盘便携携带；
 - **现代轻量化部署**：采用 **.NET 10 LTS 框架依赖部署 (Framework-Dependent)**，包体积仅 ~2.6 MB（缩减 95.3%）。系统仅需安装官方 Windows x64 .NET 10 桌面运行时 (Desktop Runtime)。
@@ -233,7 +233,7 @@ Unbox 让解压体验变得像 macOS 的 Archive Utility 一样自然，同时�
 解压至您希望常驻的目录（如 `D:\Tools\Unbox`），然后：
 
 1. 右键单击 **`注册关联.ps1`**，选择 **【使用 PowerShell 运行】**；
-2. 脚本将通过系统原生注册表引擎，向 Windows 11 登记 **44 种文件格式** 的专用高清图标与 ProgID；
+2. 脚本将通过系统原生注册表引擎，向 Windows 11 登记 **57 种文件格式** 的专用高清图标与 ProgID；
 3. 随后脚本会自动为您打开 Windows 11 设置中的【默认应用】页面，确认设置即可！
 
 ### 3. 双击解压
@@ -241,7 +241,7 @@ Unbox 让解压体验变得像 macOS 的 Archive Utility 一样自然，同时�
 关联完成后，直接在资源管理器中 **双击任意压缩包**：
 - 现代任务窗口轻盈浮现，开始高速流式解压；
 - 支持点击左下角 **“详细信息”** 查看实时吞吐面积图；
-- 解压完成后播放专属提示音 `Finished.mp3` 并轻盈退出！
+- 完整解压后播放内置提示音。
 
 ### 4. 彻底卸载与清理
 
@@ -279,7 +279,7 @@ graph TD
     User([双击压缩包]) --> Proxy[Unbox.exe 主进程<br>WPF / C# .NET 10 LTS]
     Proxy -->|Win11 任务窗口| UI[Fluent 现代对话框<br>堆积面积图 / 状态机 / 提示音]
     Proxy -->|JobObject 强生命周期绑定| Worker[UnzipWorker.exe 解压核心<br>纯原生 C++20]
-    Worker -->|加载 COM 接口| Engine[(7z.dll 官方 26.06 解码库)]
+    Worker -->|加载 COM 接口| Engine[(7z.dll 7-Zip ZS 26.05 解码库)]
     Worker -->|匿名管道 JSON 通信 30ms 限流| Proxy
     Worker -->|流式解压 / 字符清洗 / Mac 过滤| Disk[(目标磁盘目录)]
 ```
@@ -293,9 +293,19 @@ graph TD
 
 ---
 
+## 1.4.0 引擎与解压规则
+
+- 7z 容器支持读取 Zstandard、Brotli、LZ4、LZ5、Lizard、Fast-LZMA2。独立压缩流增加 Brotli、LZ4、LZ5、Lizard、Lzip 与 Zstandard 别名。
+- 普通压缩流只解一层。显式复合扩展名和 TAR 短别名解到 TAR 正文，原有分卷入口继续沿用独立规则。
+- 支持读取 XChaCha20、XChaCha20-Poly1305、AXP、AXA、XAA 加密的 7z 归档，以及既有的 7zAES。
+- 可证明长度的 LZ4 原样块流按实际长度设置预算；未知大小的流超限时，可以为当前任务输入一个更大的有限上限，再从头解压。
+- 引擎由 7-Zip 26.06 切换到 7-Zip 26.05 ZS。26.06 的 Linux split 兼容性改进随本次切换回退，Windows 分卷入口仍保留。
+
+源码构建需要 [resvg 0.47.0 x64](https://github.com/linebender/resvg/releases/tag/v0.47.0) 和 PATH 上的 FFmpeg。将 `UNBOX_RESVG` 指向 `resvg.exe`，在仓库根运行 `powershell -ExecutionPolicy Bypass -File scripts\make_app_icon.ps1`。WPF 构建也会在资源缺失或源文件变化时自动生成 ICO 和 PCM WAV。
+
 ## ✅ Quality & Verification
 
-- **发布组件可独立复核**：GitHub Release 附带 `SHA256SUMS.txt`；包内 `构建信息.txt` 记录 Git 提交号与 `Unbox.exe` / `UnzipWorker.exe` / `7z.dll` 的 SHA-256，`测试结果.txt` 保存本次构建的回归日志。
+- 下载后可用 GitHub Release 附带的 `SHA256SUMS.txt` 核对便携 ZIP 的 SHA-256。
 - **生产完成路径自动化**：`tests/Tester` 直接调用与 WPF 完全相同的 `ExtractionCompleter`（清单对账 → 同名折叠 → 来源标记 → 单次目录改名提交 → 提交后复核 → 逐卷回收），90 项用例覆盖文件名编码、复合 TAR、缺尾卷、空归档、部分完成、回收身份核对，以及真实回收后从回收站落点核对 SHA-256。
 - **性能基线**（同机实测）：1,200 个小文件解压 `373 ms` / 13 个进度帧；清单对账 + 单次目录改名提交 `109 ms`。
 
@@ -324,7 +334,7 @@ Unbox 持续演进中，后续版本规划如下：
 
 </div>
 
-- **解压核心引擎**：[7-Zip 26.06 (x64)](https://www.7-zip.org/) by Igor Pavlov（遵循 GNU LGPL 协议）；
+- **解压核心引擎**：[7-Zip 26.05 ZS v1.5.7 R1 x64](https://github.com/mcmilk/7-Zip-zstd/releases/tag/v26.05-v1.5.7-R1)。分发许可和对应源码见 [THIRD-PARTY.txt](assets/licenses/7zip-zs/THIRD-PARTY.txt)。
 - **图标原始设计**：[smalllikeart (Flaticon)](https://www.flaticon.com/authors/smalllikeart) 并由本项目根据格式定制生成；
 - **Emoji 资源**：[Animated Fluent Emojis](https://github.com/Tarikul-Islam-Anik/Animated-Fluent-Emojis) by Tarikul Islam Anik。
 

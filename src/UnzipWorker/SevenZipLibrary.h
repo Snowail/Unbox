@@ -1,6 +1,8 @@
 #pragma once
 
 #include "SevenZip.h"
+#include "ArchiveFormatPolicy.h"
+#include <functional>
 #include <windows.h>
 #include <string>
 #include <vector>
@@ -12,9 +14,8 @@ struct FormatInfo {
     std::wstring name;
     GUID classId;
     std::vector<std::wstring> extensions;
-    std::vector<std::wstring> addExtensions;
-    std::vector<uint8_t> signature;
-    uint32_t signatureOffset;
+    std::vector<std::vector<uint8_t>> signatures;
+    uint64_t signatureOffset;
 };
 
 class SevenZipLibrary {
@@ -27,14 +28,14 @@ public:
 
     bool Load(const std::wstring& dllPath) {
         Unload();
-        m_hModule = LoadLibraryW(dllPath.c_str());
+        m_hModule = LoadLibraryExW(dllPath.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
         if (!m_hModule) return false;
 
         m_pfnCreateObject = (Func_CreateObject)GetProcAddress(m_hModule, "CreateObject");
         m_pfnGetNumberOfFormats = (Func_GetNumberOfFormats)GetProcAddress(m_hModule, "GetNumberOfFormats");
         m_pfnGetHandlerProperty2 = (Func_GetHandlerProperty2)GetProcAddress(m_hModule, "GetHandlerProperty2");
 
-        if (!m_pfnCreateObject) {
+        if (!m_pfnCreateObject || !m_pfnGetNumberOfFormats || !m_pfnGetHandlerProperty2) {
             Unload();
             return false;
         }
@@ -86,15 +87,37 @@ public:
                     if (SUCCEEDED(m_pfnGetHandlerProperty2(i, NArchive::NHandlerPropID::kSignature, &prop)) && prop.vt == VT_BSTR && prop.bstrVal) {
                         UINT len = SysStringByteLen(prop.bstrVal);
                         const uint8_t* bytes = reinterpret_cast<const uint8_t*>(prop.bstrVal);
-                        info.signature.assign(bytes, bytes + len);
+                        if (len != 0) info.signatures.emplace_back(bytes, bytes + len);
                     }
                     PropVariantClear(&prop);
 
+                    // Each multi-signature record is a byte length followed by its bytes.
+                    if (SUCCEEDED(m_pfnGetHandlerProperty2(i, NArchive::NHandlerPropID::kMultiSignature, &prop))
+                        && prop.vt == VT_BSTR && prop.bstrVal) {
+                        const UINT length = SysStringByteLen(prop.bstrVal);
+                        const auto* bytes = reinterpret_cast<const uint8_t*>(prop.bstrVal);
+                        for (UINT position = 0; position < length;) {
+                            const UINT count = bytes[position++];
+                            if (count == 0 || count > length - position) {
+                                PropVariantClear(&prop);
+                                Unload();
+                                return false;
+                            }
+                            info.signatures.emplace_back(bytes + position, bytes + position + count);
+                            position += count;
+                        }
+                    }
+                    PropVariantClear(&prop);
+                    const GUID emptyId{};
+                    if (info.name.empty() || IsEqualGUID(info.classId, emptyId)) {
+                        Unload();
+                        return false;
+                    }
                     // SignatureOffset
                     info.signatureOffset = 0;
                     if (SUCCEEDED(m_pfnGetHandlerProperty2(i, NArchive::NHandlerPropID::kSignatureOffset, &prop))) {
                         if (prop.vt == VT_UI4) info.signatureOffset = prop.ulVal;
-                        else if (prop.vt == VT_UI8) info.signatureOffset = static_cast<uint32_t>(prop.uhVal.QuadPart);
+                        else if (prop.vt == VT_UI8) info.signatureOffset = prop.uhVal.QuadPart;
                     }
                     PropVariantClear(&prop);
 
@@ -103,7 +126,9 @@ public:
             }
         }
 
-        return true;
+        if (!m_formats.empty()) return true;
+        Unload();
+        return false;
     }
 
     void Unload() {
@@ -169,11 +194,18 @@ public:
         return 936;
     }
 
-    // 智能探测归档格式：先按扩展名，再按签名。严格检查 hr == S_OK，支持 OpenCallback 传入
-    bool DetectAndCreateArchive(IInStream* inStream, const std::wstring& extHint, IInArchive** outArchive, IArchiveOpenCallback* openCallback = nullptr, uint32_t codePage = 0) {
+    bool DetectAndCreateArchive(IInStream* stream, const std::wstring& extHint, IInArchive** archive,
+        IArchiveOpenCallback* callback = nullptr, uint32_t codePage = 0) {
+        const auto route = ClassifyArchiveName(extHint);
+        return DetectAndCreateArchive(stream, extHint, archive, callback, codePage, route.handlerHints,
+            route.kind == ArchiveKind::TarWrapper || route.kind == ArchiveKind::Split);
+    }
+
+    bool DetectAndCreateArchive(IInStream* inStream, const std::wstring& extHint, IInArchive** outArchive,
+        IArchiveOpenCallback* openCallback, uint32_t codePage, const std::vector<std::wstring>& hints,
+        bool requireHint, const std::function<bool()>& stop = {}, std::wstring* selected = nullptr) {
         if (!inStream || !outArchive) return false;
         *outArchive = nullptr;
-
         if (codePage == 0) {
             codePage = GetDefaultArchiveCodePage();
         }
@@ -191,72 +223,81 @@ public:
             }
         };
 
-        // 1. 尝试按扩展名候选格式
-        auto extFormats = FindFormatsByExtension(extHint);
-        for (const auto& fmt : extFormats) {
-            IInArchive* archive = nullptr;
-            if (SUCCEEDED(CreateArchiveReader(fmt.classId, &archive)) && archive) {
-                applyCodePage(archive);
-                uint64_t maxStartPos = 1 << 20; // 1MB 探测
-                uint64_t newPos = 0;
-                inStream->Seek(0, 0, &newPos);
-                // 必须严格判定 hr == S_OK，S_FALSE 属于未识别，绝对不能接受！
-                HRESULT hr = archive->Open(inStream, &maxStartPos, openCallback);
-                if (hr == S_OK) {
-                    *outArchive = archive;
+        std::vector<GUID> tried;
+        bool stopped = false;
+        auto tryFormat = [&](const FormatInfo& format) {
+            if (stopped || (stop && stop())) return false;
+            if (std::any_of(tried.begin(), tried.end(), [&](const GUID& id) {
+                return IsEqualGUID(id, format.classId);
+            })) return false;
+            tried.push_back(format.classId);
+            if (inStream->Seek(0, FILE_BEGIN, nullptr) != S_OK) {
+                stopped = true;
+                return false;
+            }
+            IInArchive* raw = nullptr;
+            const HRESULT created = CreateArchiveReader(format.classId, &raw);
+            auto release = [](IInArchive* reader) { reader->Release(); };
+            std::unique_ptr<IInArchive, decltype(release)> reader(raw, release);
+            if (created != S_OK || !reader) return false;
+            applyCodePage(reader.get());
+            const uint64_t maxStartPos = 1 << 20;
+            const HRESULT hr = reader->Open(inStream, &maxStartPos, openCallback);
+            if (hr != S_OK) {
+                if (hr == E_ABORT || (stop && stop())) stopped = true;
+                return false;
+            }
+            if (selected) *selected = format.name;
+            *outArchive = reader.release();
+            return true;
+        };
+        auto tryName = [&](const std::wstring& name) {
+            auto format = std::find_if(m_formats.begin(), m_formats.end(), [&](const FormatInfo& item) {
+                return _wcsicmp(item.name.c_str(), name.c_str()) == 0;
+            });
+            return format != m_formats.end() && tryFormat(*format);
+        };
+        for (const auto& hint : hints) if (tryName(hint)) return true;
+        if (requireHint || stopped) return false;
+        if (hints.empty()) {
+            for (const auto& format : FindFormatsByExtension(extHint)) {
+                if (_wcsicmp(format.name.c_str(), L"brotli") != 0 && tryFormat(format)) return true;
+            }
+            if (stopped) return false;
+        }
+
+        std::vector<uint8_t> prefix(65536);
+        uint32_t count = 0;
+        if (inStream->Seek(0, FILE_BEGIN, nullptr) != S_OK ||
+            inStream->Read(prefix.data(), static_cast<uint32_t>(prefix.size()), &count) != S_OK)
+            return false;
+        prefix.resize(count);
+        size_t frame = 0;
+        while (prefix.size() - frame >= 4 && (prefix[frame] & 0xF0) == 0x50 &&
+               prefix[frame + 1] == 0x2A && prefix[frame + 2] == 0x4D && prefix[frame + 3] == 0x18) {
+            if (prefix.size() - frame < 8) return false;
+            const auto* p = prefix.data() + frame + 4;
+            const uint32_t size = uint32_t(p[0]) | (uint32_t(p[1]) << 8) |
+                (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
+            if (size > prefix.size() - frame - 8) return false;
+            frame += 8 + size;
+        }
+        if (frame && prefix.size() - frame < 4) return false;
+        for (const auto& format : m_formats) {
+            if (format.signatureOffset > prefix.size() - frame) continue;
+            if (frame && _wcsicmp(format.name.c_str(), L"zstd") && _wcsicmp(format.name.c_str(), L"lz4") &&
+                _wcsicmp(format.name.c_str(), L"lz5") && _wcsicmp(format.name.c_str(), L"lizard")) continue;
+            const auto offset = frame + static_cast<size_t>(format.signatureOffset);
+            for (const auto& signature : format.signatures) {
+                if (signature.size() <= prefix.size() - offset &&
+                    std::equal(signature.begin(), signature.end(), prefix.begin() + offset) && tryFormat(format))
                     return true;
-                }
-                archive->Release();
             }
         }
+        if (frame || stopped) return false;
 
-        // 2. 尝试根据已知头部签名探测
-        uint8_t buffer[65536];
-        uint32_t readBytes = 0;
-        uint64_t newPos = 0;
-        inStream->Seek(0, 0, &newPos);
-        if (SUCCEEDED(inStream->Read(buffer, sizeof(buffer), &readBytes)) && readBytes > 0) {
-            for (const auto& fmt : m_formats) {
-                if (!fmt.signature.empty() && fmt.signatureOffset + fmt.signature.size() <= readBytes) {
-                    if (memcmp(buffer + fmt.signatureOffset, fmt.signature.data(), fmt.signature.size()) == 0) {
-                        IInArchive* archive = nullptr;
-                        if (SUCCEEDED(CreateArchiveReader(fmt.classId, &archive)) && archive) {
-                            applyCodePage(archive);
-                            inStream->Seek(0, 0, &newPos);
-                            uint64_t maxStartPos = 1 << 20;
-                            HRESULT hr = archive->Open(inStream, &maxStartPos, openCallback);
-                            if (hr == S_OK) {
-                                *outArchive = archive;
-                                return true;
-                            }
-                            archive->Release();
-                        }
-                    }
-                }
-            }
-        }
-
-        // 3. 轮询常用格式：7z, Zip, Rar5, Rar, Tar, GZip, BZip2, Xz, Wim
         static const wchar_t* commonOrder[] = { L"7z", L"zip", L"Rar5", L"Rar", L"tar", L"gzip", L"bzip2", L"xz", L"wim" };
-        for (const auto& name : commonOrder) {
-            for (const auto& fmt : m_formats) {
-                if (_wcsicmp(fmt.name.c_str(), name) == 0) {
-                    IInArchive* archive = nullptr;
-                    if (SUCCEEDED(CreateArchiveReader(fmt.classId, &archive)) && archive) {
-                        applyCodePage(archive);
-                        inStream->Seek(0, 0, &newPos);
-                        uint64_t maxStartPos = 1 << 20;
-                        HRESULT hr = archive->Open(inStream, &maxStartPos, openCallback);
-                        if (hr == S_OK) {
-                            *outArchive = archive;
-                            return true;
-                        }
-                        archive->Release();
-                    }
-                }
-            }
-        }
-
+        for (const auto* name : commonOrder) if (tryName(name)) return true;
         return false;
     }
 

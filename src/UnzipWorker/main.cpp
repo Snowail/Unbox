@@ -16,6 +16,10 @@
 #include <chrono>
 #include <algorithm>
 #include <cstdlib>
+#include <cstdio>
+#include <cerrno>
+#include <limits>
+#include "Lz4FrameSize.h"
 
 #include "SevenZip.h"
 #include "SevenZipLibrary.h"
@@ -139,48 +143,46 @@ std::string ExtractJsonStringField(const std::string& json, const std::string& f
     return res;
 }
 
-// 判断是否为切分分卷入口（.001）
-bool IsSplitVolume(const std::wstring& path) {
-    if (path.size() >= 4) {
-        std::wstring ext = path.substr(path.size() - 4);
-        for (auto& c : ext) c = towlower(c);
-        if (ext == L".001") return true;
-    }
-    return false;
-}
-
-// 判断是否为约定的复合 TAR 归档格式（.tar.gz, .tgz, .tar.bz2 等）
 bool HasCompoundTarSuffix(const std::wstring& path, std::wstring* outBaseName = nullptr) {
-    std::wstring lower = path;
-    for (auto& c : lower) c = towlower(c);
-    const wchar_t* suffixes[] = {
-        L".tar.gz", L".tgz", L".tar.bz2", L".tbz2", L".tbz",
-        L".tar.xz", L".txz", L".tar.zst", L".tzst", L".tar.lzma"
-    };
-    for (const auto& suf : suffixes) {
-        size_t len = wcslen(suf);
-        if (lower.size() >= len && lower.compare(lower.size() - len, len, suf) == 0) {
-            if (outBaseName) {
-                fs::path p(path);
-                std::wstring fileName = p.filename().wstring();
-                *outBaseName = fileName.substr(0, fileName.size() - len);
-            }
-            return true;
-        }
-    }
-    return false;
+    auto route = ClassifyArchiveName(fs::path(path).filename().wstring());
+    if (route.kind != ArchiveKind::TarWrapper) return false;
+    if (outBaseName) *outBaseName = std::move(route.baseName);
+    return true;
 }
 
-// 从归档文件名安全推导单一流的缺省文件名（RFC 1952 GZip 无原名头）
 std::wstring DeriveSingleStreamFilename(const std::wstring& archivePath) {
-    fs::path p(archivePath);
-    std::wstring ext = p.extension().wstring();
-    for (auto& c : ext) c = towlower(c);
-    if (ext == L".gz" || ext == L".bz2" || ext == L".xz" || ext == L".zst" || ext == L".lzma" || ext == L".001") {
-        std::wstring stem = p.stem().wstring();
-        if (!stem.empty()) return stem;
+    const auto leaf = fs::path(archivePath).filename().wstring();
+    return DefaultStreamName(ClassifyArchiveName(leaf), leaf);
+}
+
+uint64_t DefaultBudget(uint64_t knownBytes, uint64_t minimum) {
+    const uint64_t slack = (std::max)(knownBytes / 4, uint64_t{64} * 1024 * 1024);
+    const auto maxBytes = (std::numeric_limits<uint64_t>::max)();
+    return (std::max)(minimum, slack > maxBytes - knownBytes ? maxBytes : knownBytes + slack);
+}
+
+bool HasDiskSpace(const std::wstring& directory, uint64_t minimum) {
+    if (minimum == 0) return true;
+    ULARGE_INTEGER available{};
+    return GetDiskFreeSpaceExW(directory.c_str(), &available, nullptr, nullptr) &&
+        available.QuadPart >= minimum;
+}
+
+bool IsDiskFull(HRESULT result, DWORD writeError) {
+    return writeError == ERROR_DISK_FULL || writeError == ERROR_HANDLE_DISK_FULL ||
+        result == HRESULT_FROM_WIN32(ERROR_DISK_FULL) || result == HRESULT_FROM_WIN32(ERROR_HANDLE_DISK_FULL);
+}
+
+bool ParseBudget(std::wstring_view value, uint64_t& result) {
+    if (value.empty()) return false;
+    result = 0;
+    for (wchar_t ch : value) {
+        if (ch < L'0' || ch > L'9') return false;
+        const uint64_t digit = ch - L'0';
+        if (result > ((std::numeric_limits<uint64_t>::max)() - digit) / 10) return false;
+        result = result * 10 + digit;
     }
-    return L"extracted_file";
+    return result != 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -246,6 +248,7 @@ void ProcessIpcInputLine(const std::string& line) {
             std::lock_guard<std::mutex> lock(g_inputMutex);
             if (!g_passwordRequestPending || g_hasPasswordResponse) return;
             g_receivedPassword = Utf8ToWide(pwd);
+            SecureZeroMemory(pwd.data(), pwd.size());
             g_hasPasswordResponse = true;
         }
         g_inputCv.notify_all();
@@ -273,14 +276,16 @@ void ProcessIpcInputLine(const std::string& line) {
     }
 }
 
-void StartIpcListenerThread() {
-    std::thread([]() {
+void StartIpcListenerThread(bool managed) {
+    std::thread([managed]() {
         std::string line;
         while (std::getline(std::cin, line)) {
             if (!line.empty()) {
                 ProcessIpcInputLine(line);
+                SecureZeroMemory(line.data(), line.size());
             }
         }
+        if (managed) CancelExtraction();
     }).detach();
 }
 
@@ -297,11 +302,15 @@ bool CheckPauseOrCancel() {
 // One credential per archive attempt, shared by the open and extract callbacks.
 class ArchivePassword {
 public:
+    ~ArchivePassword() { SecureZeroMemory(m_password.data(), m_password.size() * sizeof(wchar_t)); }
+    bool Requested() const { return m_requested; }
+
     std::wstring Get(bool* outCanceled) {
         std::lock_guard<std::mutex> passwordLock(m_mutex);
         if (!g_isCanceled && !m_hasPassword) {
             std::unique_lock<std::mutex> inputLock(g_inputMutex);
             if (!g_isCanceled) {
+                m_requested = true;
                 g_passwordRequestPending = true;
                 g_hasPasswordResponse = false;
                 SendIpcMessage("{\"type\":\"password_request\"}");
@@ -311,6 +320,7 @@ public:
                     m_password.swap(g_receivedPassword);
                     m_hasPassword = true;
                 }
+                SecureZeroMemory(g_receivedPassword.data(), g_receivedPassword.size() * sizeof(wchar_t));
                 g_receivedPassword.clear();
             }
         }
@@ -321,6 +331,7 @@ public:
 private:
     std::mutex m_mutex;
     bool m_hasPassword = false;
+    std::atomic<bool> m_requested{false};
     std::wstring m_password;
 };
 
@@ -336,13 +347,10 @@ struct ItemPlan {
     uint32_t declaredUnicode = 0;  // 格式已声明 Unicode 的名称数量
     uint32_t legacyNames = 0;      // 缺少编码声明的非 ASCII 名称数量
     uint32_t undecodableNames = 0; // 无法可靠解码的名称数量
-    uint64_t declaredTotal = 0;
+    bool allSizesKnown = true;
+    uint64_t declaredKnownBytes = 0;
+    uint32_t unsafeItems = 0;
 };
-
-// 是否为可识别的归档内容（按文件签名，不依赖扩展名）
-bool LooksLikeArchivePayload(const std::wstring& path) {
-    return ArchiveNames::LooksLikeZip(path) || ArchiveNames::LooksLikeTar(path);
-}
 
 // 构建条目计划：名称来源优先使用归档内的原始名称字节，其次才使用引擎解码结果。
 ItemPlan BuildItemPlan(IInArchive* archive,
@@ -370,15 +378,12 @@ ItemPlan BuildItemPlan(IInArchive* archive,
         rawNames.clear();
     }
 
-    std::wstring derivedName;
-    bool derivedNeeded = false;
-
     for (uint32_t i = 0; i < numItems; ++i) {
         PROPVARIANT propPath;
         PropVariantInit(&propPath);
         std::wstring engineName;
         if (SUCCEEDED(archive->GetProperty(i, kpidPath, &propPath)) && propPath.vt == VT_BSTR && propPath.bstrVal) {
-            engineName = propPath.bstrVal;
+            engineName.assign(propPath.bstrVal, SysStringLen(propPath.bstrVal));
         }
         PropVariantClear(&propPath);
 
@@ -398,21 +403,23 @@ ItemPlan BuildItemPlan(IInArchive* archive,
             itemPath = engineName;
         }
 
-        if (itemPath.empty() && numItems == 1) {
-            if (derivedNeeded) {
-                itemPath = derivedName;
-            } else {
-                derivedNeeded = true;
-                std::wstring baseName;
-                if (HasCompoundTarSuffix(archivePath, &baseName) && !baseName.empty()) {
-                    derivedName = baseName + L".tar";
-                } else {
-                    derivedName = DeriveSingleStreamFilename(archivePath);
-                }
-                itemPath = derivedName;
-            }
-        }
+        if (itemPath.empty() && numItems == 1)
+            itemPath = DeriveSingleStreamFilename(archivePath);
 
+        const auto hasProperty = [&](PROPID property) {
+            PROPVARIANT value{};
+            const bool present = archive->GetProperty(i, property, &value) == S_OK &&
+                ((value.vt == VT_BSTR && SysStringByteLen(value.bstrVal) != 0) ||
+                 (value.vt == VT_BOOL && value.boolVal == VARIANT_TRUE));
+            PropVariantClear(&value);
+            return present;
+        };
+        if (!PathSanitizer::IsSafeRelativeSyntax(itemPath) || hasProperty(kpidSymLink) ||
+            hasProperty(kpidNtReparse) || hasProperty(kpidHardLink) ||
+            hasProperty(kpidCopyLink) || hasProperty(kpidIsAltStream)) {
+            ++plan.unsafeItems;
+            continue;
+        }
         itemPath = PathSanitizer::SanitizePathSeparators(itemPath);
 
         PROPVARIANT propSize;
@@ -422,6 +429,7 @@ ItemPlan BuildItemPlan(IInArchive* archive,
             if (propSize.vt == VT_UI8) itemSize = propSize.uhVal.QuadPart;
             else if (propSize.vt == VT_UI4) itemSize = propSize.ulVal;
         }
+        const bool itemSizeKnown = propSize.vt == VT_UI8 || propSize.vt == VT_UI4;
         PropVariantClear(&propSize);
 
         PROPVARIANT propIsDir;
@@ -447,7 +455,11 @@ ItemPlan BuildItemPlan(IInArchive* archive,
         plan.targetPaths[i] = itemPath;
         plan.toExtract[i] = true;
         if (!isDir) {
-            plan.declaredTotal += itemSize;
+            const auto maxBytes = (std::numeric_limits<uint64_t>::max)();
+            if (!itemSizeKnown || itemSize > maxBytes - plan.declaredKnownBytes)
+                plan.allSizesKnown = false;
+            else
+                plan.declaredKnownBytes += itemSize;
         }
     }
 
@@ -500,12 +512,7 @@ bool RequestEncodingChoice(uint32_t preferredCp, const ItemPlan& plan,
     std::unique_lock<std::mutex> lock(g_inputMutex);
     bool answered = g_inputCv.wait_for(lock, std::chrono::minutes(10),
         []() { return g_hasEncodingResponse || g_isCanceled; });
-    if (g_isCanceled) return false;
-    if (!answered) {
-        // Proxy 长时间无响应：退回默认代码页，避免任务永久挂起
-        outCp = 0;
-        return true;
-    }
+    if (!answered || g_isCanceled) return false;
     outCp = g_chosenCodePage;
     return true;
 }
@@ -520,6 +527,9 @@ struct InnerExtractResult {
     std::wstring deliveryRootName;  // 相对 staging 的隔离交付根目录名
     std::string errorReason;
     std::vector<DeliveredItemInfo> items;
+    uint64_t limitBytes = 0;
+    uint64_t writtenBytes = 0;
+    bool sizeKnown = true;
     uint32_t totalItems = 0;
     uint32_t policyFiltered = 0;
     uint32_t skipped = 0;
@@ -528,20 +538,20 @@ struct InnerExtractResult {
     uint64_t completedBytes = 0;
 };
 
-std::function<void(const std::wstring&, uint64_t, uint64_t)> MakeProgressCallback(const char* phase) {
-    return [phase](const std::wstring& relPath, uint64_t completedBytes, uint64_t totalBytes) {
+std::function<void(const std::wstring&, uint64_t, uint64_t)> MakeProgressCallback(const char* phase, bool sizeKnown) {
+    return [phase, sizeKnown](const std::wstring& relPath, uint64_t completedBytes, uint64_t totalBytes) {
         static std::mutex s_mutex;
         static auto s_last = std::chrono::steady_clock::time_point{};
+        std::lock_guard<std::mutex> lock(s_mutex);
         auto now = std::chrono::steady_clock::now();
         auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - s_last).count();
-        if (elapsedMs >= 30 || (totalBytes > 0 && completedBytes >= totalBytes)) {
-            std::lock_guard<std::mutex> lock(s_mutex);
+        if (elapsedMs >= 30 || (sizeKnown && totalBytes > 0 && completedBytes == totalBytes)) {
             s_last = now;
             std::stringstream ss;
             ss << "{\"type\":\"progress\",\"phase\":\"" << phase
                << "\",\"current_file\":\"" << EscapeJsonString(WideToUtf8(relPath))
                << "\",\"completed_bytes\":" << completedBytes
-               << ",\"total_bytes\":" << totalBytes << "}";
+               << ",\"total_bytes\":" << totalBytes << ",\"size_known\":" << (sizeKnown ? "true" : "false") << "}";
             SendIpcMessage(ss.str());
         }
     };
@@ -552,7 +562,7 @@ InnerExtractResult ExpandInnerArchive(SevenZipLibrary& lib7z,
                                       const std::wstring& payloadPath,
                                       uint32_t codePage,
                                       bool requireTar,
-                                      bool strictCodePage) {
+                                      bool strictCodePage, uint64_t explicitBudget) {
     InnerExtractResult result;
     std::error_code ec;
 
@@ -583,11 +593,14 @@ InnerExtractResult ExpandInnerArchive(SevenZipLibrary& lib7z,
     }
 
     ArchivePassword innerPassword;
-    auto requestPassword = [&innerPassword](bool* outCanceled) { return innerPassword.Get(outCanceled); };
+    std::function<std::wstring(bool*)> requestPassword;
+    if (!requireTar) requestPassword = [&innerPassword](bool* outCanceled) { return innerPassword.Get(outCanceled); };
     WorkerOpenCallback* innerOpenCallback = new WorkerOpenCallback(payloadPath, requestPassword);
 
     IInArchive* innerArchive = nullptr;
-    if (!lib7z.DetectAndCreateArchive(innerStream, ext, &innerArchive, innerOpenCallback, codePage) || !innerArchive) {
+    const std::vector<std::wstring> hints = requireTar ? std::vector<std::wstring>{L"tar"} : std::vector<std::wstring>{};
+    if (!lib7z.DetectAndCreateArchive(innerStream, ext, &innerArchive, innerOpenCallback, codePage,
+        hints, requireTar, [&] { return g_isCanceled || innerPassword.Requested(); }) || !innerArchive) {
         innerOpenCallback->Release();
         innerStream->Release();
         result.kind = g_isCanceled ? InnerExtractResult::Kind::Canceled : InnerExtractResult::Kind::Failed;
@@ -610,8 +623,7 @@ InnerExtractResult ExpandInnerArchive(SevenZipLibrary& lib7z,
     std::wstring deliverName = L".unbox_deliver_" + std::to_wstring(GetCurrentProcessId()) + L"_" +
                                std::to_wstring(std::chrono::steady_clock::now().time_since_epoch().count());
     fs::path deliverDir = fs::path(stagingDir) / deliverName;
-    fs::create_directories(deliverDir, ec);
-    if (ec) {
+    if (!fs::create_directory(deliverDir, ec)) {
         innerArchive->Close();
         innerArchive->Release();
         innerOpenCallback->Release();
@@ -640,8 +652,17 @@ InnerExtractResult ExpandInnerArchive(SevenZipLibrary& lib7z,
     }
 
     // 内层独立输出预算（以实际声明大小为准，避免与外层共用一份预算造成误判）
-    uint64_t innerBudgetLimit = plan.declaredTotal + std::max<uint64_t>(plan.declaredTotal / 4, 64ull * 1024 * 1024);
-    if (innerBudgetLimit < 128ull * 1024 * 1024) innerBudgetLimit = 128ull * 1024 * 1024;
+    uint64_t innerBudgetLimit = explicitBudget ? explicitBudget :
+        DefaultBudget(plan.declaredKnownBytes, 128ull * 1024 * 1024);
+    if (!HasDiskSpace(deliverDir.wstring(), (std::max)(plan.declaredKnownBytes, explicitBudget))) {
+        innerArchive->Close();
+        innerArchive->Release();
+        innerOpenCallback->Release();
+        innerStream->Release();
+        result.kind = InnerExtractResult::Kind::Failed;
+        result.errorReason = "insufficient_disk_space";
+        return result;
+    }
     OutputBudget innerBudget(innerBudgetLimit);
 
     WorkerExtractCallback* innerCallback = new WorkerExtractCallback(
@@ -650,27 +671,32 @@ InnerExtractResult ExpandInnerArchive(SevenZipLibrary& lib7z,
         canonicalRoot,
         plan.targetPaths,
         plan.toExtract,
-        MakeProgressCallback("inner"),
+        MakeProgressCallback("inner", plan.allSizesKnown),
         requestPassword,
         CheckPauseOrCancel,
         &innerBudget
     );
-    innerCallback->SetDeclaredTotal(plan.declaredTotal);
+    innerCallback->SetDeclaredTotal(plan.declaredKnownBytes);
 
     HRESULT hr = innerArchive->Extract(nullptr, (uint32_t)-1, false, innerCallback);
 
-    bool ok = SUCCEEDED(hr) && !innerCallback->HasError() && !innerBudget.Exceeded();
-    if (innerCallback->HasWrongPassword()) result.errorReason = "wrong_password";
+    const DWORD writeError = innerCallback->GetWriteError();
+    if (innerBudget.Exceeded()) result.errorReason = "output_budget_exceeded";
+    else if (IsDiskFull(hr, writeError)) result.errorReason = "insufficient_disk_space";
+    else if (innerCallback->HasWrongPassword()) result.errorReason = "wrong_password";
     else if (innerCallback->HasCrcError()) result.errorReason = "crc_error";
     else if (innerCallback->HasDataError()) result.errorReason = "data_error";
     else if (innerCallback->HasUnsupportedMethod()) result.errorReason = "unsupported_method";
-    else if (innerCallback->HasError()) result.errorReason = "extract_error";
-    else if (innerBudget.Exceeded()) result.errorReason = "output_budget_exceeded";
-    else if (FAILED(hr)) result.errorReason = "corrupted_inner_archive";
+    else if (writeError != ERROR_SUCCESS || innerCallback->HasError()) result.errorReason = "extract_error";
+    else if (hr != S_OK) result.errorReason = "corrupted_inner_archive";
+    const bool ok = result.errorReason.empty();
 
     result.totalItems = innerNumItems;
     result.policyFiltered = plan.policyFiltered;
-    result.unsafeItems = innerCallback->GetUnsafeCount();
+    result.unsafeItems = plan.unsafeItems + innerCallback->GetUnsafeCount();
+    result.limitBytes = innerBudget.Limit();
+    result.writtenBytes = innerBudget.Used();
+    result.sizeKnown = plan.allSizesKnown;
     result.missingItems = innerCallback->CountMissing();
     result.completedBytes = innerCallback->GetCompletedBytes();
     if (ok) {
@@ -709,23 +735,28 @@ bool WriteDeliveryManifest(const std::wstring& manifestPath,
                            const std::wstring& deliveryRootName,
                            const std::vector<DeliveredItemInfo>& items) {
     if (manifestPath.empty()) return true;
-    std::ofstream out(manifestPath, std::ios::binary | std::ios::trunc);
-    if (!out) return false;
+    FILE* file = nullptr;
+    if (_wfopen_s(&file, manifestPath.c_str(), L"wbx") != 0) return false;
+    std::unique_ptr<FILE, decltype(&std::fclose)> output(file, &std::fclose);
+    const auto write = [&](const std::string& bytes) {
+        return std::fwrite(bytes.data(), 1, bytes.size(), output.get()) == bytes.size();
+    };
 
-    out << "{\"version\":1,\"delivery_root\":\"" << EscapeJsonString(WideToUtf8(deliveryRootName))
-        << "\",\"item_count\":" << items.size() << ",\"items\":[";
+    if (!write("{\"version\":1,\"delivery_root\":\"" + EscapeJsonString(WideToUtf8(deliveryRootName)) +
+        "\",\"item_count\":" + std::to_string(items.size()) + ",\"items\":[")) return false;
     bool first = true;
     for (const auto& item : items) {
-        if (!first) out << ",";
+        std::ostringstream entry;
+        if (!first) entry << ",";
         first = false;
-        out << "{\"p\":\"" << EscapeJsonString(WideToUtf8(item.relDiskPath)) << "\""
+        entry << "{\"p\":\"" << EscapeJsonString(WideToUtf8(item.relDiskPath)) << "\""
             << ",\"d\":" << (item.isDir ? 1 : 0)
             << ",\"s\":" << item.size
             << ",\"c\":" << item.crc << "}";
+        if (!write(entry.str())) return false;
     }
-    out << "]}";
-    out.flush();
-    return out.good();
+    if (!write("]}")) return false;
+    return std::fclose(output.release()) == 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -743,6 +774,8 @@ int wmain(int argc, wchar_t* argv[]) {
     std::wstring manifestPath;
     uint32_t userCodePage = 0;
     uint64_t explicitBudget = 0;
+    uint64_t explicitInnerBudget = 0;
+    bool managed = false;
 
     for (int i = 1; i < argc; ++i) {
         std::wstring arg = argv[i];
@@ -756,8 +789,14 @@ int wmain(int argc, wchar_t* argv[]) {
             dllPath = argv[++i];
         } else if (arg == L"--manifest" && i + 1 < argc) {
             manifestPath = argv[++i];
-        } else if (arg == L"--max-output-bytes" && i + 1 < argc) {
-            explicitBudget = _wcstoui64(argv[++i], nullptr, 10);
+        } else if (arg == L"--max-output-bytes" || arg == L"--max-inner-output-bytes") {
+            auto& limit = arg == L"--max-output-bytes" ? explicitBudget : explicitInnerBudget;
+            if (i + 1 >= argc || !ParseBudget(argv[++i], limit)) {
+                SendIpcMessage("{\"type\":\"error\",\"message\":\"Invalid output budget\"}");
+                return 1;
+            }
+        } else if (arg == L"--managed") {
+            managed = true;
         } else if (arg == L"--cp" && i + 1 < argc) {
             userCodePage = (uint32_t)_wtoi(argv[++i]);
         }
@@ -769,17 +808,32 @@ int wmain(int argc, wchar_t* argv[]) {
         return 1;
     }
 
-    StartIpcListenerThread();
+    if (managed) {
+        std::string start;
+        if (!std::getline(std::cin, start) || start != "{\"type\":\"start\"}") return 1;
+    }
+    StartIpcListenerThread(managed);
+
+    const auto stagingRoot = PathSanitizer::ResolveCanonicalDirectory(stagingDir);
+    PathSanitizer::PinnedDirectories pinnedStaging;
+    DWORD stagingError = ERROR_SUCCESS;
+    if (stagingRoot.empty() || !PathSanitizer::EnsureDirectory(
+        stagingRoot, stagingRoot, stagingError, &pinnedStaging)) {
+        SendIpcMessage("{\"type\":\"error\",\"message\":\"Cannot verify staging directory\"}");
+        return 7;
+    }
 
     if (dllPath.empty()) {
-        wchar_t exePath[MAX_PATH];
-        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-        fs::path exeDir = fs::path(exePath).parent_path();
-        if (fs::exists(exeDir / L"7z.dll")) {
-            dllPath = (exeDir / L"7z.dll").wstring();
-        } else if (fs::exists(exeDir / L"assets" / L"7z.dll")) {
-            dllPath = (exeDir / L"assets" / L"7z.dll").wstring();
+        std::wstring exePath(32768, L'\0');
+        const DWORD length = GetModuleFileNameW(nullptr, exePath.data(), static_cast<DWORD>(exePath.size()));
+        if (length != 0 && length < exePath.size()) {
+            exePath.resize(length);
+            dllPath = (fs::path(exePath).parent_path() / L"7z.dll").wstring();
         }
+    } else {
+        std::error_code error;
+        const auto absolute = fs::absolute(dllPath, error);
+        if (!error) dllPath = absolute.wstring();
     }
 
     SevenZipLibrary lib7z;
@@ -798,16 +852,24 @@ int wmain(int argc, wchar_t* argv[]) {
     auto requestPassword = [&archivePassword](bool* outCanceled) { return archivePassword.Get(outCanceled); };
     WorkerOpenCallback* openCallback = new WorkerOpenCallback(archivePath, requestPassword);
 
+    const auto route = ClassifyArchiveName(fs::path(archivePath).filename().wstring());
+    const bool outerIsCompoundTar = HasCompoundTarSuffix(archivePath);
+    const bool outerIsSplitVolume = route.kind == ArchiveKind::Split;
     std::wstring ext = fs::path(archivePath).extension().wstring();
+    std::wstring handler;
     IInArchive* archive = nullptr;
-    if (!lib7z.DetectAndCreateArchive(inStream, ext, &archive, openCallback, userCodePage) || !archive) {
+    if (!lib7z.DetectAndCreateArchive(inStream, ext, &archive, openCallback, userCodePage, route.handlerHints,
+        outerIsCompoundTar || outerIsSplitVolume, [&] { return g_isCanceled || archivePassword.Requested(); },
+        &handler) || !archive) {
         openCallback->Release();
         inStream->Release();
         if (g_isCanceled) {
             SendIpcMessage("{\"type\":\"canceled\"}");
             return 0;
         }
-        SendIpcMessage("{\"type\":\"error\",\"message\":\"Unsupported or unrecognized archive format or incorrect password\"}");
+        SendIpcMessage(archivePassword.Requested()
+            ? "{\"type\":\"error\",\"error_reason\":\"password_or_data_error\",\"message\":\"Password incorrect or data damaged\"}"
+            : "{\"type\":\"error\",\"message\":\"Unsupported or unrecognized archive format\"}");
         return 4;
     }
 
@@ -835,8 +897,9 @@ int wmain(int argc, wchar_t* argv[]) {
             archive->Release();
             openCallback->Release();
             inStream->Release();
-            SendIpcMessage("{\"type\":\"canceled\"}");
-            return 0;
+            SendIpcMessage(g_isCanceled ? "{\"type\":\"canceled\"}"
+                : "{\"type\":\"error\",\"error_reason\":\"prompt_timeout\",\"message\":\"Encoding prompt timed out\"}");
+            return g_isCanceled ? 0 : 5;
         }
         // 用户一旦显式选择（即使与当前代码页相同）即切换为严格模式并重建计划，
         // 确保“选择框预览”与“落盘”走同一路径，绝不套用启发式改写覆盖用户选择。
@@ -847,19 +910,34 @@ int wmain(int argc, wchar_t* argv[]) {
         }
     }
 
-    // 磁盘空间预算预检（声明大小）
-    ULARGE_INTEGER freeBytesAvailableToCaller{};
-    ULARGE_INTEGER totalNumberOfBytes{};
-    ULARGE_INTEGER totalNumberOfFreeBytes{};
-    if (GetDiskFreeSpaceExW(stagingDir.c_str(), &freeBytesAvailableToCaller, &totalNumberOfBytes, &totalNumberOfFreeBytes)) {
-        if (plan.declaredTotal > 0 && freeBytesAvailableToCaller.QuadPart < plan.declaredTotal) {
+    std::optional<uint64_t> storedLz4Size;
+    if (!plan.allSizesKnown && numItems == 1 && plan.toExtract[0] && _wcsicmp(handler.c_str(), L"lz4") == 0) {
+        uint64_t physicalSize = 0;
+        bool restored = true;
+        if (inStream->GetSize(&physicalSize) == S_OK)
+            storedLz4Size = TryGetStoredLz4FrameSize(*inStream, physicalSize, restored, CheckPauseOrCancel);
+        if (!restored || g_isCanceled) {
             archive->Close();
             archive->Release();
             openCallback->Release();
             inStream->Release();
-            SendIpcMessage("{\"type\":\"error\",\"message\":\"Insufficient disk space in staging directory\"}");
-            return 7;
+            SendIpcMessage(g_isCanceled ? "{\"type\":\"canceled\"}"
+                : "{\"type\":\"error\",\"message\":\"Cannot restore input stream position\"}");
+            return g_isCanceled ? 0 : 5;
         }
+        if (storedLz4Size) {
+            plan.declaredKnownBytes = *storedLz4Size;
+            plan.allSizesKnown = true;
+        }
+    }
+
+    if (!HasDiskSpace(stagingDir, (std::max)(plan.declaredKnownBytes, explicitBudget))) {
+        archive->Close();
+        archive->Release();
+        openCallback->Release();
+        inStream->Release();
+        SendIpcMessage("{\"type\":\"error\",\"error_reason\":\"insufficient_disk_space\",\"message\":\"Insufficient disk space in staging directory\"}");
+        return 7;
     }
 
     bool userSkipped = false;
@@ -885,17 +963,14 @@ int wmain(int argc, wchar_t* argv[]) {
         std::unique_lock<std::mutex> lock(g_inputMutex);
         bool answered = g_inputCv.wait_for(lock, std::chrono::minutes(10),
             []() { return g_hasInvalidCharsResponse || g_isCanceled; });
-        if (!answered && !g_isCanceled) {
-            // Proxy 无响应：按默认策略批量重命名，避免任务永久挂起
-            g_invalidCharsAction = "batch_rename";
-        }
-
-        if (g_isCanceled) {
+        if (!answered || g_isCanceled) {
             archive->Close();
             archive->Release();
             openCallback->Release();
             inStream->Release();
-            return 0;
+            SendIpcMessage(g_isCanceled ? "{\"type\":\"canceled\"}"
+                : "{\"type\":\"error\",\"error_reason\":\"prompt_timeout\",\"message\":\"Filename prompt timed out\"}");
+            return g_isCanceled ? 0 : 5;
         }
 
         if (g_invalidCharsAction == "batch_rename") {
@@ -920,16 +995,13 @@ int wmain(int argc, wchar_t* argv[]) {
     }
 
     // 复合归档 / 分卷：外层先解到隔离目录，再按内容决定是否展开内层
-    bool outerIsCompoundTar = HasCompoundTarSuffix(archivePath);
-    bool outerIsSplitVolume = IsSplitVolume(archivePath);
     bool outerNeedsInnerCheck = outerIsCompoundTar || outerIsSplitVolume;
 
     std::wstring outerExtractionRoot = stagingDir;
     if (outerNeedsInnerCheck) {
         outerExtractionRoot = (fs::path(stagingDir) / L".unbox_outer_tmp").wstring();
         std::error_code ec;
-        fs::create_directories(outerExtractionRoot, ec);
-        if (ec) {
+        if (!fs::create_directory(outerExtractionRoot, ec)) {
             archive->Close();
             archive->Release();
             openCallback->Release();
@@ -950,19 +1022,17 @@ int wmain(int argc, wchar_t* argv[]) {
     }
 
     // 统一输出预算：声明大小之外再留出合理余量，杜绝声明失真导致写爆磁盘
-    uint64_t budgetLimit = explicitBudget;
-    if (budgetLimit == 0) {
-        uint64_t slack = plan.declaredTotal / 4;
-        if (slack < 64ull * 1024 * 1024) slack = 64ull * 1024 * 1024;
-        budgetLimit = plan.declaredTotal + slack;
-        if (budgetLimit < 256ull * 1024 * 1024) budgetLimit = 256ull * 1024 * 1024;
-    }
+    uint64_t budgetLimit = storedLz4Size
+        ? (explicitBudget ? (std::min)(explicitBudget, *storedLz4Size) : *storedLz4Size)
+        : (explicitBudget ? explicitBudget : DefaultBudget(plan.declaredKnownBytes, 256ull * 1024 * 1024));
     OutputBudget budget(budgetLimit);
 
     {
         std::stringstream ss;
         ss << "{\"type\":\"init\",\"total_items\":" << numItems
-           << ",\"total_bytes\":" << plan.declaredTotal
+           << ",\"total_bytes\":" << plan.declaredKnownBytes
+           << ",\"size_known\":" << (plan.allSizesKnown ? "true" : "false")
+           << ",\"catalog_sha256\":\"" << ArchiveFormatCatalogSha256 << "\""
            << ",\"mac_filtered\":" << (plan.policyFiltered > 0 ? "true" : "false")
            << ",\"policy_filtered_items\":" << plan.policyFiltered
            << ",\"code_page\":" << effectiveCp
@@ -976,40 +1046,35 @@ int wmain(int argc, wchar_t* argv[]) {
         canonicalRoot,
         plan.targetPaths,
         plan.toExtract,
-        MakeProgressCallback("outer"),
+        MakeProgressCallback("outer", plan.allSizesKnown),
         requestPassword,
         CheckPauseOrCancel,
         &budget
     );
-    callback->SetDeclaredTotal(plan.declaredTotal);
+    callback->SetDeclaredTotal(plan.declaredKnownBytes);
 
     HRESULT hr = archive->Extract(nullptr, (uint32_t)-1, false, callback);
 
-    if ((FAILED(hr) && !callback->HasWrongPassword()) || g_isCanceled) {
-        uint64_t completedBytes = callback->GetCompletedBytes();
+    if (g_isCanceled) {
         callback->Release();
         archive->Close();
         archive->Release();
         openCallback->Release();
         inStream->Release();
-        if (g_isCanceled) {
-            SendIpcMessage("{\"type\":\"canceled\"}");
-            return 0;
-        }
-        SendIpcMessage("{\"type\":\"error\",\"message\":\"Extraction failed with HRESULT: " +
-                       std::to_string(hr) + " (completed bytes: " + std::to_string(completedBytes) + ")\"}");
-        return 6;
+        SendIpcMessage("{\"type\":\"canceled\"}");
+        return 0;
     }
 
     std::vector<DeliveredItemInfo> delivered = callback->GetDeliveredItems();
     uint64_t completedBytes = callback->GetCompletedBytes();
-    uint32_t unsafeItems = callback->GetUnsafeCount();
+    uint32_t unsafeItems = plan.unsafeItems + callback->GetUnsafeCount();
     uint32_t missingItems = callback->CountMissing();
     bool extractError = callback->HasError();
     bool wrongPassword = callback->HasWrongPassword();
     bool crcError = callback->HasCrcError();
     bool dataError = callback->HasDataError();
     bool unsupported = callback->HasUnsupportedMethod();
+    const DWORD writeError = callback->GetWriteError();
     std::vector<std::wstring> openedVolumes = openCallback->GetOpenedVolumes();
     std::vector<VolumeIdentityInfo> volumeIdentities = openCallback->GetVolumeIdentities();
 
@@ -1021,12 +1086,20 @@ int wmain(int argc, wchar_t* argv[]) {
     inStream->Release();
 
     std::string errorReason;
-    if (wrongPassword) errorReason = "wrong_password";
-    else if (crcError) errorReason = "crc_error";
-    else if (dataError) errorReason = "data_error";
+    const char* failurePhase = "outer";
+    uint64_t limitBytes = budget.Limit();
+    uint64_t writtenBytes = budget.Used();
+    uint64_t intermediateBytes = 0;
+    bool sizeKnown = plan.allSizesKnown;
+    if (budget.Exceeded()) errorReason = "output_budget_exceeded";
+    else if (IsDiskFull(hr, writeError)) errorReason = "insufficient_disk_space";
+    else if (wrongPassword) errorReason = "wrong_password";
+    else if (crcError) errorReason = archivePassword.Requested() ? "password_or_data_error" : "crc_error";
+    else if (dataError) errorReason = archivePassword.Requested() ? "password_or_data_error" : "data_error";
     else if (unsupported) errorReason = "unsupported_method";
-    else if (extractError) errorReason = "extract_error";
-    else if (budget.Exceeded()) errorReason = "output_budget_exceeded";
+    else if (writeError != ERROR_SUCCESS || extractError) errorReason = "extract_error";
+    else if (hr != S_OK) errorReason = archivePassword.Requested() ? "password_or_data_error" : "extract_error";
+    else if (storedLz4Size && writtenBytes != *storedLz4Size) errorReason = "data_error";
 
     bool hardFailure = extractError || budget.Exceeded() || !errorReason.empty();
     std::wstring deliveryRootName;  // 相对 staging 的交付根；空表示 staging 本身
@@ -1037,7 +1110,7 @@ int wmain(int argc, wchar_t* argv[]) {
     if (!hardFailure && outerNeedsInnerCheck) {
         if (delivered.size() == 1 && !delivered[0].isDir) {
             std::wstring payload = delivered[0].diskPath;
-            InnerExtractResult inner = ExpandInnerArchive(lib7z, stagingDir, payload, effectiveCp, outerIsCompoundTar, cpExplicit);
+            InnerExtractResult inner = ExpandInnerArchive(lib7z, stagingDir, payload, effectiveCp, outerIsCompoundTar, cpExplicit, explicitInnerBudget);
             if (inner.kind == InnerExtractResult::Kind::Success) {
                 delivered = inner.items;
                 totalItems = inner.totalItems;
@@ -1054,12 +1127,15 @@ int wmain(int argc, wchar_t* argv[]) {
             } else if (inner.kind == InnerExtractResult::Kind::Failed) {
                 hardFailure = true;
                 errorReason = inner.errorReason.empty() ? "corrupted_archive" : inner.errorReason;
-                std::error_code ec;
-                fs::remove_all(stagingDir, ec); // 清理残损中间产物，绝不留下半成品
+                failurePhase = "inner";
+                limitBytes = inner.limitBytes;
+                writtenBytes = inner.writtenBytes;
+                intermediateBytes = delivered[0].size;
+                sizeKnown = inner.sizeKnown;
+
                 delivered.clear();
             } else if (inner.kind == InnerExtractResult::Kind::Canceled) {
-                std::error_code ec;
-                fs::remove_all(stagingDir, ec);
+
                 SendIpcMessage("{\"type\":\"canceled\"}");
                 return 0;
             } else {
@@ -1070,8 +1146,7 @@ int wmain(int argc, wchar_t* argv[]) {
             // 约定复合 TAR 必须恰好交付一个 TAR 载荷
             hardFailure = true;
             errorReason = "inner_payload_missing";
-            std::error_code ec;
-            fs::remove_all(stagingDir, ec);
+
             delivered.clear();
         } else {
             // 分卷容器直接解出了多个条目：整体交付隔离目录
@@ -1080,15 +1155,18 @@ int wmain(int argc, wchar_t* argv[]) {
     }
 
     if (hardFailure) {
-        std::error_code ec;
-        fs::remove_all(stagingDir, ec);
+        if (outerNeedsInnerCheck) {
+            std::error_code cleanupError;
+            fs::remove_all(outerExtractionRoot, cleanupError);
+        }
         delivered.clear();
     }
 
     // 交付清单：路径一律相对交付根目录，供 Proxy 逐项对账（长度 + CRC32）
-    bool manifestOk = true;
-    if (!hardFailure) {
-        manifestOk = WriteDeliveryManifest(manifestPath, deliveryRootName, delivered);
+    const bool manifestOk = !hardFailure && WriteDeliveryManifest(manifestPath, deliveryRootName, delivered);
+    if (!hardFailure && !manifestOk) {
+        hardFailure = true;
+        errorReason = "manifest_write_failed";
     }
 
     bool userSkipOrUnsafe = userSkipped || unsafeItems > 0 || missingItems > 0;
@@ -1112,6 +1190,11 @@ int wmain(int argc, wchar_t* argv[]) {
               << ",\"empty_archive\":" << ((delivered.empty() && !hardFailure) ? "true" : "false")
               << ",\"code_page\":" << effectiveCp
               << ",\"error_reason\":\"" << errorReason << "\""
+              << ",\"phase\":\"" << failurePhase << "\""
+              << ",\"limit_bytes\":" << limitBytes
+              << ",\"written_bytes\":" << writtenBytes
+              << ",\"intermediate_bytes\":" << intermediateBytes
+              << ",\"size_known\":" << (sizeKnown ? "true" : "false")
               << ",\"delivery_root\":\"" << EscapeJsonString(WideToUtf8(deliveryRootName)) << "\""
               << ",\"manifest\":\"" << EscapeJsonString(WideToUtf8(manifestPath)) << "\""
               << ",\"manifest_ok\":" << (manifestOk ? "true" : "false")

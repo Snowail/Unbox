@@ -9,29 +9,36 @@
 #include <functional>
 #include <string>
 
-// 统一输出预算：外层与内层提取共享同一份“实际写出字节”上限，
-// 用于兜底压缩炸弹与声明大小失真的样本。
+// Each extraction phase reserves its own write budget before touching disk.
 class OutputBudget {
 public:
-    explicit OutputBudget(uint64_t limit) : m_limit(limit), m_used(0), m_exceeded(false) {}
+    explicit OutputBudget(uint64_t limit) : m_limit(limit) {}
 
     bool Consume(uint64_t n) {
-        uint64_t used = m_used.fetch_add(n) + n;
-        if (used > m_limit) {
-            m_exceeded = true;
-            return false;
-        }
+        uint64_t reserved = m_reserved.load();
+        do {
+            if (n > m_limit - reserved) {
+                m_exceeded = true;
+                return false;
+            }
+        } while (!m_reserved.compare_exchange_weak(reserved, reserved + n));
         return true;
     }
 
+    void Settle(uint64_t reserved, uint64_t written) {
+        m_written.fetch_add(written);
+        m_reserved.fetch_sub(reserved - written);
+    }
+
     bool Exceeded() const { return m_exceeded; }
-    uint64_t Used() const { return m_used.load(); }
+    uint64_t Used() const { return m_written.load(); }
     uint64_t Limit() const { return m_limit; }
 
 private:
-    uint64_t m_limit;
-    std::atomic<uint64_t> m_used;
-    std::atomic<bool> m_exceeded;
+    const uint64_t m_limit;
+    std::atomic<uint64_t> m_reserved{0};
+    std::atomic<uint64_t> m_written{0};
+    std::atomic<bool> m_exceeded{false};
 };
 
 // 输入流包装
@@ -86,14 +93,13 @@ public:
         if (m_hFile == INVALID_HANDLE_VALUE) return E_FAIL;
         LARGE_INTEGER liDistanceToMove;
         liDistanceToMove.QuadPart = offset;
-        LARGE_INTEGER liNewFilePointer;
-        DWORD method = FILE_BEGIN;
-        if (seekOrigin == 1) method = FILE_CURRENT;
-        else if (seekOrigin == 2) method = FILE_END;
+        LARGE_INTEGER liNewFilePointer{};
+        if (seekOrigin != FILE_BEGIN && seekOrigin != FILE_CURRENT && seekOrigin != FILE_END) return E_INVALIDARG;
 
-        BOOL ok = SetFilePointerEx(m_hFile, liDistanceToMove, &liNewFilePointer, method);
+        if (!SetFilePointerEx(m_hFile, liDistanceToMove, &liNewFilePointer, seekOrigin))
+            return HRESULT_FROM_WIN32(GetLastError());
         if (newPosition) *newPosition = liNewFilePointer.QuadPart;
-        return ok ? S_OK : HRESULT_FROM_WIN32(GetLastError());
+        return S_OK;
     }
 
     HRESULT STDMETHODCALLTYPE GetSize(uint64_t *size) override {
@@ -107,9 +113,18 @@ public:
         return HRESULT_FROM_WIN32(GetLastError());
     }
 
-    static CInFileStream* OpenFile(const wchar_t* path) {
-        HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    static CInFileStream* OpenFile(const wchar_t* path, bool rejectReparse = false) {
+        const DWORD flags = rejectReparse ? FILE_FLAG_OPEN_REPARSE_POINT : FILE_ATTRIBUTE_NORMAL;
+        HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, flags, nullptr);
         if (h == INVALID_HANDLE_VALUE) return nullptr;
+        if (rejectReparse) {
+            FILE_ATTRIBUTE_TAG_INFO info{};
+            if (!GetFileInformationByHandleEx(h, FileAttributeTagInfo, &info, sizeof(info)) ||
+                (info.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) {
+                CloseHandle(h);
+                return nullptr;
+            }
+        }
         return new CInFileStream(h);
     }
 
@@ -174,7 +189,9 @@ public:
 
         DWORD bytesWritten = 0;
         BOOL ok = WriteFile(m_hFile, data, size, &bytesWritten, nullptr);
-        if (!ok) return HRESULT_FROM_WIN32(GetLastError());
+        const DWORD writeError = ok ? ERROR_SUCCESS : GetLastError();
+        if (!ok) m_lastWriteError = writeError;
+        if (m_budget) m_budget->Settle(size, bytesWritten);
 
         if (bytesWritten > 0) {
             m_crc.Update(data, bytesWritten);
@@ -185,11 +202,12 @@ public:
         }
 
         if (processedSize) *processedSize = bytesWritten;
-        return S_OK;
+        return ok ? S_OK : HRESULT_FROM_WIN32(writeError);
     }
 
     uint32_t GetCRC() const { return m_crc.GetDigest(); }
     uint64_t GetTotalWritten() const { return m_totalWritten; }
+    DWORD GetLastWriteError() const { return m_lastWriteError; }
 
     // 生产级安全创建：
     // 1. 用 CREATE_NEW 独占新建，同名冲突自动 "(2)" 递增，绝不静默截断；
@@ -252,6 +270,7 @@ private:
     LONG m_refCount;
     HANDLE m_hFile;
     uint64_t m_totalWritten;
+    DWORD m_lastWriteError = ERROR_SUCCESS;
     Crc32Hasher m_crc;
     std::function<void(uint64_t)> m_onBytesWritten;
     PauseCheckCallback m_checkPauseOrCancel;

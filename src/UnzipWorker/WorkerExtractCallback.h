@@ -183,18 +183,15 @@ public:
             return S_OK;
         }
 
-        // 确保父目录存在（同一父目录只做一次句柄级验证）
-        fs::path targetPath(safeFullPath);
-        std::wstring parentDir = targetPath.parent_path().wstring();
-        if (parentDir != m_lastCreatedParentDir) {
-            DWORD err = ERROR_SUCCESS;
-            if (!PathSanitizer::EnsureDirectory(m_canonicalRoot, parentDir, err)) {
-                m_hasError = true;
-                m_unsafeCount++;
-                if (index < m_disposition.size()) m_disposition[index] = ItemDisposition::UnsafeRejected;
-                return HRESULT_FROM_WIN32(err != ERROR_SUCCESS ? err : ERROR_ACCESS_DENIED);
-            }
-            m_lastCreatedParentDir = parentDir;
+        // Retain the verified directory handles until the output handle has been checked.
+        PathSanitizer::PinnedDirectories parents;
+        const std::wstring parentDir = fs::path(safeFullPath).parent_path().wstring();
+        DWORD parentError = ERROR_SUCCESS;
+        if (!PathSanitizer::EnsureDirectory(m_canonicalRoot, parentDir, parentError, &parents)) {
+            m_hasError = true;
+            m_unsafeCount++;
+            if (index < m_disposition.size()) m_disposition[index] = ItemDisposition::UnsafeRejected;
+            return HRESULT_FROM_WIN32(parentError != ERROR_SUCCESS ? parentError : ERROR_ACCESS_DENIED);
         }
 
         std::wstring actualDiskPath;
@@ -245,6 +242,8 @@ public:
             info.isDir = false;
             info.size = m_currentOutStream->GetTotalWritten();
             info.crc = m_currentOutStream->GetCRC();
+            if (m_currentOutStream->GetLastWriteError() != ERROR_SUCCESS)
+                m_writeError = m_currentOutStream->GetLastWriteError();
             info.opResult = resultEOperationResult;
             m_deliveredItems.push_back(info);
 
@@ -299,8 +298,9 @@ public:
             bool canceled = false;
             std::wstring pwd = m_onPasswordRequest(&canceled);
             if (canceled) return E_ABORT;
-            *password = SysAllocString(pwd.c_str());
-            return S_OK;
+            *password = SysAllocStringLen(pwd.data(), static_cast<UINT>(pwd.size()));
+            SecureZeroMemory(pwd.data(), pwd.size() * sizeof(wchar_t));
+            return *password ? S_OK : E_OUTOFMEMORY;
         }
         return E_ABORT;
     }
@@ -315,9 +315,10 @@ public:
                 *passwordIsDefined = 0;
                 return E_ABORT;
             }
-            *password = SysAllocString(pwd.c_str());
-            *passwordIsDefined = 1;
-            return S_OK;
+            *password = SysAllocStringLen(pwd.data(), static_cast<UINT>(pwd.size()));
+            SecureZeroMemory(pwd.data(), pwd.size() * sizeof(wchar_t));
+            *passwordIsDefined = *password != nullptr;
+            return *password ? S_OK : E_OUTOFMEMORY;
         }
         *passwordIsDefined = 0;
         return S_OK;
@@ -332,6 +333,10 @@ public:
     uint32_t GetUnsafeCount() const { return m_unsafeCount; }
     uint64_t GetTotalBytes() const { return m_totalBytes; }
     uint64_t GetCompletedBytes() const { return m_completedBytes; }
+    DWORD GetWriteError() const {
+        const DWORD pending = m_currentOutStream ? m_currentOutStream->GetLastWriteError() : ERROR_SUCCESS;
+        return pending != ERROR_SUCCESS ? pending : m_writeError;
+    }
 
     // 计划内“应交付但既未落盘、也未计入 unsafe/failed”的条目数量。
     // 少一项也必须成为 partial/failed 并禁止回收——清单与磁盘一致不足以证明全部计划条目已交付。
@@ -391,11 +396,11 @@ private:
     bool m_hasUnsupportedMethod;
 
     COutFileStream* m_currentOutStream;
+    DWORD m_writeError = ERROR_SUCCESS;
     std::wstring m_currentRelPath;
     std::wstring m_currentRelDiskPath;
     std::wstring m_currentDiskPath;
     bool m_currentIsDir;
-    std::wstring m_lastCreatedParentDir;
     uint32_t m_currentIndex;
     std::vector<DeliveredItemInfo> m_deliveredItems;
 };

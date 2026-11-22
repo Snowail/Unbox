@@ -91,25 +91,29 @@ namespace Tester
         }
 
         static WorkerRun RunWorker(string archive, string staging, string manifest, string? cp = null, string? password = null,
-                                   uint? encodingCp = null, string? invalidAction = null)
+                                   uint? encodingCp = null, string? invalidAction = null, ulong? limit = null)
         {
             var run = new WorkerRun { ManifestPath = manifest };
             var psi = new ProcessStartInfo
             {
                 FileName = _workerExe,
                 Arguments = $"--archive \"{archive}\" --staging \"{staging}\" --target-root \"{Path.GetFileNameWithoutExtension(archive)}\" " +
-                            $"--manifest \"{manifest}\"" + (cp != null ? $" --cp {cp}" : ""),
+                            $"--manifest \"{manifest}\"" + (cp != null ? $" --cp {cp}" : "") +
+                            (limit.HasValue ? FormattableString.Invariant($" --max-output-bytes {limit}") : "") + " --managed",
                 UseShellExecute = false,
                 RedirectStandardInput = true,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
-                StandardInputEncoding = Encoding.UTF8,
+                StandardInputEncoding = new UTF8Encoding(false),
                 StandardOutputEncoding = Encoding.UTF8,
                 StandardErrorEncoding = Encoding.UTF8,
                 CreateNoWindow = true
             };
 
             using var process = Process.Start(psi)!;
+            process.StandardInput.NewLine = "\n";
+            process.StandardInput.WriteLine("{\"type\":\"start\"}");
+            process.StandardInput.Flush();
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(60));
             var stderrTask = process.StandardError.ReadToEndAsync();
             string? line;
@@ -217,8 +221,10 @@ namespace Tester
                 CreateNoWindow = true,
                 RedirectStandardOutput = true
             });
-            process?.StandardOutput.ReadToEnd();
-            process?.WaitForExit();
+            if (process == null) throw new InvalidOperationException("无法启动造样 CLI");
+            process.StandardOutput.ReadToEnd();
+            process.WaitForExit();
+            if (process.ExitCode != 0) throw new InvalidOperationException($"造样 CLI 失败（退出代码 {process.ExitCode}）");
         }
 
         static void CreateZipStored(string zipPath, params (string Name, string Content)[] entries)
@@ -767,6 +773,8 @@ namespace Tester
         [STAThread]
         static int Main(string[] args)
         {
+            if (args is ["--job-parent", var parentWorkerPath, var parentArchivePath, var parentStaging, var parentManifestPath])
+                return RunJobParent(parentWorkerPath, parentArchivePath, parentStaging, parentManifestPath);
             try { System.Text.Encoding.RegisterProvider(System.Text.CodePagesEncodingProvider.Instance); } catch { }
 
             Console.WriteLine("==================================================");
@@ -774,16 +782,21 @@ namespace Tester
             Console.WriteLine("==================================================\n");
 
             bool round10Only = args.Length == 1 && args[0] == "--round10";
-            _testDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory,
-                round10Only ? "test_output_round10" : "test_output");
-            if (Directory.Exists(_testDir))
-            {
-                try { Directory.Delete(_testDir, true); } catch { }
-            }
+            _testDir = Path.Combine(Path.GetTempPath(), "Unbox-QA", Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(_testDir);
+            AppDomain.CurrentDomain.ProcessExit += (_, _) =>
+            {
+                try { Directory.Delete(_testDir, true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+            };
 
             _cli7z = Find7zCli();
             _workerExe = FindWorkerExe();
+
+            if (args is ["--real-sample", var sample])
+            {
+                TestRealLz4Sample(sample);
+                return _fail == 0 ? 0 : 1;
+            }
 
             if (round10Only)
             {
@@ -847,11 +860,12 @@ namespace Tester
             File.WriteAllText(recycleProbe, "identity-v1");
             var identityBefore = VolumeIdentity.Capture(recycleProbe);
             Assert("回收: 成功捕获源文件对象身份", identityBefore != null && identityBefore.Valid);
+            bool recycleSupported = ShellRecycleBin.IsRecycleBinSupported(recycleProbe);
             File.WriteAllText(recycleProbe, "identity-v2-changed-content");
             var replacedResult = ShellRecycleBin.RecycleVolumes(new[] { identityBefore! });
             Assert("回收: 源文件被替换后拒绝回收且文件保留",
                 !replacedResult.Success && File.Exists(recycleProbe) &&
-                replacedResult.Items.Any(i => !i.Recycled && i.Detail.Contains("替换")),
+                replacedResult.Items.Any(i => !i.Recycled && i.Detail.Contains(recycleSupported ? "替换" : "不支持回收站")),
                 replacedResult.Message);
 
             // 真实回收一个临时文件，并从回收站落点核对字节（证明可还原）
@@ -872,12 +886,18 @@ namespace Tester
                     restoredHash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(item.RecycledTo)));
                 }
             }
-            Assert("回收: 通过 Shell 逐项回收并返回回收站落点",
-                wentToRecycleBin && !string.IsNullOrEmpty(realResult.Items[0].RecycledTo),
-                $"{realResult.Message} | 明细: {(realResult.Items.Count > 0 ? realResult.Items[0].Detail : "无")} | 支持回收站={ShellRecycleBin.IsRecycleBinSupported(realRecycle)}");
-            Assert("回收: 回收站内的字节与源文件摘要一致（可还原）",
-                restoredHash == expectedHash || string.IsNullOrEmpty(restoredHash),
-                string.IsNullOrEmpty(restoredHash) ? "未取得回收站落点，跳过摘要比对" : restoredHash);
+            if (recycleSupported)
+            {
+                Assert("回收: 通过 Shell 逐项回收并返回回收站落点",
+                    wentToRecycleBin && !string.IsNullOrEmpty(realResult.Items[0].RecycledTo), realResult.Message);
+                Assert("回收: 回收站内的字节与源文件摘要一致", restoredHash == expectedHash);
+            }
+            else
+            {
+                Console.WriteLine("[SKIP] 当前测试会话未提供可用回收站，跳过 Shell 实际回收与落点摘要。");
+                Assert("回收: 回收站不可用时保留源文件原始字节", !realResult.Success &&
+                    File.Exists(realRecycle) && Sha256(realRecycle) == expectedHash);
+            }
 
             // -------------------------------------------------------------
             Console.WriteLine("\n>>> [测试 6] 生产完成路径：普通 ZIP 交付到最终目录");
@@ -1246,7 +1266,7 @@ namespace Tester
 
             // 非法字符“跳过”必须仍然交付可表示的文件，并标记部分完成（不得整体丢弃）
             string skipZip = Path.Combine(_testDir, "skip_items.zip");
-            CreateZipStored(skipZip, ("a:b.txt", "illegal-name"), ("ok.txt", "keep-me"));
+            CreateZipStored(skipZip, ("a?b.txt", "illegal-name"), ("ok.txt", "keep-me"));
             string skipStaging = NewStaging("skip");
             string skipManifest = Path.Combine(_testDir, "manifest_skip.json");
             var skipRun = RunWorker(skipZip, skipStaging, skipManifest, cp: "936", invalidAction: "skip");
@@ -1625,6 +1645,7 @@ namespace Tester
             }
             TestWindowCompletion();
             TestPinnedTraversal();
+            TestZsArchives();
 
             Console.WriteLine("\n==================================================");
             Console.WriteLine($"测试总结: 共 {_pass + _fail} 项测试，通过: {_pass}，失败: {_fail}");

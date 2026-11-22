@@ -1,63 +1,61 @@
-﻿# make_app_icon.ps1: 生成 unbox 应用程序图标 app.ico
-Add-Type -AssemblyName System.Drawing
+[CmdletBinding()]
+param(
+    [string]$Output,
+    [string]$Renderer = $env:UNBOX_RESVG
+)
 
-$srcPng = "icon.png"
-$targetIco1 = "src\UnzipProxy\app.ico"
-$targetIco2 = "bin\app.ico"
-$sizes = @(256, 128, 64, 48, 32, 24, 16)
-
-$img = [System.Drawing.Image]::FromFile($srcPng)
-$pngDataList = [System.Collections.Generic.List[byte[]]]::new()
-$dimList = [System.Collections.Generic.List[int]]::new()
-
-foreach ($s in $sizes) {
-    $bmp = New-Object System.Drawing.Bitmap $s, $s
-    $g = [System.Drawing.Graphics]::FromImage($bmp)
-    $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
-    $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
-    $g.DrawImage($img, 0, 0, $s, $s)
-    $g.Dispose()
-
-    $ms = New-Object System.IO.MemoryStream
-    $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
-    $bmp.Dispose()
-    $pngDataList.Add($ms.ToArray())
-    $dimList.Add($s)
-    $ms.Dispose()
+$ErrorActionPreference = 'Stop'
+$root = Split-Path -Parent $PSScriptRoot
+if (-not $Output) { $Output = Join-Path $root 'src\UnzipProxy\obj\UnboxBrand.ico' }
+if (-not $Renderer) {
+    $command = Get-Command resvg.exe -ErrorAction SilentlyContinue
+    $Renderer = if ($command) { $command.Source } else { Join-Path $root '.agent-tmp\resvg\resvg.exe' }
 }
-$img.Dispose()
-
-function Save-Ico($path) {
-    $fs = [System.IO.File]::Create($path)
-    $bw = New-Object System.IO.BinaryWriter $fs
-    $bw.Write([uint16]0)
-    $bw.Write([uint16]1)
-    $bw.Write([uint16]$pngDataList.Count)
-    $offset = 6 + ($pngDataList.Count * 16)
-
-    for ($i = 0; $i -lt $pngDataList.Count; $i++) {
-        $dim = $dimList[$i]
-        $w = if ($dim -ge 256) { [byte]0 } else { [byte]$dim }
-        $h = if ($dim -ge 256) { [byte]0 } else { [byte]$dim }
-        $bw.Write([byte]$w)
-        $bw.Write([byte]$h)
-        $bw.Write([byte]0)
-        $bw.Write([byte]0)
-        $bw.Write([uint16]1)
-        $bw.Write([uint16]32)
-        $bw.Write([uint32]$pngDataList[$i].Length)
-        $bw.Write([uint32]$offset)
-        $offset += $pngDataList[$i].Length
-    }
-    for ($i = 0; $i -lt $pngDataList.Count; $i++) {
-        $bw.Write($pngDataList[$i])
-    }
-    $bw.Flush()
-    $bw.Close()
-    $fs.Close()
+if (-not (Test-Path -LiteralPath $Renderer -PathType Leaf) -or
+    ((& $Renderer --version) -join '').Trim() -notmatch '^(?:resvg )?0\.47\.0$' -or $LASTEXITCODE -ne 0) {
+    throw 'Install resvg 0.47.0 and set UNBOX_RESVG to its resvg.exe.'
 }
 
-Save-Ico $targetIco1
-Save-Ico $targetIco2
-Write-Host "[OK] app.ico successfully created in $targetIco1 and $targetIco2"
+$Output = [IO.Path]::GetFullPath($Output)
+$directory = [IO.Path]::GetDirectoryName($Output)
+[IO.Directory]::CreateDirectory($directory) | Out-Null
+$token = [Guid]::NewGuid().ToString('N')
+$png = Join-Path $directory "UnboxBrand.$token.png"
+$ico = Join-Path $directory "UnboxBrand.$token.ico"
+$sizes = @(16,24,32,48,64,128,256)
+$frames = [Collections.Generic.List[byte[]]]::new()
+try {
+    foreach ($size in $sizes) {
+        $name = if ($size -le 24) { 'package-box-24px.svg' } else { 'package-box.svg' }
+        & $Renderer --width $size --height $size (Join-Path $root "appicon\$name") $png
+        if ($LASTEXITCODE -ne 0) { throw "resvg failed for $name at $size px" }
+        $frames.Add([IO.File]::ReadAllBytes($png))
+        [IO.File]::Delete($png)
+    }
+
+    $writer = [IO.BinaryWriter]::new([IO.File]::Open($ico, [IO.FileMode]::CreateNew))
+    try {
+        $writer.Write([uint16]0)
+        $writer.Write([uint16]1)
+        $writer.Write([uint16]$sizes.Count)
+        $offset = 6 + 16 * $sizes.Count
+        for ($i = 0; $i -lt $sizes.Count; ++$i) {
+            $dim = [byte]($sizes[$i] % 256)
+            $writer.Write($dim)
+            $writer.Write($dim)
+            $writer.Write([uint16]0)
+            $writer.Write([uint16]1)
+            $writer.Write([uint16]32)
+            $writer.Write([uint32]$frames[$i].Length)
+            $writer.Write([uint32]$offset)
+            $offset += $frames[$i].Length
+        }
+        foreach ($frame in $frames) { $writer.Write($frame) }
+    } finally { $writer.Dispose() }
+
+    if ([IO.File]::Exists($Output)) { [IO.File]::Replace($ico, $Output, [NullString]::Value) }
+    else { [IO.File]::Move($ico, $Output) }
+} finally {
+    [IO.File]::Delete($png)
+    [IO.File]::Delete($ico)
+}

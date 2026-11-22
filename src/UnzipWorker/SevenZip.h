@@ -140,7 +140,10 @@ enum SevenZipPropID {
     kpidErrorFlags = 71,
     kpidWarningFlags = 72,
     kpidWarning = 73,
-    kpidNumStreams = 74
+    kpidNumStreams = 74,
+    kpidNtReparse = 89,
+    kpidHardLink = 90,
+    kpidCopyLink = 95
 };
 
 // COM interfaces for 7-Zip

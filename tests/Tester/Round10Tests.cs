@@ -182,7 +182,10 @@ namespace Tester
                     CreateNoWindow = true
                 })!;
                 var forceWindow = OpenTestWindow(forcePlan, Path.Combine(_testDir, "r10_force.json"), blockedWorker);
+                var closed = new TaskCompletionSource();
+                forceWindow.Closed += (_, _) => closed.SetResult();
                 forceWindow.Close();
+                AwaitWindowCompletion(closed.Task);
                 Assert("R10: 强制终止未完成的 Worker 只清理暂存并保留源包",
                     blockedWorker.HasExited && !forceWindow.IsVisible && !Directory.Exists(forcePlan.StagingDirectory) &&
                     !Directory.Exists(forcePlan.FinalTargetDirectory) && File.Exists(source));

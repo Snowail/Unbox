@@ -1,4 +1,5 @@
 using System;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 
@@ -6,13 +7,13 @@ namespace UnzipProxy.Core
 {
     public sealed class JobObjectManager : IDisposable
     {
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern IntPtr CreateJobObject(IntPtr lpJobAttributes, string? lpName);
 
-        [DllImport("kernel32.dll")]
+        [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool SetInformationJobObject(IntPtr hJob, int JobObjectInfoClass, IntPtr lpJobObjectInfo, uint cbJobObjectInfoLength);
 
-        [DllImport("kernel32.dll")]
+        [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool AssignProcessToJobObject(IntPtr hJob, IntPtr hProcess);
 
         [DllImport("kernel32.dll")]
@@ -62,7 +63,9 @@ namespace UnzipProxy.Core
         public JobObjectManager()
         {
             _hJob = CreateJobObject(IntPtr.Zero, null);
-            if (_hJob != IntPtr.Zero)
+            if (_hJob == IntPtr.Zero) throw new Win32Exception();
+
+            try
             {
                 var info = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
                 info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -72,12 +75,18 @@ namespace UnzipProxy.Core
                 try
                 {
                     Marshal.StructureToPtr(info, lpInfo, false);
-                    SetInformationJobObject(_hJob, JobObjectExtendedLimitInformation, lpInfo, (uint)length);
+                    if (!SetInformationJobObject(_hJob, JobObjectExtendedLimitInformation, lpInfo, (uint)length))
+                        throw new Win32Exception();
                 }
                 finally
                 {
                     Marshal.FreeHGlobal(lpInfo);
                 }
+            }
+            catch
+            {
+                Dispose();
+                throw;
             }
         }
 

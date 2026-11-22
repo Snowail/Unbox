@@ -1,6 +1,9 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
+using System.ComponentModel;
+using System.Text;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -59,12 +62,16 @@ namespace UnzipProxy
         private long _completedBytes = 0;
         private int _totalItems = 1;
 
-        // 非阻塞 UI 调度标志
-        private volatile bool _isUiUpdatePending = false;
-        private string _pendingCurrentFile = "";
-
         private ExtractionPrompt? _activePrompt;
         private bool _closeRequested;
+        private bool _closingWorker;
+        private bool _sizeKnown;
+        private string _progressPhase = "";
+        private VolumeIdentity? _sourceIdentity;
+        private AttemptOptions _attemptOptions = new(null, null);
+        private sealed record AttemptOptions(ulong? OuterLimit, ulong? InnerLimit);
+        private sealed record BudgetFailure(string Phase, ulong Limit, ulong Written, ulong IntermediateBytes,
+            List<VolumeIdentity> Volumes);
 
         public MainWindow(string archivePath)
         {
@@ -189,8 +196,9 @@ namespace UnzipProxy
             }
 
             _plan = ArchiveTaskPlanner.Plan(_archivePath);
-            TitleText.Text = "已完成 0%";
-            MainStatusText.Text = "已完成 0%";
+            _sourceIdentity = VolumeIdentity.Capture(_plan.SourceArchivePath);
+            TitleText.Text = "正在打开压缩包…";
+            MainStatusText.Text = "正在打开压缩包…";
 
             string srcName = Path.GetFileName(_archivePath);
             string targetName = _plan.TargetRootDirName;
@@ -206,94 +214,103 @@ namespace UnzipProxy
             await StartExtractionAsync();
         }
 
-        private Task StartExtractionAsync()
+        private async Task StartExtractionAsync()
         {
-            return Task.Run(() =>
+            Process? worker = null;
+            bool started = false;
+            try
             {
-                try
+                var plan = _plan ?? throw new InvalidOperationException("缺少解压计划");
+                string appDir = AppDomain.CurrentDomain.BaseDirectory;
+                string workerExe = Path.Combine(appDir, "UnzipWorker.exe");
+                if (!File.Exists(workerExe))
+                    throw new FileNotFoundException("找不到解压工作组件 UnzipWorker.exe");
+
+                Directory.CreateDirectory(plan.StagingDirectory);
+                _manifestPath = Path.Combine(plan.DestinationParentDir, $".unbox_manifest_{Guid.NewGuid():N}.json");
+
+                var utf8 = new UTF8Encoding(false);
+                var psi = new ProcessStartInfo
                 {
-                    string appDir = AppDomain.CurrentDomain.BaseDirectory;
-                    string workerExe = Path.Combine(appDir, "UnzipWorker.exe");
-                    if (!File.Exists(workerExe))
+                    FileName = workerExe,
+                    UseShellExecute = false,
+                    RedirectStandardInput = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    StandardInputEncoding = utf8,
+                    StandardOutputEncoding = utf8,
+                    StandardErrorEncoding = utf8,
+                    CreateNoWindow = true
+                };
+                foreach (var argument in new[] { "--managed", "--archive", plan.SourceArchivePath,
+                    "--staging", plan.StagingDirectory, "--manifest", _manifestPath })
+                    psi.ArgumentList.Add(argument);
+                if (_settings.ArchiveCodePage != 0)
+                {
+                    psi.ArgumentList.Add("--cp");
+                    psi.ArgumentList.Add(_settings.ArchiveCodePage.ToString(CultureInfo.InvariantCulture));
+                }
+                AddLimit("--max-output-bytes", _attemptOptions.OuterLimit);
+                AddLimit("--max-inner-output-bytes", _attemptOptions.InnerLimit);
+
+                void AddLimit(string option, ulong? value)
+                {
+                    if (!value.HasValue) return;
+                    psi.ArgumentList.Add(option);
+                    psi.ArgumentList.Add(value.Value.ToString(CultureInfo.InvariantCulture));
+                }
+
+                _jobManager = new JobObjectManager();
+                worker = new Process { StartInfo = psi };
+                started = worker.Start();
+                if (!started) throw new InvalidOperationException("无法启动解压工作进程");
+                if (!_jobManager.AssignProcess(worker))
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "无法将解压进程加入任务对象");
+
+                _workerProcess = worker;
+                _workerInput = worker.StandardInput;
+                _workerInput.NewLine = "\n";
+                _workerInput.WriteLine("{\"type\":\"start\"}");
+                _workerInput.Flush();
+
+                var drainError = worker.StandardError.BaseStream.CopyToAsync(Stream.Null);
+                await Task.Run(() => ListenWorkerOutput(worker, worker.StandardOutput));
+                await worker.WaitForExitAsync();
+                await drainError;
+                if (ReferenceEquals(_workerProcess, worker) && !_finishedHandled && !_workerErrorShown && !_isCompleted && !_closingWorker)
+                {
+                    TriggerError("解压中断", $"工作进程异常退出（退出代码 {worker.ExitCode}）");
+                }
+            }
+            catch (Exception ex)
+            {
+                if (started && worker != null)
+                {
+                    try
                     {
-                        string altWorker = Path.GetFullPath(Path.Combine(appDir, @"..\..\..\..\bin\UnzipWorker.exe"));
-                        if (File.Exists(altWorker)) workerExe = altWorker;
+                        worker.StandardInput.Close();
+                        if (!worker.HasExited) worker.Kill();
+                        await worker.WaitForExitAsync();
                     }
-
-                    if (!File.Exists(workerExe))
+                    catch (InvalidOperationException) { }
+                }
+                if (ReferenceEquals(_workerProcess, worker) || _workerProcess == null)
+                {
+                    _workerProcess = null;
+                    _workerInput = null;
+                    _jobManager?.Dispose();
+                    _jobManager = null;
+                    if (!_closingWorker)
                     {
-                        Dispatcher.Invoke(() => TriggerError("启动失败", "找不到解压工作组件: UnzipWorker.exe"));
-                        return;
-                    }
-
-                    if (!Directory.Exists(_plan!.StagingDirectory))
-                    {
-                        Directory.CreateDirectory(_plan.StagingDirectory);
-                    }
-
-                    // 交付清单放在暂存目录之外，避免进入最终交付树
-                    _manifestPath = Path.Combine(_plan.DestinationParentDir, $".unbox_manifest_{Guid.NewGuid():N}.json");
-
-                    // 仅当用户显式选择/记忆了归档代码页时才把 --cp 传给 Worker；
-                    // 未设置时保持 Worker 的自动识别（默认代码页 + 声明/启发式解码），
-                    // 绝不能把系统 ACP 冒充为显式选择，导致正常入口无法使用自动识别。
-                    string cpArg = _settings.ArchiveCodePage != 0
-                        ? $" --cp {(uint)_settings.ArchiveCodePage}"
-                        : "";
-
-                    var psi = new ProcessStartInfo
-                    {
-                        FileName = workerExe,
-                        Arguments = $"--archive \"{_plan.SourceArchivePath}\" --staging \"{_plan.StagingDirectory}\" " +
-                                    $"--target-root \"{_plan.TargetRootDirName}\"{cpArg} --manifest \"{_manifestPath}\"",
-                        UseShellExecute = false,
-                        RedirectStandardInput = true,
-                        RedirectStandardOutput = true,
-                        RedirectStandardError = true,
-                        StandardInputEncoding = System.Text.Encoding.UTF8,
-                        StandardOutputEncoding = System.Text.Encoding.UTF8,
-                        StandardErrorEncoding = System.Text.Encoding.UTF8,
-                        CreateNoWindow = true
-                    };
-
-                    _jobManager = new JobObjectManager();
-                    var worker = new Process { StartInfo = psi };
-                    if (!worker.Start())
-                    {
-                        worker.Dispose();
-                        Dispatcher.Invoke(() => TriggerError("启动失败", "无法启动工作进程: " + workerExe));
-                        return;
-                    }
-                    _workerProcess = worker;
-                    if (!_jobManager.AssignProcess(_workerProcess))
-                    {
-                        Debug.WriteLine("[WARN] Failed to assign worker process to JobObject");
-                    }
-
-                    _workerInput = _workerProcess.StandardInput;
-
-                    ListenWorkerOutput(_workerProcess.StandardOutput);
-
-                    _workerProcess.WaitForExit();
-                    if (!_finishedHandled && !_workerErrorShown && !_isCompleted)
-                    {
-                        string stdErr = _workerProcess.StandardError.ReadToEnd();
-                        int exitCode = _workerProcess.ExitCode;
-                        Dispatcher.Invoke(() =>
-                        {
-                            TriggerError("解压中断", $"工作进程异常退出 (退出代码: {exitCode})" +
-                                                     (string.IsNullOrEmpty(stdErr) ? "" : ": " + stdErr));
-                        });
+                        StopWorkerAndCleanup();
+                        TriggerError("解压启动出错", ex.Message);
                     }
                 }
-                catch (Exception ex)
-                {
-                    Dispatcher.Invoke(() => TriggerError("解压启动出错", ex.Message));
-                }
-            });
+                worker?.Dispose();
+            }
         }
 
-        private void ListenWorkerOutput(StreamReader reader)
+        private void ListenWorkerOutput(Process worker, StreamReader reader)
         {
             string? line;
             while ((line = reader.ReadLine()) != null)
@@ -305,28 +322,12 @@ namespace UnzipProxy
                     var root = doc.RootElement.Clone();
                     string type = root.GetProperty("type").GetString() ?? "";
 
-                    if (type == "progress")
+                    Dispatcher.Invoke(() =>
                     {
-                        _pendingCurrentFile = root.TryGetProperty("current_file", out var cf) ? (cf.GetString() ?? "") : "";
-                        _completedBytes = root.TryGetProperty("completed_bytes", out var cb) ? cb.GetInt64() : _completedBytes;
-                        long reportedTotal = root.TryGetProperty("total_bytes", out var tb) ? tb.GetInt64() : 0;
-                        if (reportedTotal > 0) _totalBytes = reportedTotal;
-
-                        if (!_isUiUpdatePending)
-                        {
-                            _isUiUpdatePending = true;
-                            Dispatcher.BeginInvoke(DispatcherPriority.Normal, () =>
-                            {
-                                _isUiUpdatePending = false;
-                                if (!_finishedHandled && !_isCompleted)
-                                    UpdateProgressUi(_pendingCurrentFile);
-                            });
-                        }
-                    }
-                    else
-                    {
-                        Dispatcher.Invoke(() => HandleWorkerMessage(type, root));
-                    }
+                        if (!ReferenceEquals(_workerProcess, worker) || _closingWorker ||
+                            _finishedHandled || _workerErrorShown || _isCompleted) return;
+                        HandleWorkerMessage(type, root);
+                    });
                 }
                 catch
                 {
@@ -341,9 +342,22 @@ namespace UnzipProxy
 
             switch (type)
             {
+                case "progress":
+                    string phase = root.TryGetProperty("phase", out var phaseValue) ? phaseValue.GetString() ?? "" : "";
+                    if (_progressPhase != phase)
+                    {
+                        _progressPhase = phase;
+                        _lastBytes = 0;
+                        _currentSpeedMBps = 0;
+                    }
+                    _completedBytes = root.TryGetProperty("completed_bytes", out var completed) && completed.TryGetInt64(out long count) ? count : 0;
+                    ReadProgressTotal(root);
+                    UpdateProgressUi(root.TryGetProperty("current_file", out var file) ? file.GetString() : null);
+                    break;
+
                 case "init":
                     _totalItems = root.TryGetProperty("total_items", out var ti) ? ti.GetInt32() : _totalItems;
-                    _totalBytes = root.TryGetProperty("total_bytes", out var tb) ? tb.GetInt64() : _totalBytes;
+                    ReadProgressTotal(root);
                     if (_plan != null)
                     {
                         string srcName = Path.GetFileName(_archivePath);
@@ -371,9 +385,15 @@ namespace UnzipProxy
                     _ = HandleFinishedAsync(root);
                     break;
 
+                case "canceled":
+                    Close();
+                    break;
+
                 case "error":
                     _workerErrorShown = true;
                     string msg = root.TryGetProperty("message", out var m) ? (m.GetString() ?? "未知错误") : "未知错误";
+                    if (TryReadRequired(root, "error_reason", out string reason))
+                        msg = DescribeFailure(reason, -1, "failed");
                     TriggerError("解压失败", msg);
                     break;
             }
@@ -395,6 +415,12 @@ namespace UnzipProxy
             SystemEffects.FlashWindowForError(hwnd);
         }
 
+        private void ReadProgressTotal(JsonElement root)
+        {
+            _totalBytes = root.TryGetProperty("total_bytes", out var total) && total.TryGetInt64(out long bytes) ? bytes : 0;
+            _sizeKnown = root.TryGetProperty("size_known", out var known) && known.ValueKind == JsonValueKind.True;
+        }
+
         // 统一且流畅的实时进度更新
         private void UpdateProgressUi(string? currentFile = null)
         {
@@ -405,18 +431,14 @@ namespace UnzipProxy
                 DetailFileNameText.ToolTip = currentFile;
             }
 
-            if (_totalBytes <= 0)
-            {
-                ExtractProgressBar.IsIndeterminate = true;
-                return;
-            }
-
-            ExtractProgressBar.IsIndeterminate = false;
-            double progress = Math.Clamp((double)_completedBytes / _totalBytes, 0.0, 1.0);
-            double pct = progress * 100.0;
+            bool determinate = _sizeKnown && _totalBytes > 0;
+            ExtractProgressBar.IsIndeterminate = !determinate;
+            double progress = determinate ? Math.Clamp((double)_completedBytes / _totalBytes, 0.0, 1.0) : 0;
+            double pct = progress * 100;
             ExtractProgressBar.Value = pct;
 
-            string statusText = _isPaused ? $"已暂停 - 已完成 {pct:0}%" : $"已完成 {pct:0}%";
+            string statusText = determinate ? $"已完成 {pct:0}%" : $"已解出 {FormatBytes(_completedBytes)}";
+            if (_isPaused) statusText = "已暂停 · " + statusText;
             TitleText.Text = statusText;
             MainStatusText.Text = statusText;
 
@@ -442,6 +464,12 @@ namespace UnzipProxy
 
             SpeedGraph.PushSample(progress, _currentSpeedMBps, _displayedSpeedMBps);
 
+            if (!determinate)
+            {
+                DetailRemainingText.Text = "已解出 " + FormatBytes(_completedBytes);
+                DetailEtaText.Text = "—";
+                return;
+            }
             long remainingBytes = Math.Max(0, _totalBytes - _completedBytes);
             int estimatedRemainingItems = Math.Max(0, (int)Math.Ceiling((1.0 - progress) * _totalItems));
             if (remainingBytes > 0 && estimatedRemainingItems == 0) estimatedRemainingItems = 1;
@@ -468,7 +496,7 @@ namespace UnzipProxy
 
         private void OnSpeedTimerTick(object? sender, EventArgs e)
         {
-            if (_isCompleted || _isPaused) return;
+            if (_isCompleted || _isPaused || _workerErrorShown || _closingWorker) return;
             UpdateProgressUi();
         }
 
@@ -788,9 +816,13 @@ namespace UnzipProxy
             MainStatusText.Text = "正在校验和交付…";
 
             bool autoClose = false;
+            AttemptOptions? retry = null;
             try
             {
-                autoClose = await FinalizeExtractionAsync(root);
+                if (ReadBudgetFailure(root) is { } budget)
+                    retry = await TryRetryBudgetAsync(budget);
+                if (retry == null)
+                    autoClose = await FinalizeExtractionAsync(root);
             }
             catch (Exception ex)
             {
@@ -799,9 +831,34 @@ namespace UnzipProxy
             finally
             {
                 CleanupManifest();
-                _isCompleted = true;
+                _isCompleted = retry == null;
             }
 
+            if (retry != null && !_closeRequested)
+            {
+                _workerInput = null;
+                _jobManager?.Dispose();
+                _jobManager = null;
+                _workerProcess?.Dispose();
+                _workerProcess = null;
+                _plan = ArchiveTaskPlanner.Plan(_archivePath);
+                _attemptOptions = retry;
+                _finishedHandled = false;
+                _workerErrorShown = false;
+                _sizeKnown = false;
+                _progressPhase = "";
+                _isPaused = false;
+                _totalBytes = _completedBytes = _lastBytes = 0;
+                _displayedSpeedMBps = _currentSpeedMBps = 0;
+                _lastTime = _startTime = _lastSpeedDisplayTime = DateTime.UtcNow;
+                PauseResumeButton.IsEnabled = true;
+                RecycleCheckBox.IsEnabled = true;
+                _speedTimer.Start();
+                await StartExtractionAsync();
+                return;
+            }
+
+            _isCompleted = true;
             if (_closeRequested)
             {
                 Close();
@@ -811,6 +868,70 @@ namespace UnzipProxy
                 await Task.Delay(800);
                 if (IsVisible) Close();
             }
+        }
+
+        private BudgetFailure? ReadBudgetFailure(JsonElement root)
+        {
+            if (!TryReadRequired(root, "status", out string status) || status != "failed" ||
+                !TryReadRequired(root, "error_reason", out string reason) || reason != "output_budget_exceeded" ||
+                !TryReadRequired(root, "manifest", out string manifest) || !string.Equals(manifest, _manifestPath, StringComparison.Ordinal) ||
+                !TryReadRequired(root, "phase", out string phase) || phase is not ("outer" or "inner") ||
+                !root.TryGetProperty("size_known", out var known) || known.ValueKind != JsonValueKind.False ||
+                !root.TryGetProperty("limit_bytes", out var limit) || !limit.TryGetUInt64(out ulong bytes) ||
+                !root.TryGetProperty("written_bytes", out var written) || !written.TryGetUInt64(out ulong used) ||
+                used > bytes) return null;
+            ulong intermediate = root.TryGetProperty("intermediate_bytes", out var payload) &&
+                payload.TryGetUInt64(out ulong length) ? length : 0;
+            return new BudgetFailure(phase, bytes, used, intermediate, ParseVolumeIdentities(root));
+        }
+
+        private async Task<AttemptOptions?> TryRetryBudgetAsync(BudgetFailure failure)
+        {
+            var worker = _workerProcess;
+            var plan = _plan;
+            if (worker == null || plan == null || !await Task.Run(() => worker.WaitForExit(15000)) || worker.ExitCode != 10)
+                return null;
+
+            bool SourcesMatch() => _sourceIdentity != null &&
+                VolumeIdentity.Capture(plan.SourceArchivePath) is { } source && _sourceIdentity.Matches(source) &&
+                failure.Volumes.Count > 0 && failure.Volumes.All(
+                    original => VolumeIdentity.Capture(original.Path) is { } current && original.Matches(current));
+            if (_closeRequested || !SourcesMatch()) return null;
+
+            _workerInput?.Dispose();
+            _workerInput = null;
+            ArchiveTaskPlanner.CleanupStaging(plan);
+            CleanupManifest();
+            if (Directory.Exists(plan.StagingDirectory) || File.Exists(_manifestPath)) return null;
+
+            const ulong MiB = 1024 * 1024;
+            ulong FreeMiB()
+            {
+                ulong free = (ulong)Math.Max(0, new DriveInfo(Path.GetPathRoot(plan.DestinationParentDir)!).AvailableFreeSpace);
+                return free > failure.IntermediateBytes ? (free - failure.IntermediateBytes) / MiB : 0;
+            }
+            ulong available = FreeMiB();
+            ulong minimum = failure.Limit / MiB + 1;
+            if (minimum > available) return null;
+
+            var prompt = CreatePrompt("解压超出本次上限", "重新解压");
+            prompt.ModalBudgetPanel.Visibility = Visibility.Visible;
+            prompt.BudgetDetailText.Text = $"已解出 {failure.Written / (double)MiB:N1} MiB，上限为 {failure.Limit / (double)MiB:N1} MiB。" +
+                $"磁盘可用 {available:N0} MiB。设置更大的上限后将从头解压。";
+            prompt.BudgetLimitInput.Text = Math.Min(available, Math.Max(minimum, 2 * (failure.Limit / MiB))).ToString(CultureInfo.InvariantCulture);
+            ulong entered = 0;
+            prompt.ValidateSubmission = () =>
+            {
+                if (ulong.TryParse(prompt.BudgetLimitInput.Text, NumberStyles.None, CultureInfo.InvariantCulture, out entered) &&
+                    entered >= minimum && entered <= FreeMiB()) return true;
+                prompt.BudgetValidationText.Text = $"请输入 {minimum:N0} 到 {FreeMiB():N0} MiB 之间的整数。";
+                return false;
+            };
+            if (!ShowPrompt(prompt, prompt.BudgetLimitInput) || _closeRequested || !SourcesMatch() || entered > FreeMiB())
+                return null;
+
+            return failure.Phase == "inner" ? _attemptOptions with { InnerLimit = entered * MiB } :
+                _attemptOptions with { OuterLimit = entered * MiB };
         }
 
         private async Task<bool> FinalizeExtractionAsync(JsonElement root)
@@ -843,7 +964,7 @@ namespace UnzipProxy
             bool exitMatches = status switch
             {
                 "ok" => exitCode == 0,
-                "partial" => exitCode is 0 or 11,
+                "partial" => exitCode == 11,
                 _ => false
             };
 
@@ -897,6 +1018,7 @@ namespace UnzipProxy
             }
 
             // 交付成功
+            ExtractProgressBar.IsIndeterminate = false;
             ExtractProgressBar.Value = 100;
             DetailEtaText.Text = "完成";
             DetailRemainingText.Text = "0 (0 B)";
@@ -921,7 +1043,6 @@ namespace UnzipProxy
                 PathInfoText.ToolTip = PathInfoText.Text;
                 RunningActionPanel.Visibility = Visibility.Collapsed;
                 FinishedActionPanel.Visibility = Visibility.Visible;
-                SystemEffects.PlayFinishedSound();
                 return false;
             }
 
@@ -935,7 +1056,7 @@ namespace UnzipProxy
                 PathInfoText.ToolTip = PathInfoText.Text;
                 RunningActionPanel.Visibility = Visibility.Collapsed;
                 FinishedActionPanel.Visibility = Visibility.Visible;
-                SystemEffects.PlayFinishedSound();
+                await SystemEffects.PlayFinishedSound();
                 return false;
             }
 
@@ -950,7 +1071,7 @@ namespace UnzipProxy
             PathInfoText.Text = finalText;
             PathInfoText.ToolTip = finalText;
 
-            SystemEffects.PlayFinishedSound();
+            await SystemEffects.PlayFinishedSound();
 
             return true;
         }
@@ -1070,6 +1191,8 @@ namespace UnzipProxy
         {
             switch (errorReason)
             {
+                case "password_or_data_error":
+                    return "解压失败：密码错误或数据损坏，源压缩包已保留。";
                 case "wrong_password":
                     return "解压失败：归档中至少有一个条目的密码不匹配，源压缩包已保留。";
                 case "crc_error":
@@ -1088,6 +1211,8 @@ namespace UnzipProxy
                     return "解压失败：复合 TAR 归档缺少可展开的内层载荷，已放弃交付，源压缩包已保留。";
                 case "insufficient_disk_space":
                     return "解压失败：目标磁盘可用空间不足，已安全终止，源压缩包已保留。";
+                case "prompt_timeout":
+                    return "解压失败：等待输入超时，源压缩包已保留。";
                 case "output_budget_exceeded":
                     return "解压失败：实际写出数据超出预算（疑似声明大小失真），已安全终止，源压缩包已保留。";
                 case "extract_error":
@@ -1139,7 +1264,7 @@ namespace UnzipProxy
             catch { }
         }
 
-        private void OnWindowClosing(object? sender, System.ComponentModel.CancelEventArgs e)
+        private async void OnWindowClosing(object? sender, System.ComponentModel.CancelEventArgs e)
         {
             if (_finishedHandled && !_isCompleted)
             {
@@ -1149,12 +1274,20 @@ namespace UnzipProxy
             }
 
             _speedTimer.Stop();
-            if (!_isCompleted)
+            if (!_isCompleted && _workerProcess != null)
             {
+                e.Cancel = true;
+                if (_closingWorker) return;
+                _closingWorker = true;
                 SendWorkerMessage("{\"type\":\"cancel\"}");
-                StopWorkerAndCleanup();
+                await Task.Run(StopWorkerAndCleanup);
                 _isCompleted = true;
+                Close();
+                return;
             }
+
+            if (!_isCompleted) StopWorkerAndCleanup();
+            _isCompleted = true;
             _jobManager?.Dispose();
         }
     }
