@@ -761,13 +761,6 @@ namespace Tester
         {
             try { System.Text.Encoding.RegisterProvider(System.Text.CodePagesEncodingProvider.Instance); } catch { }
 
-            if (args.Length > 0 && args[0] == "hero")
-            {
-                string ws = args.Length > 1 ? args[1] : Directory.GetCurrentDirectory();
-                HeroGenerator.Generate(ws);
-                return 0;
-            }
-
             Console.WriteLine("==================================================");
             Console.WriteLine("  Unbox · 生产完成路径与全量缺陷修复自动化测试套件");
             Console.WriteLine("==================================================\n");
