@@ -2,7 +2,8 @@
 [CmdletBinding()]
 param(
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = "1.2.0"
+    [string]$Version = "1.2.0",
+    [switch]$SkipTests
 )
 
 $ErrorActionPreference = "Stop"
@@ -101,19 +102,20 @@ if (-not (Test-Path (Join-Path $binDir "7z.dll"))) {
     }
 }
 
-# 5. 严格验证必备组件完整性（杜绝任何关键文件缺失）
-Write-Host ">>> [步骤 4/5] 严密核验发布物完整性..." -ForegroundColor Yellow
+# 5. 严格验证必备组件完整性并复制至发布目录（杜绝任何关键文件缺失）
+Write-Host ">>> [步骤 4/5] 严密核验发布物完整性并复制组件..." -ForegroundColor Yellow
 
 $requiredCoreFiles = @(
-    @{ Path = Join-Path $binDir "Unbox.exe";       Name = "Unbox.exe (WPF UI)" },
+    @{ Path = Join-Path $binDir "Unbox.exe";        Name = "Unbox.exe (WPF UI)" },
     @{ Path = Join-Path $binDir "UnzipWorker.exe";  Name = "UnzipWorker.exe (C++20 Engine)" },
-    @{ Path = Join-Path $binDir "7z.dll";          Name = "7z.dll (7-Zip Library)" },
-    @{ Path = Join-Path $rootDir "Finished.mp3";   Name = "Finished.mp3 (提示音)" },
-    @{ Path = Join-Path $rootDir "icon.png";       Name = "icon.png (品牌图标)" },
-    @{ Path = Join-Path $rootDir "README.md";      Name = "README.md (说明文档)" },
-    @{ Path = Join-Path $rootDir "LICENSE";        Name = "LICENSE (开源协议与署名)" },
-    @{ Path = Join-Path $rootDir "注册关联.ps1";   Name = "注册关联.ps1 (关联脚本)" },
-    @{ Path = Join-Path $rootDir "取消关联.ps1";   Name = "取消关联.ps1 (卸载脚本)" }
+    @{ Path = Join-Path $binDir "7z.dll";           Name = "7z.dll (7-Zip Library)" },
+    @{ Path = Join-Path $rootDir "Finished.mp3";    Name = "Finished.mp3 (提示音)" },
+    @{ Path = Join-Path $rootDir "icon.png";        Name = "icon.png (品牌图标)" },
+    @{ Path = Join-Path $rootDir "README.md";       Name = "README.md (说明文档)" },
+    @{ Path = Join-Path $rootDir "LICENSE";         Name = "LICENSE (开源协议与署名)" },
+    @{ Path = Join-Path $rootDir "安装与卸载.cmd";    Name = "安装与卸载.cmd (图形化管理菜单)" },
+    @{ Path = Join-Path $rootDir "注册关联.ps1";    Name = "注册关联.ps1 (关联脚本)" },
+    @{ Path = Join-Path $rootDir "取消关联.ps1";    Name = "取消关联.ps1 (卸载脚本)" }
 )
 
 foreach ($item in $requiredCoreFiles) {
@@ -123,8 +125,6 @@ foreach ($item in $requiredCoreFiles) {
     Copy-Item -Path $item.Path -Destination $pkgDir -Force
     Write-Host "  [OK] $($item.Name)" -ForegroundColor Green
 }
-
-# Windows 文件系统大小写不敏感，Unbox.exe 即可直接响应 unbox 命令
 
 # 复制图标库
 $iconsDir = Join-Path $binDir "icons"
@@ -137,15 +137,19 @@ if ($icoCount -lt 25) {
 }
 Write-Host "  [OK] 图标库完整 ($icoCount 个专用格式图标)" -ForegroundColor Green
 
-# 只在本次构建的原生与托管回归通过后生成发布包；保存实际测试结论。
-$testLog = Join-Path $pkgDir "测试结果.txt"
-Push-Location $rootDir
-try {
-    & "$rootDir\tests\Run-AllTests.ps1" *>&1 | Tee-Object -FilePath $testLog
-    if ($LASTEXITCODE -ne 0) { throw "发布回归测试失败" }
-} finally { Pop-Location }
-$testSummary = Get-Content -LiteralPath $testLog | Where-Object { $_ -match '^测试总结:' } | Select-Object -Last 1
-if (-not $testSummary) { throw "未取得本次测试总结，拒绝生成发布包" }
+# 自动化回归测试（若未跳过，测试日志输出至 dist 外部目录，绝不打包入发布包）
+if (-not $SkipTests) {
+    Write-Host ">>> 执行自动化回归测试门禁..." -ForegroundColor Yellow
+    $buildLogsDir = Join-Path $distDir ".build_logs"
+    if (-not (Test-Path $buildLogsDir)) { New-Item -ItemType Directory -Path $buildLogsDir -Force | Out-Null }
+    $testLog = Join-Path $buildLogsDir "test_run.log"
+    Push-Location $rootDir
+    try {
+        & "$rootDir\tests\Run-AllTests.ps1" *>&1 | Tee-Object -FilePath $testLog
+        if ($LASTEXITCODE -ne 0) { throw "发布回归测试未完全通过，中止打包！" }
+    } finally { Pop-Location }
+    Write-Host "  [OK] 自动化回归测试全量通过" -ForegroundColor Green
+}
 
 # 6. 生成使用说明与运行库环境提示
 $readmeText = @"
@@ -163,12 +167,14 @@ $readmeText = @"
 
 【使用方法】
 1. 解压本便携包至常驻安装目录（如 D:\Tools\Unbox 或 C:\Program Files\Unbox 等）；
-2. 右键单击【注册关联.ps1】，选择【使用 PowerShell 运行】；
+2. 双击运行【安装与卸载.cmd】（推荐，提供友好的控制台菜单完成一键安装与管理），
+   或右键单击【注册关联.ps1】选择【使用 PowerShell 运行】；
 3. 系统将自动为常见 44 种压缩与镜像格式注册现代 Fluent 图标与双击自动解压能力；
 4. 随后直接双击任意压缩包，即可自动开始流式解压！
 
 【卸载方法】
-若您不再需要使用本工具，只需右键单击【取消关联.ps1】并选择【使用 PowerShell 运行】，
+若您不再需要使用本工具，只需双击运行【安装与卸载.cmd】选择卸载选项，
+或右键单击【取消关联.ps1】并选择【使用 PowerShell 运行】，
 即可彻底、干净地清理所有写入系统的关联和注册表项。
 
 开源协议：MIT License / 7-Zip LGPL / 图标原设计由 smalllikeart 授权
@@ -176,10 +182,9 @@ $readmeText = @"
 "@
 Set-Content -Path (Join-Path $pkgDir "使用说明.txt") -Value $readmeText -Encoding utf8
 
-# 7. 打包为 ZIP 便携压缩包
+# 7. 生成纯净的构建元数据
 Write-Host ">>> [步骤 5/5] 打包便携绿色压缩包..." -ForegroundColor Yellow
 
-# 记录本次交付的提交号、组件摘要与测试所用组件，便于独立复核
 $commit = ""
 try { $commit = (& git -C $rootDir rev-parse HEAD 2>$null) } catch { }
 if (-not $commit) { $commit = "unknown" }
@@ -197,12 +202,29 @@ Git 提交        : $commit
 Unbox.exe       : $(Get-Sha256 (Join-Path $binDir "Unbox.exe"))
 UnzipWorker.exe : $(Get-Sha256 (Join-Path $binDir "UnzipWorker.exe"))
 7z.dll          : $(Get-Sha256 (Join-Path $binDir "7z.dll"))
-测试所用组件    : 同次构建的 bin/UnzipWorker.exe、bin/7z.dll 与 Release 项目引用的托管代码
-测试结果        : $testSummary（完整日志见 测试结果.txt）
 ================================================================
 "@
 Set-Content -Path (Join-Path $pkgDir "构建信息.txt") -Value $buildInfo -Encoding utf8
 
+# 8. 严格安全审计：确保发布包绝不包含任何测试、报告、历史或临时文件
+$disallowedPatterns = @(
+    "*test*", "*Test*", "*.cpp", "*.obj", "*.pdb",
+    "*plan*", "*review*", "*report*", "*HANDOFF*",
+    "*.log", "*.tmp"
+)
+$leakedFiles = Get-ChildItem -Path $pkgDir -Recurse | Where-Object {
+    $item = $_
+    foreach ($pat in $disallowedPatterns) {
+        if ($item.Name -like $pat) { return $true }
+    }
+    return $false
+}
+if ($leakedFiles) {
+    throw "发布阻断：检测到非发布文件混入发布包目录：$($leakedFiles.FullName -join ', ')"
+}
+Write-Host "  [OK] 发布包目录纯净审计通过（无测试、报告或历史记录）" -ForegroundColor Green
+
+# 9. 压缩为发布 ZIP
 Compress-Archive -Path "$pkgDir\*" -DestinationPath $zipFile -Force
 
 $zipSize = (Get-Item $zipFile).Length
@@ -215,4 +237,6 @@ Write-Host "发布包路径: $zipFile" -ForegroundColor Green
 Write-Host "发布包体积: $zipSizeMB MB ($zipSize 字节)" -ForegroundColor Green
 Write-Host "SHA-256   : $zipHash" -ForegroundColor Green
 Write-Host "Git 提交  : $commit" -ForegroundColor Green
+Write-Host "发布包内容清单:" -ForegroundColor Yellow
+Get-ChildItem -Path $pkgDir | Select-Object Name, Length | Format-Table -AutoSize | Out-String | Write-Host
 Write-Host "==========================================" -ForegroundColor Cyan

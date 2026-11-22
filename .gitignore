@@ -22,16 +22,21 @@ release/
 # Temporary and logs
 *.log
 *.tmp
+test_output/
 tests/output/
+tests/**/test_output/
 tests/staging*/
 tests/test_staging*/
 
-# Local agent review artifacts
+# Local agent review, planning and temporary artifacts
+.agent-tmp/
 /.agent-tmp/
+Review History/
 /Review History/
+HANDOFF*.md
 /HANDOFF.md
-/Issue列表与必查清单.txt
-/Issus列表与必查清单.txt
+Issue列表与必查清单*.txt
+/Issue列表与必查清单*.txt
 
 # OS generated files
 Thumbs.db
