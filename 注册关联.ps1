@@ -1,5 +1,5 @@
 ﻿[CmdletBinding()]
-param([switch]$NoSettings, [switch]$Status)
+param([switch]$NoSettings, [switch]$Status, [switch]$Menu)
 
 $ErrorActionPreference = 'Stop'
 $appId = 'Unbox'
@@ -38,12 +38,15 @@ function Get-UnboxStatus($Layout, $Entries) {
     $hkcu = [Microsoft.Win32.Registry]::CurrentUser
     $registered = $hkcu.OpenSubKey('Software\RegisteredApplications')
     $cap = $hkcu.OpenSubKey("$regRelativePath\FileAssociations")
+    $applicationCommand = $hkcu.OpenSubKey('Software\Classes\Applications\Unbox.exe\shell\open\command')
     try {
         $registeredAs = if ($registered) { $registered.GetValue($appId) }
         if (-not $registeredAs -and -not $cap -and -not ($hkcu.OpenSubKey('Software\Classes\Unbox.zip'))) {
             return '未登记'
         }
-        if ($registeredAs -ne $regRelativePath -or -not $cap -or $cap.ValueCount -ne $Entries.Count) {
+        $expectedCommand = '"{0}" "%1"' -f $Layout.Application
+        if ($registeredAs -ne $regRelativePath -or -not $cap -or $cap.ValueCount -ne $Entries.Count -or
+            -not $applicationCommand -or $applicationCommand.GetValue('') -ne $expectedCommand) {
             return '部分登记或旧目录'
         }
         foreach ($entry in $Entries) {
@@ -55,7 +58,7 @@ function Get-UnboxStatus($Layout, $Entries) {
             $expectedIcon = Join-Path $Layout.Icons ($entry.iconKey + '.ico')
             try {
                 if ($cap.GetValue($ext) -ne $progId -or -not $command -or -not $icon -or -not $openWith -or
-                    $command.GetValue('') -ne ('"{0}" "%1"' -f $Layout.Application) -or
+                    $command.GetValue('') -ne $expectedCommand -or
                     $icon.GetValue('') -ne ('"{0}",0' -f $expectedIcon) -or
                     $openWith.GetValueNames() -notcontains $progId -or
                     $openWith.GetValueKind($progId) -ne [Microsoft.Win32.RegistryValueKind]::None) {
@@ -71,6 +74,7 @@ function Get-UnboxStatus($Layout, $Entries) {
     } finally {
         if ($registered) { $registered.Dispose() }
         if ($cap) { $cap.Dispose() }
+        if ($applicationCommand) { $applicationCommand.Dispose() }
     }
 }
 
@@ -92,6 +96,12 @@ $hkcu = [Microsoft.Win32.Registry]::CurrentUser
 $classesKey = $hkcu.CreateSubKey("Software\Classes")
 $appCapKey = $hkcu.CreateSubKey($regRelativePath)
 $fileAssocKey = $appCapKey.CreateSubKey("FileAssociations")
+$openCommand = '"{0}" "%1"' -f $proxyExe
+
+# Windows may keep an Open with choice by executable name instead of by extension ProgID.
+$applicationCommand = $classesKey.CreateSubKey('Applications\Unbox.exe\shell\open\command')
+try { $applicationCommand.SetValue('', $openCommand) }
+finally { $applicationCommand.Dispose() }
 
 # 写入 Capabilities 核心信息
 $appCapKey.SetValue("ApplicationName", "Unbox")
@@ -121,7 +131,7 @@ foreach ($ext in $assocMap.Keys) {
     $iconKey.Close()
 
     $cmdKey = $progIdKey.CreateSubKey("shell\open\command")
-    $cmdKey.SetValue("", "`"$proxyExe`" `"%1`"")
+    $cmdKey.SetValue("", $openCommand)
     $cmdKey.Close()
 
     $openKey = $progIdKey.CreateSubKey("shell\open")
@@ -178,14 +188,60 @@ try {
 }
 
 }
-try {
+function Get-UnboxSetup {
     $layout = Get-UnboxLayout $PSScriptRoot
     $entries = @(Read-AssociationCatalog $layout.Catalog)
     if ($entries.Count -ne 57) { throw "预期 57 个候选关联，实际为 $($entries.Count)" }
+    return @{ Layout = $layout; Entries = $entries }
+}
+
+function Show-UnboxMenu {
+    while ($true) {
+        Write-Host 'Unbox - 安装与卸载管理'
+        try {
+            $setup = Get-UnboxSetup
+            Write-Host ("[系统状态] " + (Get-UnboxStatus $setup.Layout $setup.Entries))
+        } catch {
+            Write-Host ("[系统状态] " + $_.Exception.Message)
+        }
+        Write-Host ''
+        Write-Host '  [1] 安装或修复关联'
+        Write-Host '  [2] 卸载关联'
+        Write-Host '  [0] 退出'
+        Write-Host '请选择操作 [1/2/0]：' -NoNewline
+        $choice = [Console]::ReadLine()
+        if ($null -eq $choice -or $choice.Trim() -eq '0') { return }
+
+        try {
+            switch ($choice.Trim()) {
+                '1' {
+                    $setup = Get-UnboxSetup
+                    Register-UnboxAssociations $setup.Layout $setup.Entries
+                }
+                '2' {
+                    $global:LASTEXITCODE = 0
+                    & (Join-Path $PSScriptRoot '取消关联.ps1')
+                    if ($LASTEXITCODE -ne 0) { throw '卸载关联失败，请查看上方错误。' }
+                }
+                default { Write-Host '请输入 1、2 或 0。' }
+            }
+        } catch {
+            [Console]::Error.WriteLine($_.Exception.Message)
+        }
+        Write-Host ''
+    }
+}
+
+try {
+    if ($Menu) {
+        Show-UnboxMenu
+        exit 0
+    }
+    $setup = Get-UnboxSetup
     if ($Status) {
-        Write-Host ("[系统状态] " + (Get-UnboxStatus $layout $entries))
+        Write-Host ("[系统状态] " + (Get-UnboxStatus $setup.Layout $setup.Entries))
     } else {
-        Register-UnboxAssociations $layout $entries -NoSettings:$NoSettings
+        Register-UnboxAssociations $setup.Layout $setup.Entries -NoSettings:$NoSettings
     }
 } catch {
     [Console]::Error.WriteLine($_.Exception.Message)

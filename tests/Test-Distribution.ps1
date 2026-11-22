@@ -51,6 +51,53 @@ function Test-IcoFrameTable([byte[]]$Bytes, [string]$Name) {
     }
 }
 
+function Test-AssociationMenu([string]$Folder) {
+    $launcher = Join-Path $Folder '安装与卸载.cmd'
+    $bytes = [IO.File]::ReadAllBytes($launcher)
+    if ($bytes | Where-Object { $_ -gt 127 }) { throw 'The CMD launcher must be ASCII.' }
+    if ([Text.Encoding]::ASCII.GetString($bytes) -match '(?<!\r)\n|\r(?!\n)') {
+        throw 'The CMD launcher must use Windows CRLF line endings.'
+    }
+
+    foreach ($codePage in @(0, 936, 65001)) {
+        $start = [Diagnostics.ProcessStartInfo]::new((Join-Path $env:SystemRoot 'System32\cmd.exe'))
+        $command = 'call "%UNBOX_DIST_MENU_TEST%"'
+        if ($codePage -ne 0) {
+            $command = ('(chcp {0} >nul 2>nul || exit /b 125) & ' -f $codePage) + $command
+        }
+        $start.Arguments = '/d /s /c "' + $command + '"'
+        $start.UseShellExecute = $false
+        $start.RedirectStandardInput = $true
+        $start.RedirectStandardOutput = $true
+        $start.RedirectStandardError = $true
+        $start.StandardOutputEncoding = [Text.Encoding]::UTF8
+        $start.StandardErrorEncoding = [Text.Encoding]::UTF8
+        $start.EnvironmentVariables['UNBOX_DIST_MENU_TEST'] = $launcher
+        $process = [Diagnostics.Process]::Start($start)
+        try {
+            $stdout = $process.StandardOutput.ReadToEndAsync()
+            $stderr = $process.StandardError.ReadToEndAsync()
+            $process.StandardInput.WriteLine('0')
+            $process.StandardInput.Close()
+            if (-not $process.WaitForExit(15000)) {
+                $process.Kill()
+                throw "Association menu timed out under code page $codePage."
+            }
+            $output = $stdout.GetAwaiter().GetResult()
+            $errors = $stderr.GetAwaiter().GetResult()
+            if ($process.ExitCode -eq 125 -and $codePage -eq 936) {
+                Write-Host '[SKIP] Code page 936 is unavailable on this Windows installation.'
+                continue
+            }
+            if ($process.ExitCode -ne 0 -or $errors.Trim() -or $output -notmatch 'Unbox - ' -or
+                $output -notmatch '(?m)^\s*\[1\].*\r?\n\s*\[2\].*\r?\n\s*\[0\]' -or
+                $output -notmatch '\[1/2/0\]') {
+                throw "Association menu failed under code page ${codePage}, exit $($process.ExitCode): $errors $output"
+            }
+        } finally { $process.Dispose() }
+    }
+}
+
 function Test-AssociationLifecycle([string]$Folder) {
     $registry = [Microsoft.Win32.Registry]::CurrentUser
     foreach ($key in @('Software\Unbox\Capabilities','Software\UnzipProxy\Capabilities','Software\Classes\Unbox.zip')) {
@@ -63,10 +110,17 @@ function Test-AssociationLifecycle([string]$Folder) {
     $extension = $registry.CreateSubKey('Software\Classes\.lz4\OpenWithProgids')
     $sentinel = 'UnboxDistributionTest.' + [Guid]::NewGuid().ToString('N')
     $extension.SetValue($sentinel, 'other application')
+    $byName = $registry.CreateSubKey('Software\Classes\Applications\Unbox.exe\shell\open\command')
+    $originalCommand = $byName.GetValue('')
+    $byName.SetValue('', '"C:\OldBuild\Unbox.exe" "%1"')
+    $byName.SetValue($sentinel, 'keep other settings')
     $launcher = Join-Path $Folder '安装与卸载.cmd'
     try {
         & $launcher /install
         if ($LASTEXITCODE -ne 0) { throw 'Silent install failed' }
+        if ($byName.GetValue('') -ne ('"{0}" "%1"' -f (Join-Path $Folder 'Unbox.exe'))) {
+            throw 'Existing Open with entry still points to the old build'
+        }
         $register = Join-Path $Folder '注册关联.ps1'
         if ((& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $register -Status 6>&1 | Out-String) -notmatch '完整登记') {
             throw 'Registration did not report complete'
@@ -76,6 +130,9 @@ function Test-AssociationLifecycle([string]$Folder) {
         $launcher = Join-Path $moved '安装与卸载.cmd'
         & $launcher /install
         if ($LASTEXITCODE -ne 0) { throw 'Repair after moving failed' }
+        if ($byName.GetValue('') -ne ('"{0}" "%1"' -f (Join-Path $moved 'Unbox.exe'))) {
+            throw 'Open with entry was not updated after moving'
+        }
         $register = Join-Path $moved '注册关联.ps1'
         if ((& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $register -Status 6>&1 | Out-String) -notmatch '完整登记') {
             throw 'Moved paths were not repaired'
@@ -86,6 +143,7 @@ function Test-AssociationLifecycle([string]$Folder) {
         }
         if ($extension.GetValue($sentinel) -ne 'other application' -or
             $extension.GetValueNames() -contains 'Unbox.lz4' -or
+            $null -ne $byName.GetValue('') -or $byName.GetValue($sentinel) -ne 'keep other settings' -or
             -not (Test-Path -LiteralPath (Join-Path $moved 'Unbox.exe') -PathType Leaf)) {
             throw 'Uninstall changed unrelated registration, retained Unbox, or removed program files'
         }
@@ -93,6 +151,10 @@ function Test-AssociationLifecycle([string]$Folder) {
         if (Test-Path -LiteralPath $launcher) { & $launcher /uninstall }
         $extension.DeleteValue($sentinel, $false)
         $extension.Dispose()
+        if ($null -ne $originalCommand) { $byName.SetValue('', $originalCommand) }
+        else { $byName.DeleteValue('', $false) }
+        $byName.DeleteValue($sentinel, $false)
+        $byName.Dispose()
     }
 }
 
@@ -174,6 +236,7 @@ try {
         [IO.File]::ReadAllText((Join-Path $staging 'fixture.txt')) -ne 'Unbox distribution check') {
         throw 'Packaged Worker/DLL failed a smoke test or used a different catalog'
     }
+    Test-AssociationMenu $package
     if ($VerifyAssociations) { Test-AssociationLifecycle $package }
     Write-Host "[OK] Portable ZIP verified ($($expected.Count) files, $($registered.Count) association candidates)"
 } finally {

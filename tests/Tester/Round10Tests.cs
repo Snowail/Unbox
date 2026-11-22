@@ -101,6 +101,7 @@ namespace Tester
             try
             {
                 TestPasswordPromptLayout();
+                TestStartupErrorStopsProgress();
                 foreach (string scenario in new[] { "no-marker", "unknown-status", "wrong-marker", "traversal", "wait-exit", "wait-delivery" })
                 {
                     string directory = Path.Combine(_testDir, "r10_window_" + scenario);
@@ -194,6 +195,27 @@ namespace Tester
             {
                 SynchronizationContext.SetSynchronizationContext(previousContext);
             }
+        }
+
+        static void TestStartupErrorStopsProgress()
+        {
+            const BindingFlags flags = BindingFlags.NonPublic | BindingFlags.Instance;
+            var plan = ArchiveTaskPlanner.Plan(Path.Combine(_testDir, "r10_start_failure.zip"));
+            var window = OpenTestWindow(plan, "", null);
+            try
+            {
+                var bar = (ProgressBar)window.FindName("ExtractProgressBar");
+                bar.IsIndeterminate = true;
+                var timer = (DispatcherTimer)typeof(MainWindow).GetField("_speedTimer", flags)!.GetValue(window)!;
+                timer.Start();
+                const string error = "无法写入解压目录";
+                typeof(MainWindow).GetMethod("TriggerError", flags)!.Invoke(window, new object[] { error, plan.DestinationParentDir });
+                typeof(MainWindow).GetMethod("OnSpeedTimerTick", flags)!.Invoke(window, new object?[] { null, EventArgs.Empty });
+                Assert("R10: 启动错误停止计时且不被 0 B 进度覆盖",
+                    ((TextBlock)window.FindName("MainStatusText")).Text == error &&
+                    ((TextBlock)window.FindName("TitleText")).Text == error && !timer.IsEnabled && !bar.IsIndeterminate);
+            }
+            finally { window.Close(); }
         }
 
         static void TestPasswordPromptLayout()

@@ -26,6 +26,20 @@ function Unregister-UnboxAssociations {
             $cap = $hkcu.OpenSubKey($capPath, $true)
             $associations = if ($cap) { $cap.OpenSubKey('FileAssociations', $true) }
             try {
+                if ($id -eq 'Unbox' -and $classes -and $cap -and
+                    $cap.GetValue('ApplicationName') -eq 'Unbox' -and
+                    $cap.GetValue('ApplicationIcon') -match '^"([^"]+\\Unbox\.exe)",0$') {
+                    $installedCommand = '"{0}" "%1"' -f $Matches[1]
+                    $applicationCommand = $classes.OpenSubKey('Applications\Unbox.exe\shell\open\command', $true)
+                    if ($applicationCommand) {
+                        try {
+                            if ($applicationCommand.GetValue('') -eq $installedCommand) {
+                                $applicationCommand.DeleteValue('', $false)
+                            }
+                        } finally { $applicationCommand.Dispose() }
+                    }
+                }
+
                 $extensions = @($known)
                 if ($associations) { $extensions += $associations.GetValueNames() }
                 foreach ($ext in ($extensions | Sort-Object -Unique)) {

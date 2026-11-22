@@ -226,7 +226,16 @@ namespace UnzipProxy
                 if (!File.Exists(workerExe))
                     throw new FileNotFoundException("找不到解压工作组件 UnzipWorker.exe");
 
-                Directory.CreateDirectory(plan.StagingDirectory);
+                try
+                {
+                    Directory.CreateDirectory(plan.StagingDirectory);
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    TriggerError("无法写入解压目录",
+                        $"Windows 拒绝在「{plan.DestinationParentDir}」创建暂存目录。解压尚未开始，源压缩包已保留。");
+                    return;
+                }
                 _manifestPath = Path.Combine(plan.DestinationParentDir, $".unbox_manifest_{Guid.NewGuid():N}.json");
 
                 var utf8 = new UTF8Encoding(false);
@@ -390,7 +399,6 @@ namespace UnzipProxy
                     break;
 
                 case "error":
-                    _workerErrorShown = true;
                     string msg = root.TryGetProperty("message", out var m) ? (m.GetString() ?? "未知错误") : "未知错误";
                     if (TryReadRequired(root, "error_reason", out string reason))
                         msg = DescribeFailure(reason, -1, "failed");
@@ -401,9 +409,13 @@ namespace UnzipProxy
 
         private void TriggerError(string title, string message)
         {
+            _workerErrorShown = true;
+            _speedTimer.Stop();
+            TitleText.Text = title;
             MainStatusText.Text = title;
             PathInfoText.Text = message;
             PathInfoText.ToolTip = message;
+            ExtractProgressBar.IsIndeterminate = false;
             ExtractProgressBar.Foreground = (Brush)Resources["Win11Red"];
             RunningActionPanel.Visibility = Visibility.Collapsed;
             FinishedActionPanel.Visibility = Visibility.Visible;
