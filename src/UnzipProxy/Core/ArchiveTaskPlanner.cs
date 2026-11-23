@@ -1,5 +1,7 @@
 using System;
 using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.RegularExpressions;
 
 namespace UnzipProxy.Core
@@ -15,6 +17,25 @@ namespace UnzipProxy.Core
 
     public static class ArchiveTaskPlanner
     {
+        [DllImport("mpr.dll", CharSet = CharSet.Unicode)]
+        private static extern int WNetGetConnection(string localName, StringBuilder remoteName, ref int capacity);
+
+        private static string ResolveArchivePath(string path)
+        {
+            string full = Path.GetFullPath(path);
+            string? root = Path.GetPathRoot(full);
+            if (root is not { Length: 3 } || root[1] != ':' || new DriveInfo(root).DriveType != DriveType.Network)
+                return full;
+
+            // The Worker and delivery verifier compare paths with the UNC name returned by file handles.
+            int capacity = 32768;
+            var share = new StringBuilder(capacity);
+            if (WNetGetConnection(root[..2], share, ref capacity) != 0) return full;
+            string remote = share.ToString();
+            return remote.StartsWith(@"\\", StringComparison.Ordinal)
+                ? Path.Combine(remote, full[root.Length..]) : full;
+        }
+
         public static bool IsCompoundTar(string filePath) =>
             ArchiveFormatCatalog.Match(Path.GetFileName(filePath))?.Kind == ArchiveKind.TarWrapper;
 
@@ -70,7 +91,7 @@ namespace UnzipProxy.Core
         // 生成完整提取计划
         public static ExtractionPlan Plan(string archivePath)
         {
-            string fullArchivePath = Path.GetFullPath(archivePath);
+            string fullArchivePath = ResolveArchivePath(archivePath);
             string? parentDir = Path.GetDirectoryName(fullArchivePath);
             if (string.IsNullOrEmpty(parentDir))
             {

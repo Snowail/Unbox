@@ -16,10 +16,17 @@ $distDir = Join-Path $rootDir "dist"
 $pkgName = "Unbox-v$Version-win-x64"
 $pkgDir = Join-Path $distDir $pkgName
 $zipFile = Join-Path $distDir "$pkgName.zip"
+$sumsFile = Join-Path $distDir "SHA256SUMS.txt"
+$lockFile = Join-Path $distDir ".package-release.lock"
 $publishTemp = Join-Path $distDir (".publish_" + [guid]::NewGuid().ToString("N"))
+$candidateDir = Join-Path $distDir (".candidate_" + [guid]::NewGuid().ToString("N"))
 
 # 删除构建缓存前，确认目标均为仓库 dist 下的直接产物。
-foreach ($target in @($pkgDir, $zipFile, $publishTemp)) {
+if ((Test-Path -LiteralPath $distDir) -and
+    ((Get-Item -LiteralPath $distDir -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+    throw "dist 目录不能为重解析点：$distDir"
+}
+foreach ($target in @($pkgDir, $zipFile, $sumsFile, $lockFile, $publishTemp, $candidateDir)) {
     $resolved = [System.IO.Path]::GetFullPath($target)
     if ([System.IO.Path]::GetDirectoryName($resolved) -ne [System.IO.Path]::GetFullPath($distDir)) {
         throw "构建路径不在预期 dist 目录中：$resolved"
@@ -42,9 +49,6 @@ Write-Host "==========================================" -ForegroundColor Cyan
 # 1. 确保目录纯净
 if (Test-Path $pkgDir) {
     Remove-Item -LiteralPath $pkgDir -Recurse -Force
-}
-if (Test-Path $zipFile) {
-    Remove-Item -LiteralPath $zipFile -Force
 }
 New-Item -ItemType Directory -Path $pkgDir -Force | Out-Null
 New-Item -ItemType Directory -Path $distDir -Force | Out-Null
@@ -136,7 +140,7 @@ foreach ($key in $iconKeys) {
 $readmePath = Join-Path $pkgDir "README.md"
 $readme = Get-Content -LiteralPath $readmePath -Raw -Encoding UTF8
 $publicAssets = 'https://raw.githubusercontent.com/Snowail/Unbox/main/'
-$readme = $readme.Replace('src="icon.png"', ('src="' + $publicAssets + 'icon.png"'))
+$readme = $readme.Replace('](appicon/package-box.png)', ('](' + $publicAssets + 'appicon/package-box.png)'))
 $readme = $readme.Replace('src="assets/banner.png"', ('src="' + $publicAssets + 'assets/banner.png"'))
 Set-Content -LiteralPath $readmePath -Value $readme -Encoding UTF8
 
@@ -207,23 +211,77 @@ if ($leakedFiles) {
 }
 Write-Host "  [OK] 发布包目录纯净审计通过（无测试、报告或历史记录）" -ForegroundColor Green
 
-# 8. 压缩为发布 ZIP
+# 8. 在独立目录生成并验收候选附件，再切换正式文件名。
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 Add-Type -AssemblyName System.IO.Compression
-$zip = [IO.Compression.ZipFile]::Open($zipFile, [IO.Compression.ZipArchiveMode]::Create)
+$candidateZip = Join-Path $candidateDir "$pkgName.zip"
+$candidateSums = Join-Path $candidateDir "SHA256SUMS.txt"
+$previousDir = Join-Path $candidateDir "previous"
+$keepCandidate = $false
+New-Item -ItemType Directory -Path $candidateDir | Out-Null
 try {
-    foreach ($file in Get-ChildItem -LiteralPath $pkgDir -Recurse -File) {
-        $name = $file.FullName.Substring($pkgDir.Length + 1).Replace('\', '/')
-        [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $file.FullName, $name,
-            [IO.Compression.CompressionLevel]::Optimal) | Out-Null
-    }
-} finally { $zip.Dispose() }
-& (Join-Path $rootDir 'tests\Test-Distribution.ps1') -ZipPath $zipFile
+    $zip = [IO.Compression.ZipFile]::Open($candidateZip, [IO.Compression.ZipArchiveMode]::Create)
+    try {
+        foreach ($file in Get-ChildItem -LiteralPath $pkgDir -Recurse -File) {
+            $name = $file.FullName.Substring($pkgDir.Length + 1).Replace('\', '/')
+            [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $file.FullName, $name,
+                [IO.Compression.CompressionLevel]::Optimal) | Out-Null
+        }
+    } finally { $zip.Dispose() }
+    & (Join-Path $rootDir 'tests\Test-Distribution.ps1') -ZipPath $candidateZip
 
-$zipSize = (Get-Item $zipFile).Length
-$zipSizeMB = [math]::Round($zipSize / 1MB, 2)
-$zipHash = (Get-FileHash -Path $zipFile -Algorithm SHA256).Hash
-Set-Content -LiteralPath (Join-Path $distDir "SHA256SUMS.txt") -Value "$zipHash  $pkgName.zip" -Encoding ASCII
+    $zipSize = (Get-Item -LiteralPath $candidateZip).Length
+    $zipSizeMB = [math]::Round($zipSize / 1MB, 2)
+    $zipHash = (Get-FileHash -LiteralPath $candidateZip -Algorithm SHA256).Hash
+    Set-Content -LiteralPath $candidateSums -Value "$zipHash  $pkgName.zip" -Encoding ASCII
+
+    $lock = [IO.FileStream]::new($lockFile, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite,
+        [IO.FileShare]::None, 4096, [IO.FileOptions]::DeleteOnClose)
+    try {
+        New-Item -ItemType Directory -Path $previousDir | Out-Null
+        $attachments = @(
+            @{ Candidate = $candidateZip; Final = $zipFile; Previous = (Join-Path $previousDir "$pkgName.zip") },
+            @{ Candidate = $candidateSums; Final = $sumsFile; Previous = (Join-Path $previousDir "SHA256SUMS.txt") }
+        )
+        foreach ($attachment in $attachments) {
+            if ([IO.File]::Exists($attachment.Final)) {
+                [IO.File]::Copy($attachment.Final, $attachment.Previous)
+            }
+        }
+
+        # A stopped promotion can leave the two final names out of sync.
+        # Keep the complete previous pair until both replacements or rollback finish.
+        $keepCandidate = $true
+        $promoted = @()
+        try {
+            foreach ($attachment in $attachments) {
+                if ([IO.File]::Exists($attachment.Previous)) {
+                    [IO.File]::Replace($attachment.Candidate, $attachment.Final, [NullString]::Value)
+                } else {
+                    [IO.File]::Move($attachment.Candidate, $attachment.Final)
+                }
+                $promoted += $attachment
+            }
+        } catch {
+            try {
+                foreach ($attachment in $promoted) {
+                    if ([IO.File]::Exists($attachment.Previous)) {
+                        [IO.File]::Replace($attachment.Previous, $attachment.Final, [NullString]::Value)
+                    } else {
+                        [IO.File]::Move($attachment.Final, $attachment.Candidate)
+                    }
+                }
+            } catch {
+                throw "附件切换后恢复失败。上一套附件的备份位于 $previousDir。$($_.Exception.Message)"
+            }
+            $keepCandidate = $false
+            throw
+        }
+        $keepCandidate = $false
+    } finally { $lock.Dispose() }
+} finally {
+    if (-not $keepCandidate) { Remove-Item -LiteralPath $candidateDir -Recurse -Force }
+}
 
 Write-Host "==========================================" -ForegroundColor Cyan
 Write-Host "[OK] 发布便携包制作成功！" -ForegroundColor Green

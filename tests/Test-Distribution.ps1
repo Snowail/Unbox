@@ -122,8 +122,13 @@ function Test-AssociationLifecycle([string]$Folder) {
             throw 'Existing Open with entry still points to the old build'
         }
         $register = Join-Path $Folder '注册关联.ps1'
-        if ((& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $register -Status 6>&1 | Out-String) -notmatch '完整登记') {
+        if ((& $register -Status 6>&1 | Out-String) -notmatch '完整登记') {
             throw 'Registration did not report complete'
+        }
+        $cap = $registry.OpenSubKey('Software\Unbox\Capabilities\FileAssociations', $true)
+        try { $cap.DeleteValue('.lz4') } finally { $cap.Dispose() }
+        if ((& $register -Status 6>&1 | Out-String) -notmatch '部分登记或旧目录') {
+            throw 'Status did not detect a missing association'
         }
         $moved = Join-Path (Split-Path -Parent $Folder) '移动路径 (修复)'
         Move-Item -LiteralPath $Folder -Destination $moved
@@ -134,7 +139,7 @@ function Test-AssociationLifecycle([string]$Folder) {
             throw 'Open with entry was not updated after moving'
         }
         $register = Join-Path $moved '注册关联.ps1'
-        if ((& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $register -Status 6>&1 | Out-String) -notmatch '完整登记') {
+        if ((& $register -Status 6>&1 | Out-String) -notmatch '完整登记') {
             throw 'Moved paths were not repaired'
         }
         foreach ($attempt in 1, 2) {

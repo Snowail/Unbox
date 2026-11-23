@@ -2,6 +2,10 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Security.Principal;
+using System.Text;
+using System.Threading;
+using Microsoft.Win32;
 
 namespace UnzipProxy.Core
 {
@@ -9,6 +13,7 @@ namespace UnzipProxy.Core
     {
         public string Path { get; init; } = "";
         public bool Recycled { get; init; }
+        public bool RecycleBinUnavailable { get; init; }
         public string Detail { get; init; } = "";
         /// <summary>回收站内的实际去向（Shell 回报的新建项），没有则为空。</summary>
         public string RecycledTo { get; init; } = "";
@@ -36,11 +41,18 @@ namespace UnzipProxy.Core
         private const uint FOF_ALLOWUNDO = 0x0040;
         private const uint FOF_NOERRORUI = 0x0400;
         private const uint FOFX_RECYCLEONDELETE = 0x00080000;
+        private const uint TSF_DELETE_RECYCLE_IF_POSSIBLE = 0x80;
+        private const int E_ABORT = unchecked((int)0x80004004);
+        private const long MiB = 1024 * 1024;
+        internal const string BinDisabledMessage = "回收站没有启用，源文件未删除";
+        internal const string CapacityUnknownMessage = "无法确认目标卷的回收站容量，已保留源文件。请检查回收站属性或联系管理员";
+        internal const string CapacityInsufficientMessage = "回收站剩余容量不足以容纳本次源文件，已保留源文件";
 
         private const uint SIGDN_DESKTOPABSOLUTEPARSING = 0x80028000;
 
         private static readonly Guid IID_IShellItem = new Guid("43826D1E-E718-42EE-BC55-A1E261C37BFE");
         private static readonly Guid CLSID_FileOperation = new Guid("3AD05575-8857-4850-9277-11B85BDB8E09");
+        private sealed record RecycleVolume(Guid Id, long? CapacityBytes, long OccupiedBytes);
 
         // 注意：必须使用默认 8 字节对齐（x64 下 sizeof = 24），否则 cbSize 不匹配会导致查询恒失败
         [StructLayout(LayoutKind.Sequential)]
@@ -53,6 +65,15 @@ namespace UnzipProxy.Core
 
         [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
         private static extern int SHQueryRecycleBin(string pszRootPath, ref SHQUERYRBINFO pSHQueryRBInfo);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        private static extern bool GetVolumePathName(string path, StringBuilder mount, int capacity);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        private static extern bool GetVolumeNameForVolumeMountPoint(string mount, StringBuilder name, int capacity);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        private static extern DriveType GetDriveType(string rootPath);
 
         [DllImport("shell32.dll", CharSet = CharSet.Unicode, PreserveSig = false)]
         private static extern void SHCreateItemFromParsingName(
@@ -121,9 +142,12 @@ namespace UnzipProxy.Core
             [PreserveSig] int ResumeTimer();
         }
 
-        private sealed class RecycleProgressSink : IFileOperationProgressSink
+        private sealed class RecycleProgressSink(VolumeIdentity expected, Guid volumeId, long pendingBytes)
+            : IFileOperationProgressSink
         {
-            public readonly List<(string Path, int HResult, string RecycledTo)> Deleted = new();
+            public int? DeleteResult;
+            public string Destination = "";
+            public string? BlockedReason;
 
             public int StartOperations() => 0;
             public int FinishOperations(int hrResult) => 0;
@@ -133,13 +157,29 @@ namespace UnzipProxy.Core
             public int PostMoveItem(uint dwFlags, IShellItem psiItem, IShellItem psiDestinationFolder, string pszNewName, int hrMove, IShellItem psiNewlyCreated) => 0;
             public int PreCopyItem(uint dwFlags, IShellItem psiItem, IShellItem psiDestinationFolder, string pszNewName) => 0;
             public int PostCopyItem(uint dwFlags, IShellItem psiItem, IShellItem psiDestinationFolder, string pszNewName, int hrCopy, IShellItem psiNewlyCreated) => 0;
-            public int PreDeleteItem(uint dwFlags, IShellItem psiItem) => 0;
+            public int PreDeleteItem(uint dwFlags, IShellItem psiItem)
+            {
+                if ((dwFlags & TSF_DELETE_RECYCLE_IF_POSSIBLE) == 0 ||
+                    QueryRecycleVolume(expected.Path) is not { } bin)
+                    BlockedReason = BinDisabledMessage;
+                else if (bin.Id != volumeId)
+                    BlockedReason = "源文件所在卷已改变，已保留源文件";
+                else
+                    BlockedReason = CheckCapacity(bin, pendingBytes);
+
+                if (BlockedReason != null) return E_ABORT;
+                if (VolumeIdentity.Capture(expected.Path) is { } current && expected.Matches(current))
+                    return 0;
+                BlockedReason = "源文件身份已改变或无法核对，已保留源文件";
+                return E_ABORT;
+            }
 
             public int PostDeleteItem(uint dwFlags, IShellItem psiItem, int hrDelete, IShellItem psiNewlyCreated)
             {
                 try
                 {
-                    Deleted.Add((GetParsingName(psiItem) ?? "", hrDelete, GetParsingName(psiNewlyCreated) ?? ""));
+                    DeleteResult = hrDelete;
+                    Destination = GetParsingName(psiNewlyCreated) ?? "";
                 }
                 catch
                 {
@@ -172,40 +212,73 @@ namespace UnzipProxy.Core
             }
         }
 
-        public static bool IsRecycleBinSupported(string path)
+        public static bool IsRecycleBinSupported(string path) => QueryRecycleVolume(path) != null;
+
+        private static RecycleVolume? QueryRecycleVolume(string path)
         {
             try
             {
-                if (string.IsNullOrWhiteSpace(path)) return false;
-                if (path.StartsWith(@"\\", StringComparison.Ordinal)) return false; // UNC 共享
-                string root = Path.GetPathRoot(path) ?? "";
-                if (string.IsNullOrEmpty(root)) return false;
+                if (!Path.IsPathFullyQualified(path) || path.StartsWith(@"\\", StringComparison.Ordinal))
+                    return null;
 
-                var drive = new DriveInfo(root);
-                if (drive.DriveType != DriveType.Fixed && drive.DriveType != DriveType.Removable)
-                {
-                    return false;
-                }
+                var mount = new StringBuilder(32768);
+                var volume = new StringBuilder(64);
+                if (!GetVolumePathName(path, mount, mount.Capacity)) return null;
+                string mountPath = mount.ToString();
+                if (GetDriveType(mountPath) is not (DriveType.Fixed or DriveType.Removable) ||
+                    !GetVolumeNameForVolumeMountPoint(mountPath, volume, volume.Capacity))
+                    return null;
+                string guid = volume.ToString().TrimEnd('\\');
+                if (!guid.StartsWith(@"\\?\Volume", StringComparison.OrdinalIgnoreCase) ||
+                    !Guid.TryParse(guid[10..], out var volumeId)) return null;
 
-                var rbInfo = new SHQUERYRBINFO { cbSize = Marshal.SizeOf(typeof(SHQUERYRBINFO)) };
-                return SHQueryRecycleBin(root, ref rbInfo) == 0;
+                const string policy = @"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer";
+                using var userPolicy = Registry.CurrentUser.OpenSubKey(policy);
+                using var machinePolicy = Registry.LocalMachine.OpenSubKey(policy);
+                using var bin = Registry.CurrentUser.OpenSubKey(
+                    $@"Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket\Volume\{volumeId:B}");
+                object? configuredCapacity = bin?.GetValue("MaxCapacity");
+                if (Convert.ToInt32(userPolicy?.GetValue("NoRecycleFiles")) != 0 ||
+                    Convert.ToInt32(machinePolicy?.GetValue("NoRecycleFiles")) != 0 ||
+                    Convert.ToInt32(bin?.GetValue("NukeOnDelete")) != 0 ||
+                    configuredCapacity is 0) return null;
+
+                var rbInfo = new SHQUERYRBINFO { cbSize = Marshal.SizeOf<SHQUERYRBINFO>() };
+                if (SHQueryRecycleBin(mountPath, ref rbInfo) != 0 || rbInfo.i64Size < 0) return null;
+
+                // SHQueryRecycleBin reports usage, not the effective quota. Do not guess a
+                // default or use the per-volume setting when policy can override it.
+                long? capacity = configuredCapacity is int capMiB && capMiB > 0 &&
+                    userPolicy?.GetValue("RecycleBinSize") == null &&
+                    machinePolicy?.GetValue("RecycleBinSize") == null ? capMiB * MiB : null;
+                return new RecycleVolume(volumeId, capacity, rbInfo.i64Size);
             }
             catch
             {
-                return false;
+                return null;
             }
         }
 
-        private static long QueryRecycleBinCount(string path)
+        private static string? CheckCapacity(RecycleVolume bin, long pendingBytes)
         {
+            if (bin.CapacityBytes is not { } capacity) return CapacityUnknownMessage;
+            return pendingBytes > capacity - bin.OccupiedBytes ? CapacityInsufficientMessage : null;
+        }
+
+        private static Mutex? TryAcquireRecycleLock()
+        {
+            Mutex? mutex = null;
             try
             {
-                string root = Path.GetPathRoot(Path.GetFullPath(path)) ?? "";
-                var info = new SHQUERYRBINFO { cbSize = Marshal.SizeOf(typeof(SHQUERYRBINFO)) };
-                if (SHQueryRecycleBin(root, ref info) == 0) return info.i64NumItems;
+                using var user = WindowsIdentity.GetCurrent();
+                if (user.User is not { } sid) return null;
+                mutex = new Mutex(false, $@"Global\Unbox.Recycle.{sid.Value}");
+                if (mutex.WaitOne(TimeSpan.FromSeconds(5))) return mutex;
             }
+            catch (AbandonedMutexException) { return mutex; }
             catch { }
-            return -1;
+            mutex?.Dispose();
+            return null;
         }
 
         /// <summary>
@@ -214,13 +287,26 @@ namespace UnzipProxy.Core
         /// </summary>
         public static RecycleResult RecycleVolumes(IReadOnlyList<VolumeIdentity> volumes, IntPtr ownerWindow = default)
         {
-            var items = new List<RecycleItemResult>();
             if (volumes == null || volumes.Count == 0)
+                return new RecycleResult { Success = true, Message = "无需回收" };
+
+            using var mutex = TryAcquireRecycleLock();
+            if (mutex == null)
             {
-                return new RecycleResult { Success = true, Message = "无需回收", Items = items };
+                const string reason = "无法独占本次 Unbox 回收操作，已保留源文件";
+                var retained = new List<RecycleItemResult>(volumes.Count);
+                foreach (var volume in volumes) retained.Add(Fail(volume.Path, reason));
+                return new RecycleResult { Message = reason, Items = retained };
             }
 
-            var verified = new List<(VolumeIdentity Expected, string FullPath)>();
+            try { return RecycleVolumesLocked(volumes, ownerWindow); }
+            finally { mutex.ReleaseMutex(); }
+        }
+
+        private static RecycleResult RecycleVolumesLocked(IReadOnlyList<VolumeIdentity> volumes, IntPtr ownerWindow)
+        {
+            var items = new List<RecycleItemResult>(volumes.Count);
+            var verified = new List<(VolumeIdentity Expected, string FullPath, RecycleVolume Bin)>();
             foreach (var volume in volumes)
             {
                 string fullPath = "";
@@ -237,26 +323,23 @@ namespace UnzipProxy.Core
                         items.Add(Fail(fullPath, "源卷不存在或已被移除，已保留"));
                         continue;
                     }
-                    if (fullPath.StartsWith(@"\\", StringComparison.Ordinal))
+                    const string missingIdentity = "缺少解压时记录的源文件身份，无法确认未被替换，已保留";
+                    if (QueryRecycleVolume(fullPath) is not { } bin)
                     {
-                        items.Add(Fail(fullPath, "网络路径不支持回收站，已保留"));
-                        continue;
-                    }
-                    if (!IsRecycleBinSupported(fullPath))
-                    {
-                        items.Add(Fail(fullPath, "所在驱动器不支持回收站，已保留"));
-                        continue;
-                    }
-
-                    var current = VolumeIdentity.Capture(fullPath);
-                    if (current == null)
-                    {
-                        items.Add(Fail(fullPath, "无法读取源文件对象身份，已保留"));
+                        items.Add(Fail(fullPath, volume.Valid ? BinDisabledMessage : BinDisabledMessage + "；" + missingIdentity,
+                            binUnavailable: true));
                         continue;
                     }
                     if (!volume.Valid)
                     {
-                        items.Add(Fail(fullPath, "缺少解压时记录的源文件身份，无法确认未被替换，已保留"));
+                        items.Add(Fail(fullPath, missingIdentity));
+                        continue;
+                    }
+
+                    var current = VolumeIdentity.Capture(fullPath);
+                    if (current == null || current.Size < 0)
+                    {
+                        items.Add(Fail(fullPath, "无法读取源文件对象身份，已保留"));
                         continue;
                     }
                     if (!volume.Matches(current))
@@ -264,7 +347,7 @@ namespace UnzipProxy.Core
                         items.Add(Fail(fullPath, "源文件在解压后已被替换或修改，已保留"));
                         continue;
                     }
-                    verified.Add((volume, fullPath));
+                    verified.Add((volume, fullPath, bin));
                 }
                 catch (Exception ex)
                 {
@@ -282,131 +365,121 @@ namespace UnzipProxy.Core
                 };
             }
 
-            long binCountBefore = QueryRecycleBinCount(verified[0].FullPath);
-            var sink = new RecycleProgressSink();
-            IFileOperation? operation = null;
-            uint cookie = 0;
-            bool advised = false;
-            int performHr = 0;
-            bool aborted = false;
-
-            try
-            {
-                Type? operationType = Type.GetTypeFromCLSID(CLSID_FileOperation);
-                if (operationType == null)
-                {
-                    throw new InvalidOperationException("无法创建 Shell 文件操作对象");
-                }
-                operation = (IFileOperation)Activator.CreateInstance(operationType)!;
-                operation.SetOwnerWindow(ownerWindow);
-                operation.SetOperationFlags(FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI);
-                if (operation.Advise(sink, out cookie) != 0)
-                {
-                    advised = false;
-                }
-                else
-                {
-                    advised = true;
-                }
-
-                foreach (var entry in verified)
-                {
-                    SHCreateItemFromParsingName(entry.FullPath, IntPtr.Zero, IID_IShellItem, out var shellItem);
-                    int deleteHr = operation.DeleteItem(shellItem, null);
-                    if (deleteHr != 0)
-                    {
-                        sink.Deleted.Add((entry.FullPath, deleteHr, ""));
-                    }
-                    Marshal.ReleaseComObject(shellItem);
-                }
-
-                performHr = operation.PerformOperations();
-                operation.GetAnyOperationsAborted(out aborted);
-            }
-            catch (Exception ex)
-            {
-                items.Add(Fail("", $"调用 Shell 回收接口失败：{ex.Message}"));
-            }
-            finally
-            {
-                if (operation != null)
-                {
-                    if (advised)
-                    {
-                        try { operation.Unadvise(cookie); } catch { }
-                    }
-                    try { Marshal.ReleaseComObject(operation); } catch { }
-                }
-            }
-
-            long binCountAfter = QueryRecycleBinCount(verified[0].FullPath);
-
+            var pendingByVolume = new Dictionary<Guid, long>();
+            string? preflightFailure = items.Exists(item => item.RecycleBinUnavailable)
+                ? "本次源卷包含无法确认可回收的卷，已保留其余源文件" : null;
             foreach (var entry in verified)
             {
-                string path = entry.FullPath;
-                int callbackIndex = sink.Deleted.FindIndex(d =>
-                    !string.IsNullOrEmpty(d.Path) &&
-                    string.Equals(Path.GetFullPath(d.Path), path, StringComparison.OrdinalIgnoreCase));
-                bool callbackFound = callbackIndex >= 0;
-                int callbackHr = callbackFound ? sink.Deleted[callbackIndex].HResult : 0;
-                // Shell 的 Copy Engine 使用 S_ 前缀的成功码（例如 S_DONT_PROCESS_CHILDREN = 0x00270008），
-                // 必须按 HRESULT 的符号判断成功，不能要求恰好等于 0。
-                bool callbackOk = callbackHr >= 0;
-
-                bool stillExists = File.Exists(path);
-                if (stillExists)
+                if (preflightFailure != null) break;
+                long pending = pendingByVolume.GetValueOrDefault(entry.Bin.Id);
+                if (entry.Expected.Size > long.MaxValue - pending)
                 {
-                    string detail = !callbackOk
-                        ? $"Shell 返回失败 (0x{callbackHr:X8})，源文件仍在原位"
-                        : $"源文件仍在原位（Shell 未报告回收完成{(aborted ? "，操作被中止" : "")}）";
-                    items.Add(Fail(path, detail));
+                    preflightFailure = CapacityInsufficientMessage;
+                    break;
+                }
+                pending += entry.Expected.Size;
+                preflightFailure = CheckCapacity(entry.Bin, pending);
+                if (preflightFailure != null) break;
+                pendingByVolume[entry.Bin.Id] = pending;
+            }
+            if (preflightFailure != null)
+            {
+                foreach (var entry in verified) items.Add(Fail(entry.FullPath, preflightFailure));
+                return new RecycleResult { Message = preflightFailure, Items = items };
+            }
+
+            int firstAttempt = items.Count;
+            foreach (var entry in verified)
+            {
+                long pending = pendingByVolume[entry.Bin.Id];
+                var item = RecycleOne(entry.Expected, entry.FullPath, entry.Bin.Id, pending, ownerWindow);
+                items.Add(item);
+                if (item.Recycled)
+                    pendingByVolume[entry.Bin.Id] -= entry.Expected.Size;
+            }
+
+            // A later operation can change the bin again. Count only items that are
+            // still visible in the Shell recycle namespace with the expected identity.
+            for (int i = 0; i < verified.Count; i++)
+            {
+                int index = firstAttempt + i;
+                if (!items[index].Recycled) continue;
+
+                var entry = verified[i];
+                if (File.Exists(entry.FullPath))
+                {
+                    items[index] = Fail(entry.FullPath, "任务结束时源路径仍有文件，请核对原路径和回收站");
                     continue;
                 }
-
-                if (!callbackOk)
-                {
-                    string located = TryLocateRecycleBinPath(path);
-                    items.Add(Fail(path, string.IsNullOrEmpty(located)
-                        ? $"Shell 返回失败 (0x{callbackHr:X8})，源文件已不在原位，请人工确认"
-                        : $"Shell 返回失败 (0x{callbackHr:X8})，但回收站内已能找到该项：{located}"));
-                    continue;
-                }
-
-                string recycledTo = callbackFound ? sink.Deleted[callbackIndex].RecycledTo : "";
-                if (string.IsNullOrEmpty(recycledTo))
-                {
-                    recycledTo = TryLocateRecycleBinPath(path);
-                }
-
-                items.Add(new RecycleItemResult
-                {
-                    Path = path,
-                    Recycled = true,
-                    Detail = string.IsNullOrEmpty(recycledTo) ? "已移入回收站（可还原）" : $"已移入回收站：{recycledTo}",
-                    RecycledTo = recycledTo
-                });
+                string destination = TryLocateRecycleBinPath(entry.Expected);
+                if (destination.Length == 0)
+                    items[index] = Fail(entry.FullPath, "源文件已不在原位，任务结束时未能核实可还原的回收站落点，请检查回收站");
+                else if (!string.Equals(destination, items[index].RecycledTo, StringComparison.OrdinalIgnoreCase))
+                    items[index] = new RecycleItemResult { Path = entry.FullPath, Recycled = true, RecycledTo = destination,
+                        Detail = $"已移入回收站：{destination}" };
             }
 
             bool allRecycled = items.TrueForAll(i => i.Recycled);
             string message;
             if (allRecycled)
             {
-                message = $"已将 {items.Count} 个源卷移入回收站（回收站项目数 {binCountBefore} -> {binCountAfter}）";
+                message = $"已确认 {items.Count} 个源卷可从回收站还原";
             }
             else
             {
-                message = $"{items.FindAll(i => i.Recycled).Count}/{items.Count} 个源卷已移入回收站，其余已保留在原位"
-                          + (performHr != 0 ? $"（Shell 返回 0x{performHr:X8}）" : "");
+                message = $"{items.FindAll(i => i.Recycled).Count}/{items.Count} 个源卷已确认移入回收站";
             }
 
             return new RecycleResult { Success = allRecycled, Message = message, Items = items };
         }
 
-        /// <summary>
-        /// 在系统回收站中按“原文件名 + 原目录”定位刚回收的项，返回其实际存放路径。
-        /// 这是逐卷“实际去向”的直接证据；取不到时返回空字符串。
-        /// </summary>
-        private static string TryLocateRecycleBinPath(string originalPath, int maxItems = 5000)
+        private static RecycleItemResult RecycleOne(VolumeIdentity expected, string path, Guid volumeId,
+            long pendingBytes, IntPtr ownerWindow)
+        {
+            IFileOperation? operation = null;
+            IShellItem? item = null;
+            try
+            {
+                var type = Type.GetTypeFromCLSID(CLSID_FileOperation, throwOnError: true)!;
+                operation = (IFileOperation)Activator.CreateInstance(type)!;
+                Marshal.ThrowExceptionForHR(operation.SetOwnerWindow(ownerWindow));
+                Marshal.ThrowExceptionForHR(operation.SetOperationFlags(
+                    FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI));
+                var sink = new RecycleProgressSink(expected, volumeId, pendingBytes);
+                SHCreateItemFromParsingName(path, IntPtr.Zero, IID_IShellItem, out item);
+                Marshal.ThrowExceptionForHR(operation.DeleteItem(item, sink));
+                int hr = operation.PerformOperations();
+                if (File.Exists(path))
+                    return Fail(path, sink.BlockedReason ?? $"Shell 未完成回收（0x{hr:X8}），源文件仍在原位",
+                        binUnavailable: sink.BlockedReason == BinDisabledMessage);
+
+                if (hr < 0 || operation.GetAnyOperationsAborted(out bool aborted) < 0 || aborted ||
+                    sink.DeleteResult is null or < 0)
+                    return Fail(path, "源文件已不在原位，未能确认 Shell 回收结果，请检查回收站");
+
+                string destination = sink.Destination;
+                if (!MatchesDestination(expected, destination))
+                    destination = TryLocateRecycleBinPath(expected);
+                if (destination.Length == 0)
+                    return Fail(path, "源文件已不在原位，未能核实可还原的回收站落点，请检查回收站");
+                return new RecycleItemResult { Path = path, Recycled = true, RecycledTo = destination,
+                    Detail = $"已移入回收站：{destination}" };
+            }
+            catch (Exception ex)
+            {
+                return Fail(path, $"调用 Shell 回收接口失败：{ex.Message}");
+            }
+            finally
+            {
+                if (item != null) Marshal.ReleaseComObject(item);
+                if (operation != null) Marshal.ReleaseComObject(operation);
+            }
+        }
+
+        private static bool MatchesDestination(VolumeIdentity expected, string path) =>
+            Path.IsPathFullyQualified(path) && VolumeIdentity.Capture(path) is { } actual && expected.Matches(actual);
+
+        private static string TryLocateRecycleBinPath(VolumeIdentity expected, int maxItems = 5000)
         {
             try
             {
@@ -419,15 +492,11 @@ namespace UnzipProxy.Core
 
                 dynamic items = bin.Items();
                 int count = Math.Min((int)items.Count, maxItems);
-                string targetName = Path.GetFileName(originalPath);
-                string targetDir = (Path.GetDirectoryName(originalPath) ?? "").TrimEnd('\\');
+                string targetDir = (Path.GetDirectoryName(expected.Path) ?? "").TrimEnd('\\');
 
                 for (int i = 0; i < count; i++)
                 {
                     dynamic item = items.Item(i);
-                    string name = (item.Name as string) ?? "";
-                    if (!string.Equals(name, targetName, StringComparison.OrdinalIgnoreCase)) continue;
-
                     string deletedFrom = "";
                     try { deletedFrom = (item.ExtendedProperty("System.Recycle.DeletedFrom") as string) ?? ""; } catch { }
                     if (!string.IsNullOrEmpty(deletedFrom) &&
@@ -435,7 +504,8 @@ namespace UnzipProxy.Core
                     {
                         continue;
                     }
-                    return (item.Path as string) ?? "";
+                    string path = (item.Path as string) ?? "";
+                    if (MatchesDestination(expected, path)) return path;
                 }
             }
             catch
@@ -464,9 +534,9 @@ namespace UnzipProxy.Core
             return RecycleVolumes(identities);
         }
 
-        private static RecycleItemResult Fail(string path, string detail)
+        private static RecycleItemResult Fail(string path, string detail, bool binUnavailable = false)
         {
-            return new RecycleItemResult { Path = path, Recycled = false, Detail = detail };
+            return new RecycleItemResult { Path = path, Recycled = false, Detail = detail, RecycleBinUnavailable = binUnavailable };
         }
     }
 }

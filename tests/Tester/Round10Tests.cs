@@ -15,6 +15,10 @@ namespace Tester
 {
     partial class Program
     {
+        private static bool IsRecycleCapacityGuard(string detail) =>
+            detail.Contains("无法确认目标卷的回收站容量", StringComparison.Ordinal) ||
+            detail.Contains("回收站剩余容量不足", StringComparison.Ordinal);
+
         static void TestPasswordReuse()
         {
             string correct = Guid.NewGuid().ToString("N");
@@ -102,7 +106,7 @@ namespace Tester
             {
                 TestPasswordPromptLayout();
                 TestStartupErrorStopsProgress();
-                foreach (string scenario in new[] { "no-marker", "unknown-status", "wrong-marker", "traversal", "wait-exit", "wait-delivery" })
+                foreach (string scenario in new[] { "no-marker", "unknown-status", "wrong-marker", "traversal", "wait-exit", "wait-delivery", "missing-identity", "missing-secondary" })
                 {
                     string directory = Path.Combine(_testDir, "r10_window_" + scenario);
                     Directory.CreateDirectory(directory);
@@ -117,6 +121,14 @@ namespace Tester
                     if (scenario == "no-marker") message.Remove("manifest_ok");
                     if (scenario == "wrong-marker") message["manifest_ok"] = "true";
                     if (scenario == "unknown-status") message["status"] = "unexpected";
+                    string missingIdentityPath = archive;
+                    if (scenario == "missing-identity") message.Remove("volume_identities");
+                    if (scenario == "missing-secondary")
+                    {
+                        missingIdentityPath = Path.Combine(directory, "source.z01");
+                        File.Copy(archive, missingIdentityPath);
+                        message["opened_volumes"]!.AsArray().Add(missingIdentityPath);
+                    }
                     string outside = Path.Combine(directory, "outside");
                     if (scenario == "traversal")
                     {
@@ -139,11 +151,33 @@ namespace Tester
                     if (!waitForExit) worker.WaitForExit();
 
                     using var frame = JsonDocument.Parse(message.ToJsonString());
+                    if (scenario is "missing-identity" or "missing-secondary" or "wait-exit")
+                    {
+                        const BindingFlags flags = BindingFlags.NonPublic | BindingFlags.Static;
+                        var volumes = typeof(MainWindow).GetMethod("ParseVolumeIdentities", flags)!
+                            .Invoke(null, new object[] { frame.RootElement });
+                        bool retry = (bool)typeof(MainWindow).GetMethod("RetryVolumesMatch", flags)!
+                            .Invoke(null, new[] { volumes })!;
+                        Assert($"R1-004: 重试前核对全部已打开卷 ({scenario})", retry == (scenario == "wait-exit"));
+                    }
                     var window = OpenTestWindow(plan, manifest, worker);
                     var finish = typeof(MainWindow).GetMethod("HandleFinishedAsync", BindingFlags.NonPublic | BindingFlags.Instance)!;
                     var task = (Task)finish.Invoke(window, new object[] { frame.RootElement })!;
 
-                    if (waitForExit || scenario == "wait-delivery")
+                    if (scenario is "missing-identity" or "missing-secondary")
+                    {
+                        AwaitWindowCompletion(task);
+                        string details = ((TextBlock)window.FindName("PathInfoText")).Text;
+                        Assert($"R1-004: WPF 保留并说明缺少身份的源卷 ({scenario})",
+                            window.IsVisible && File.Exists(missingIdentityPath) &&
+                            File.Exists(Path.Combine(plan.FinalTargetDirectory, "data.txt")) &&
+                            details.Contains(Path.GetFileName(missingIdentityPath)) && details.Contains("缺少解压时记录的源文件身份"), details);
+                        if (!ShellRecycleBin.IsRecycleBinSupported(archive))
+                            Assert($"R1-001/R1-004: 回收站禁用且卷身份缺失时仍给出指定提示 ({scenario})",
+                                ((TextBlock)window.FindName("MainStatusText")).Text == "回收站没有启用，源文件未删除");
+                        window.Close();
+                    }
+                    else if (waitForExit || scenario == "wait-delivery")
                     {
                         bool recycleSupported = ShellRecycleBin.IsRecycleBinSupported(archive);
                         window.Close();
@@ -152,9 +186,13 @@ namespace Tester
                         if (waitForExit) worker.StandardInput.Close();
                         AwaitWindowCompletion(task);
                         var statusText = (TextBlock)window.FindName("MainStatusText");
-                        bool recycleResult = recycleSupported
+                        string detail = ((TextBlock)window.FindName("PathInfoText")).Text;
+                        bool capacityGuarded = IsRecycleCapacityGuard(detail);
+                        bool recycleResult = recycleSupported && !capacityGuarded
                             ? !File.Exists(archive)
-                            : File.Exists(archive) && statusText.Text.Contains("源文件回收未完成");
+                            : File.Exists(archive) && (capacityGuarded
+                                ? statusText.Text == "解压完成（源文件回收未完成）"
+                                : statusText.Text == "回收站没有启用，源文件未删除");
                         string delivered = Path.Combine(plan.FinalTargetDirectory, "data.txt");
                         Assert($"R10: 交付、复核与回收完成后才关闭 ({scenario})",
                             !window.IsVisible && recycleResult && File.Exists(delivered) &&

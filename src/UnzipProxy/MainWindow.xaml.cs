@@ -25,6 +25,12 @@ namespace UnzipProxy
         [DllImport("dwmapi.dll")]
         private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
 
+        [DllImport("kernel32.dll", EntryPoint = "GetDiskFreeSpaceExW", ExactSpelling = true,
+            CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetDiskFreeSpaceEx(string directory, out ulong availableBytes,
+            IntPtr totalBytes, IntPtr totalFreeBytes);
+
         private const int DWMWA_WINDOW_CORNER_PREFERENCE = 33;
         private const int DWMWCP_ROUND = 2;
 
@@ -831,10 +837,11 @@ namespace UnzipProxy
             AttemptOptions? retry = null;
             try
             {
+                string? budgetFailureDetail = null;
                 if (ReadBudgetFailure(root) is { } budget)
-                    retry = await TryRetryBudgetAsync(budget);
+                    (retry, budgetFailureDetail) = await TryRetryBudgetAsync(budget);
                 if (retry == null)
-                    autoClose = await FinalizeExtractionAsync(root);
+                    autoClose = await FinalizeExtractionAsync(root, budgetFailureDetail);
             }
             catch (Exception ex)
             {
@@ -897,34 +904,45 @@ namespace UnzipProxy
             return new BudgetFailure(phase, bytes, used, intermediate, ParseVolumeIdentities(root));
         }
 
-        private async Task<AttemptOptions?> TryRetryBudgetAsync(BudgetFailure failure)
+        private static bool RetryVolumesMatch(List<VolumeIdentity> volumes) =>
+            volumes.Count > 0 && volumes.All(original => original.Valid &&
+                VolumeIdentity.Capture(original.Path) is { } current && original.Matches(current));
+
+        private async Task<(AttemptOptions? Retry, string? FailureDetail)> TryRetryBudgetAsync(BudgetFailure failure)
         {
             var worker = _workerProcess;
             var plan = _plan;
             if (worker == null || plan == null || !await Task.Run(() => worker.WaitForExit(15000)) || worker.ExitCode != 10)
-                return null;
+                return default;
 
             bool SourcesMatch() => _sourceIdentity != null &&
                 VolumeIdentity.Capture(plan.SourceArchivePath) is { } source && _sourceIdentity.Matches(source) &&
-                failure.Volumes.Count > 0 && failure.Volumes.All(
-                    original => VolumeIdentity.Capture(original.Path) is { } current && original.Matches(current));
-            if (_closeRequested || !SourcesMatch()) return null;
+                RetryVolumesMatch(failure.Volumes);
+            if (_closeRequested || !SourcesMatch()) return default;
 
             _workerInput?.Dispose();
             _workerInput = null;
             ArchiveTaskPlanner.CleanupStaging(plan);
             CleanupManifest();
-            if (Directory.Exists(plan.StagingDirectory) || File.Exists(_manifestPath)) return null;
+            if (Directory.Exists(plan.StagingDirectory) || File.Exists(_manifestPath)) return default;
 
             const ulong MiB = 1024 * 1024;
-            ulong FreeMiB()
+            const string unavailable = "无法查询目标目录的可用空间。请检查连接和目录访问权限后重新打开源包。";
+            const string insufficient = "目标目录的可用空间不足以提高解压上限。请释放空间后重新打开源包。";
+            string destination = plan.DestinationParentDir;
+            if (!Path.EndsInDirectorySeparator(destination))
+                destination += Path.DirectorySeparatorChar;
+
+            ulong? FreeMiB()
             {
-                ulong free = (ulong)Math.Max(0, new DriveInfo(Path.GetPathRoot(plan.DestinationParentDir)!).AvailableFreeSpace);
+                if (!GetDiskFreeSpaceEx(destination, out ulong free, IntPtr.Zero, IntPtr.Zero))
+                    return null;
                 return free > failure.IntermediateBytes ? (free - failure.IntermediateBytes) / MiB : 0;
             }
-            ulong available = FreeMiB();
+            if (FreeMiB() is not { } available)
+                return (null, unavailable);
             ulong minimum = failure.Limit / MiB + 1;
-            if (minimum > available) return null;
+            if (minimum > available) return (null, insufficient);
 
             var prompt = CreatePrompt("解压超出本次上限", "重新解压");
             prompt.ModalBudgetPanel.Visibility = Visibility.Visible;
@@ -934,19 +952,34 @@ namespace UnzipProxy
             ulong entered = 0;
             prompt.ValidateSubmission = () =>
             {
+                if (FreeMiB() is not { } current)
+                {
+                    prompt.BudgetValidationText.Text = unavailable;
+                    return false;
+                }
+                if (minimum > current)
+                {
+                    prompt.BudgetValidationText.Text = insufficient;
+                    return false;
+                }
                 if (ulong.TryParse(prompt.BudgetLimitInput.Text, NumberStyles.None, CultureInfo.InvariantCulture, out entered) &&
-                    entered >= minimum && entered <= FreeMiB()) return true;
-                prompt.BudgetValidationText.Text = $"请输入 {minimum:N0} 到 {FreeMiB():N0} MiB 之间的整数。";
+                    entered >= minimum && entered <= current) return true;
+                prompt.BudgetValidationText.Text = $"请输入 {minimum:N0} 到 {current:N0} MiB 之间的整数。";
                 return false;
             };
-            if (!ShowPrompt(prompt, prompt.BudgetLimitInput) || _closeRequested || !SourcesMatch() || entered > FreeMiB())
-                return null;
+            if (!ShowPrompt(prompt, prompt.BudgetLimitInput) || _closeRequested || !SourcesMatch())
+                return default;
+            if (FreeMiB() is not { } remaining)
+                return (null, unavailable);
+            if (entered > remaining)
+                return (null, insufficient);
 
-            return failure.Phase == "inner" ? _attemptOptions with { InnerLimit = entered * MiB } :
+            var retry = failure.Phase == "inner" ? _attemptOptions with { InnerLimit = entered * MiB } :
                 _attemptOptions with { OuterLimit = entered * MiB };
+            return (retry, null);
         }
 
-        private async Task<bool> FinalizeExtractionAsync(JsonElement root)
+        private async Task<bool> FinalizeExtractionAsync(JsonElement root, string? budgetFailureDetail)
         {
             var worker = _workerProcess;
             bool workerExited = worker != null && (worker.HasExited ||
@@ -982,7 +1015,8 @@ namespace UnzipProxy
 
             if (!workerExited || !exitMatches || !manifestOk || errorReason.Length != 0)
             {
-                FailWithoutCommit(DescribeFailure(errorReason, exitCode, status), !workerExited);
+                FailWithoutCommit(budgetFailureDetail is { } detail ? $"{detail} 源压缩包已保留。" :
+                    DescribeFailure(errorReason, exitCode, status), !workerExited);
                 return false;
             }
 
@@ -1060,7 +1094,9 @@ namespace UnzipProxy
 
             if (recycleProblem)
             {
-                MainStatusText.Text = "解压完成（源文件回收未完成）";
+                MainStatusText.Text = result.Recycle!.Items.Count > 0 &&
+                    result.Recycle.Items.All(i => i.RecycleBinUnavailable)
+                    ? ShellRecycleBin.BinDisabledMessage : "解压完成（源文件回收未完成）";
                 MainStatusText.Foreground = (Brush)Resources["Win11Amber"];
                 TitleText.Text = "已完成 100%";
                 PathInfoText.Text = "解压已完成并已逐项校验。" + result.Recycle!.Message + "。"
@@ -1092,17 +1128,15 @@ namespace UnzipProxy
         {
             var failures = recycle.Items.Where(i => !i.Recycled).Select(i => $"{Path.GetFileName(i.Path)}：{i.Detail}").ToList();
             if (failures.Count == 0) return "";
-            return "（未回收：" + string.Join("；", failures) + "）";
+            return "（回收未确认：" + string.Join("；", failures) + "）";
         }
 
         private static List<VolumeIdentity> ParseVolumeIdentities(JsonElement root)
         {
             var list = new List<VolumeIdentity>();
-            if (!root.TryGetProperty("volume_identities", out var identities) || identities.ValueKind != JsonValueKind.Array)
-            {
-                return list;
-            }
-            foreach (var element in identities.EnumerateArray())
+            var entries = root.TryGetProperty("volume_identities", out var identities) && identities.ValueKind == JsonValueKind.Array
+                ? identities.EnumerateArray() : Enumerable.Empty<JsonElement>();
+            foreach (var element in entries)
             {
                 try
                 {
@@ -1155,7 +1189,13 @@ namespace UnzipProxy
                     // 单条身份解析失败：该卷会在回收时被判为“无法确认身份”而保留
                 }
             }
-            return list;
+            if (!root.TryGetProperty("opened_volumes", out var opened) || opened.ValueKind != JsonValueKind.Array)
+                return list; // Older frames contain only the identity list.
+            var byPath = list.ToLookup(i => i.Path, StringComparer.OrdinalIgnoreCase);
+            return opened.EnumerateArray().Where(p => p.ValueKind == JsonValueKind.String)
+                .Select(p => p.GetString()!).Distinct(StringComparer.OrdinalIgnoreCase)
+                .Select(path => byPath[path].FirstOrDefault() ?? new VolumeIdentity { Path = path })
+                .ToList();
         }
 
         private static ulong ReadUInt64LittleEndian(byte[] bytes, int offset)

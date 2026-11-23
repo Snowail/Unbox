@@ -865,7 +865,7 @@ namespace Tester
             var replacedResult = ShellRecycleBin.RecycleVolumes(new[] { identityBefore! });
             Assert("回收: 源文件被替换后拒绝回收且文件保留",
                 !replacedResult.Success && File.Exists(recycleProbe) &&
-                replacedResult.Items.Any(i => !i.Recycled && i.Detail.Contains(recycleSupported ? "替换" : "不支持回收站")),
+                replacedResult.Items.Any(i => !i.Recycled && i.Detail.Contains(recycleSupported ? "替换" : "回收站没有启用，源文件未删除")),
                 replacedResult.Message);
 
             // 真实回收一个临时文件，并从回收站落点核对字节（证明可还原）
@@ -886,7 +886,8 @@ namespace Tester
                     restoredHash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(item.RecycledTo)));
                 }
             }
-            if (recycleSupported)
+            string recycleDetail = realResult.Items.SingleOrDefault()?.Detail ?? "";
+            if (recycleSupported && !IsRecycleCapacityGuard(recycleDetail))
             {
                 Assert("回收: 通过 Shell 逐项回收并返回回收站落点",
                     wentToRecycleBin && !string.IsNullOrEmpty(realResult.Items[0].RecycledTo), realResult.Message);
@@ -894,8 +895,9 @@ namespace Tester
             }
             else
             {
-                Console.WriteLine("[SKIP] 当前测试会话未提供可用回收站，跳过 Shell 实际回收与落点摘要。");
-                Assert("回收: 回收站不可用时保留源文件原始字节", !realResult.Success &&
+                Console.WriteLine($"[SKIP] 当前会话的 Shell 回收条件未满足：{recycleDetail}");
+                Assert("回收: 回收条件未满足时保留源文件原始字节", !realResult.Success &&
+                    (IsRecycleCapacityGuard(recycleDetail) || recycleDetail == "回收站没有启用，源文件未删除") &&
                     File.Exists(realRecycle) && Sha256(realRecycle) == expectedHash);
             }
 

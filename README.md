@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="icon.png" width="128" height="128" alt="Unbox Logo">
+![Unbox Logo](appicon/package-box.png)
 
 # Unbox
 
@@ -37,56 +37,6 @@
 
 <!-- Hero Banner Showcase -->
 <img src="assets/banner.png" width="900" alt="Unbox Preview" style="border-radius: 14px; box-shadow: 0 20px 40px rgba(0,0,0,0.45);">
-
-<br><br>
-
-<!-- Quick Navigation with Icons -->
-<table>
-  <tr>
-    <td align="center" width="14%">
-      <a href="#-the-problem">
-        <img src="https://raw.githubusercontent.com/Tarikul-Islam-Anik/Animated-Fluent-Emojis/master/Emojis/Objects/Light%20Bulb.png" width="28"><br>
-        <b>痛点与初衷</b>
-      </a>
-    </td>
-    <td align="center" width="14%">
-      <a href="#-superpowers">
-        <img src="https://raw.githubusercontent.com/Tarikul-Islam-Anik/Animated-Fluent-Emojis/master/Emojis/Travel%20and%20places/Rocket.png" width="28"><br>
-        <b>核心特性</b>
-      </a>
-    </td>
-    <td align="center" width="14%">
-      <a href="#-get-started">
-        <img src="https://raw.githubusercontent.com/Tarikul-Islam-Anik/Animated-Fluent-Emojis/master/Emojis/Objects/Package.png" width="28"><br>
-        <b>快速上手</b>
-      </a>
-    </td>
-    <td align="center" width="14%">
-      <a href="#-supported-formats">
-        <img src="https://raw.githubusercontent.com/Tarikul-Islam-Anik/Animated-Fluent-Emojis/master/Emojis/Activities/Puzzle%20Piece.png" width="28"><br>
-        <b>支持格式</b>
-      </a>
-    </td>
-    <td align="center" width="14%">
-      <a href="#-architecture">
-        <img src="https://raw.githubusercontent.com/Tarikul-Islam-Anik/Animated-Fluent-Emojis/master/Emojis/Objects/Gear.png" width="28"><br>
-        <b>架构设计</b>
-      </a>
-    </td>
-    <td align="center" width="14%">
-      <a href="#-roadmap">
-        <img src="https://raw.githubusercontent.com/Tarikul-Islam-Anik/Animated-Fluent-Emojis/master/Emojis/Travel%20and%20places/Compass.png" width="28"><br>
-        <b>路线规划</b>
-      </a>
-    </td>
-    <td align="center" width="14%">
-      <a href="#-license--credits">
-        <img src="https://raw.githubusercontent.com/Tarikul-Islam-Anik/Animated-Fluent-Emojis/master/Emojis/Smilies/Smiling%20Face%20with%20Hearts.png" width="28"><br>
-        <b>开源与致谢</b>
-      </a>
-    </td>
-  </tr>
-</table>
 
 </div>
 
@@ -228,26 +178,24 @@ Unbox 让解压体验变得像 macOS 的 Archive Utility 一样自然，同时�
 - **免安装**：解压即可使用，支持随身 U 盘便携携带；
 - **现代轻量化部署**：采用 **.NET 10 LTS 框架依赖部署 (Framework-Dependent)**，包体积仅 ~2.6 MB（缩减 95.3%）。系统仅需安装官方 Windows x64 .NET 10 桌面运行时 (Desktop Runtime)。
 
-### 2. 一键注册关联
+### 2. 安装或修复关联
 
-解压至您希望常驻的目录（如 `D:\Tools\Unbox`），然后：
+将便携包解压到常用目录，例如 `D:\Tools\Unbox`。
 
-1. 双击 **`安装与卸载.cmd`**，选择 **[1] 安装或修复关联**；
-2. 脚本将通过系统原生注册表引擎，向 Windows 11 登记 **57 种文件格式** 的专用高清图标与 ProgID；
-3. 随后脚本会自动为您打开 Windows 11 设置中的【默认应用】页面，确认设置即可！
+1. 双击 **`安装与卸载.cmd`**，选择 **[1] 安装或修复关联**。
+2. 菜单为当前 Windows 用户登记 57 个扩展名的打开方式和图标，然后打开系统的「默认应用」设置。
+3. 在「默认应用」中，把需要双击解压的扩展名设为由 **Unbox** 打开。
 
 ### 3. 双击解压
 
-关联完成后，直接在资源管理器中 **双击任意压缩包**：
+设置好默认应用后，在资源管理器中 **双击对应格式的压缩包**：
 - 现代任务窗口轻盈浮现，开始高速流式解压；
 - 支持点击左下角 **“详细信息”** 查看实时吞吐面积图；
 - 完整解压后播放内置提示音。
 
-### 4. 彻底卸载与清理
+### 4. 卸载关联
 
-若需完全取消文件关联，只需：
-- 双击 **`安装与卸载.cmd`**，选择 **[2] 卸载关联**；
-- 脚本将幂等清除全部写入系统的注册表 Capabilities、ProgID 项并广播刷新图标缓存，不留任何残留。
+双击 **`安装与卸载.cmd`**，选择 **[2] 卸载关联**，即可清理当前用户的 Unbox 文件关联。
 
 <br>
 
@@ -255,39 +203,32 @@ Unbox 让解压体验变得像 macOS 的 Archive Utility 一样自然，同时�
 
 ## 🗂️ Supported Formats
 
-Unbox 完整覆盖了常见归档、流式压缩、分卷包以及发行镜像：
+Unbox 支持以下归档、分卷入口、映像和压缩流。安装菜单登记 57 个扩展名。TAR 长后缀也能识别，Windows 通过最后一段扩展名打开文件。
 
 | 分类 | 格式扩展名 |
 |:---|:---|
-| **常用归档** | `.zip`, `.zipx`, `.7z`, `.rar`, `.r00`, `.tar`, `.ova` |
-| **压缩流与复合别名** | `.gz`, `.gzip`, `.tgz`, `.tpz`, `.bz2`, `.bzip2`, `.tbz2`, `.tbz`, `.xz`, `.txz`, `.zst`, `.tzst`, `.lzma`, `.lzh`, `.lha`, `.z`, `.taz`, `.cab`, `.arj` |
-| **分卷与发行包** | `.001` (分卷首卷), `.deb`, `.rpm`, `.cpio`, `.xar`, `.xip` |
+| **常用归档** | `.zip`, `.zipx`, `.7z`, `.rar`, `.tar`, `.ova`, `.lzh`, `.lha`, `.cab`, `.arj` |
+| **分卷入口** | `.r00`, `.001` |
+| **发行包与系统归档** | `.deb`, `.rpm`, `.cpio`, `.xar`, `.xip` |
 | **映像与虚拟机磁盘** | `.wim`, `.swm`, `.esd`, `.dmg` (Apple 磁盘映像), `.squashfs`, `.vmdk`, `.vdi`, `.qcow`, `.qcow2`, `.fat`, `.ntfs` |
 
+普通压缩流解开最外层。使用 TAR 短别名或长后缀时，Unbox 会继续展开内层 TAR。
+
+| 压缩格式 | 普通流 | TAR 短别名 | TAR 长后缀 |
+|:---|:---|:---|:---|
+| gzip | `.gz`, `.gzip` | `.tgz`, `.tpz` | `.tar.gz`, `.tar.gzip` |
+| bzip2 | `.bz2`, `.bzip2` | `.tbz2`, `.tbz` | `.tar.bz2`, `.tar.bzip2` |
+| XZ | `.xz` | `.txz` | `.tar.xz` |
+| UNIX Compress | `.z` | `.taz` | `.tar.z` |
+| LZMA | `.lzma`, `.lzma86` | — | `.tar.lzma` |
+| Zstandard | `.zst`, `.zstd` | `.tzst`, `.tzstd` | `.tar.zst`, `.tar.zstd` |
+| Brotli | `.br`, `.brotli` | `.tbr` | `.tar.br`, `.tar.brotli` |
+| LZ4 | `.lz4` | `.tlz4` | `.tar.lz4` |
+| LZ5 | `.lz5` | `.tlz5` | `.tar.lz5` |
+| Lizard | `.liz` | `.tliz` | `.tar.liz` |
+| Lzip | `.lz` | `.tlz` | `.tar.lz` |
+
 > *注：系统原生可直接加载挂载的 `.iso`、`.vhd`、`.vhdx` 以及办公文档容器（`.docx`、`.xlsx` 等）严格排除关联，保留原有系统行为。*
-
-<br>
-
----
-
-## 🛠️ Architecture
-
-Unbox 采用现代客户端软件的典型**进程隔离双核心架构**：
-
-```mermaid
-graph TD
-    User([双击压缩包]) --> Proxy[Unbox.exe 主进程<br>WPF / C# .NET 10 LTS]
-    Proxy -->|Win11 任务窗口| UI[Fluent 现代对话框<br>堆积面积图 / 状态机 / 提示音]
-    Proxy -->|JobObject 强生命周期绑定| Worker[UnzipWorker.exe 解压核心<br>纯原生 C++20]
-    Worker -->|加载 COM 接口| Engine[(7z.dll 7-Zip ZS 26.05 解码库)]
-    Worker -->|匿名管道 JSON 通信 30ms 限流| Proxy
-    Worker -->|流式解压 / 字符清洗 / Mac 过滤| Disk[(目标磁盘目录)]
-```
-
-- **前端交互（Unbox.exe）**：
-  基于 WPF 与 .NET 10 LTS，深度融合 Windows 11 DWM 圆角渲染与深色模式 API。面积图采用高性能分桶推进算法，速度指标经过 500ms EMA 滤波与 30ms 管道限流，UI 帧率极度丝滑；
-- **原生后端（UnzipWorker.exe）**：
-  纯原生 C++20 编写，加载官方 `7z.dll` COM 解码接口。依托 Windows `JobObject` 保证主窗口关闭时工作进程 100% 级联终结，绝不发生后台孤儿进程泄漏。
 
 <br>
 

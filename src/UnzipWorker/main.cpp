@@ -353,11 +353,22 @@ struct ItemPlan {
 };
 
 // 构建条目计划：名称来源优先使用归档内的原始名称字节，其次才使用引擎解码结果。
+// The handler can open and extract a readable prefix while reporting fatal damage
+// at archive scope. WarningFlags are a separate, non-fatal property.
+bool HasArchiveErrors(IInArchive* archive) {
+    PROPVARIANT flags{};
+    const HRESULT hr = archive->GetArchiveProperty(kpidErrorFlags, &flags);
+    const bool invalid = FAILED(hr) || (flags.vt != VT_EMPTY &&
+        (flags.vt != VT_UI4 || flags.ulVal != 0));
+    PropVariantClear(&flags);
+    return invalid;
+}
+
 ItemPlan BuildItemPlan(IInArchive* archive,
                        uint32_t numItems,
                        const std::wstring& archivePath,
                        uint32_t codePage,
-                       bool allowAutoSanitize,
+                       bool isTar,
                        bool strictCodePage = false) {
     ItemPlan plan;
     plan.targetPaths.assign(numItems, L"");
@@ -440,6 +451,19 @@ ItemPlan BuildItemPlan(IInArchive* archive,
         }
         PropVariantClear(&propIsDir);
 
+        if (isTar) {
+            // Raw syntax and link metadata have already been checked above.
+            fs::path relative;
+            for (const auto& segment : fs::path(itemPath)) {
+                if (!segment.empty() && segment != L".") relative /= segment;
+            }
+            itemPath = relative.native();
+            if (itemPath.empty()) {
+                if (!isDir) ++plan.unsafeItems;
+                continue; // An explicit "./" directory denotes the existing root.
+            }
+        }
+
         // D5：macOS 辅助文件按产品规则过滤（不是“跳过”，也不代表内容缺失）
         if (PathSanitizer::IsMacAuxiliary(itemPath)) {
             plan.policyFiltered++;
@@ -463,7 +487,6 @@ ItemPlan BuildItemPlan(IInArchive* archive,
         }
     }
 
-    (void)allowAutoSanitize;
     return plan;
 }
 
@@ -609,7 +632,7 @@ InnerExtractResult ExpandInnerArchive(SevenZipLibrary& lib7z,
     }
 
     uint32_t innerNumItems = 0;
-    if (FAILED(innerArchive->GetNumberOfItems(&innerNumItems))) {
+    if (HasArchiveErrors(innerArchive) || FAILED(innerArchive->GetNumberOfItems(&innerNumItems))) {
         innerArchive->Close();
         innerArchive->Release();
         innerOpenCallback->Release();
@@ -645,7 +668,7 @@ InnerExtractResult ExpandInnerArchive(SevenZipLibrary& lib7z,
         return result;
     }
 
-    ItemPlan plan = BuildItemPlan(innerArchive, innerNumItems, payloadPath, codePage, true, strictCodePage);
+    ItemPlan plan = BuildItemPlan(innerArchive, innerNumItems, payloadPath, codePage, isTar, strictCodePage);
     // 内层非法字符直接批量清洗（不再打断用户），并如实计数
     for (uint32_t idx : plan.illegalItems) {
         plan.targetPaths[idx] = PathSanitizer::SanitizeRelativePath(plan.targetPaths[idx]);
@@ -874,12 +897,12 @@ int wmain(int argc, wchar_t* argv[]) {
     }
 
     uint32_t numItems = 0;
-    if (FAILED(archive->GetNumberOfItems(&numItems))) {
+    if (HasArchiveErrors(archive) || FAILED(archive->GetNumberOfItems(&numItems))) {
         archive->Close();
         archive->Release();
         openCallback->Release();
         inStream->Release();
-        SendIpcMessage("{\"type\":\"error\",\"message\":\"Failed to get archive items\"}");
+        SendIpcMessage("{\"type\":\"error\",\"message\":\"Archive is damaged or incomplete\"}");
         return 5;
     }
 
@@ -887,7 +910,8 @@ int wmain(int argc, wchar_t* argv[]) {
     bool cpExplicit = (userCodePage != 0);
 
     // 外层条目计划（尊重归档声明的 Unicode 名称；显式编码时严格按该值解码）
-    ItemPlan plan = BuildItemPlan(archive, numItems, archivePath, effectiveCp, true, cpExplicit);
+    const bool isTar = _wcsicmp(handler.c_str(), L"tar") == 0;
+    ItemPlan plan = BuildItemPlan(archive, numItems, archivePath, effectiveCp, isTar, cpExplicit);
 
     // 名称的编码声明自相矛盾或存在无法解码的名称时，请 Proxy 让用户选择编码
     if (plan.undecodableNames > 0 || (plan.declaredUnicode > 0 && plan.legacyNames > 0)) {
@@ -906,7 +930,7 @@ int wmain(int argc, wchar_t* argv[]) {
         if (chosen != 0) {
             effectiveCp = chosen;
             cpExplicit = true;
-            plan = BuildItemPlan(archive, numItems, archivePath, effectiveCp, true, true);
+            plan = BuildItemPlan(archive, numItems, archivePath, effectiveCp, isTar, true);
         }
     }
 

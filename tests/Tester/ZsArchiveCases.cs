@@ -61,6 +61,46 @@ partial class Program
         return files.Length == 1 && Path.GetFileName(files[0]) == expectedLeaf && Sha256(files[0]) == expectedHash;
     }
 
+    private static void TestInterruptedZipAndTarRoot(string directory, string payload, string expected)
+    {
+        string pair = Path.Combine(directory, "pair.zip");
+        CreateZipStored(pair, ("first.txt", "first"), ("second.txt", "second"));
+        byte[] bytes = File.ReadAllBytes(pair);
+        int second = bytes.AsSpan(4).IndexOf(new byte[] { 0x50, 0x4B, 3, 4 }) + 4;
+        if (second <= 4) throw new InvalidDataException("Missing second local ZIP header");
+        foreach (string name in new[] { "interrupted.zip", "interrupted.zip.001" })
+        {
+            string path = Path.Combine(directory, name);
+            File.WriteAllBytes(path, bytes[..second]);
+            string before = Sha256(path);
+            var run = ExtractZs(path, "interrupted", out _, out string manifest);
+            Assert($"R1-002: {name} 拒绝仅首条可读的 ZIP", run.ExitCode != 0 && run.Status != "ok" &&
+                !File.Exists(manifest) && Sha256(path) == before, $"exit={run.ExitCode} reason={run.ErrorReason}");
+        }
+
+        string tarPath = Path.Combine(directory, "dotroot.tar");
+        using (var tar = new TarWriter(File.Create(tarPath), TarEntryFormat.Ustar))
+        {
+            tar.WriteEntry(new UstarTarEntry(TarEntryType.Directory, "./"));
+            tar.WriteEntry(payload, "./report.csv");
+            tar.WriteEntry(payload, "./-/nested.csv");
+        }
+        RunFixtureTool(ZsCli, directory, "a", "-tgzip", "dotroot.tgz", "dotroot.tar");
+        RunFixtureTool(ZsCli, directory, "a", "-tlz4", "dotroot.tar.lz4", "dotroot.tar");
+        foreach (string name in new[] { "dotroot.tar", "dotroot.tgz", "dotroot.tar.lz4" })
+        {
+            string path = Path.Combine(directory, name);
+            var run = ExtractZs(path, "dotroot", out string staging, out string manifest);
+            var result = CompleteViaProduction(path, staging, manifest, run.DeliveryRoot);
+            string first = Path.Combine(result.FinalDirectory, "report.csv");
+            string secondFile = Path.Combine(result.FinalDirectory, "-", "nested.csv");
+            Assert($"R1-003: {name} 保留真实 - 目录并去除当前目录段", run.ExitCode == 0 && !run.InvalidCharsOffered &&
+                result.Delivered && File.Exists(first) && File.Exists(secondFile) &&
+                Sha256(first) == expected && Sha256(secondFile) == expected &&
+                Directory.GetFiles(result.FinalDirectory, "*", SearchOption.AllDirectories).Length == 2);
+        }
+    }
+
     private static void TestZsArchives()
     {
         Assert("ZS: Worker 同目录固定引擎摘要", Sha256(Path.Combine(Path.GetDirectoryName(_workerExe)!, "7z.dll")) == FixedZsSha256);
@@ -69,6 +109,7 @@ partial class Program
         string payload = Path.Combine(directory, "report.csv");
         File.WriteAllText(payload, "column_a,column_b\n100,200\n", new UTF8Encoding(false));
         string expected = Sha256(payload);
+        TestInterruptedZipAndTarRoot(directory, payload, expected);
         string tarPath = Path.Combine(directory, "project.tar");
         using (var tar = new TarWriter(File.Create(tarPath), TarEntryFormat.Ustar))
             tar.WriteEntry(payload, "report.csv");
